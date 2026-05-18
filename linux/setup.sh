@@ -317,12 +317,10 @@ if [ -f "$ENV_FILE" ]; then
     # shellcheck disable=SC1090
     source "$ENV_FILE"
     set +a
-elif [ "$HARDEN_ONLY" = "true" ]; then
-    log ".env not found; continuing (harden-only mode — no provider secrets needed locally)"
 else
-    error "Missing ${ENV_FILE}."
-    error "Copy .env.example to .env and fill in your keys."
-    exit 1
+    warn ".env not found at ${ENV_FILE}; continuing without it."
+    warn "Provider vars from the current shell + ~/.profile will still be picked up."
+    warn "To configure providers up front, copy .env.example to .env and fill it in."
 fi
 
 # 5a. Gateway URL + telemetry → ~/.profile (client-side; runs in every mode).
