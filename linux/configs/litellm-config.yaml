@@ -1,0 +1,66 @@
+# LiteLLM Proxy config — see https://docs.litellm.ai/docs/proxy/config_settings
+# Public Model Names match upstream ids (no `claude-*` alias layer).
+# Secrets resolve from ~/.config/litellm/env (mode 600, systemd EnvironmentFile).
+# See CLAUDE.md > "Model naming" for the discovery / feature-gate trade-offs.
+
+model_list:
+  - model_name: azure/gpt-5.4
+    litellm_params:
+      model: azure/gpt-5.4
+      api_base: os.environ/AZURE_RESOURCE_ENDPOINT
+      api_version: "2025-04-01-preview"
+      api_key: os.environ/AZURE_OPENAI_API_KEY
+
+  - model_name: azure/gpt-5.4-mini
+    litellm_params:
+      model: azure/gpt-5.4-mini
+      api_base: os.environ/AZURE_RESOURCE_ENDPOINT
+      api_version: "2025-04-01-preview"
+      api_key: os.environ/AZURE_OPENAI_API_KEY
+
+litellm_settings:
+  drop_params: true
+  request_timeout: 600
+  num_retries: 2
+  json_logs: true
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  database_url: os.environ/DATABASE_URL  # local Postgres provisioned by setup.sh Phase 6; enables /ui model management + spend/key tracking
+
+# --- Guardrails (deferred — uncomment to enable) ---------------------------
+# All four below are OSS, no enterprise license required.
+# Reference: https://docs.litellm.ai/docs/proxy/guardrails/quick_start
+#
+# guardrails:
+#   - guardrail_name: "pii-mask"
+#     litellm_params:
+#       guardrail: litellm_content_filter
+#       mode: "pre_call"
+#       default_on: true
+#       patterns:
+#         - { pattern_type: "prebuilt", pattern_name: "email",          action: "MASK"  }
+#         - { pattern_type: "prebuilt", pattern_name: "phone",          action: "MASK"  }
+#         - { pattern_type: "prebuilt", pattern_name: "us_ssn",         action: "BLOCK" }
+#         - { pattern_type: "prebuilt", pattern_name: "aws_access_key", action: "BLOCK" }
+#         - { pattern_type: "prebuilt", pattern_name: "aws_secret_key", action: "BLOCK" }
+#         - { pattern_type: "prebuilt", pattern_name: "github_token",   action: "BLOCK" }
+#
+#   - guardrail_name: "hide-secrets"
+#     litellm_params:
+#       guardrail: "hide-secrets"
+#       mode: "pre_call"
+#       default_on: true
+#
+#   # Presidio PII/PHI — needs two Docker sidecars on ports 5001/5002
+#   # (see https://docs.litellm.ai/docs/proxy/guardrails/pii_masking_v2)
+#   # - guardrail_name: "presidio-pii"
+#   #   litellm_params:
+#   #     guardrail: presidio
+#   #     mode: "pre_call"
+#   #     default_on: true
+#   #     pii_entities_config:
+#   #       CREDIT_CARD: "MASK"
+#   #       EMAIL_ADDRESS: "MASK"
+#   #       PERSON: "MASK"
+#   #       US_SSN: "BLOCK"

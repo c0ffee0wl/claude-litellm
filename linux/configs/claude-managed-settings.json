@@ -1,0 +1,228 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "cleanupPeriodDays": 90,
+  "allowManagedPermissionRulesOnly": false,
+  "allowManagedHooksOnly": false,
+  "allowManagedMcpServersOnly": false,
+  "enableAllProjectMcpServers": true,
+  "voiceEnabled": false,
+  "channelsEnabled": false,
+  "disableDeepLinkRegistration": "disable",
+  "disableRemoteControl": true,
+  "skipWebFetchPreflight": true,
+  "attribution": {
+    "commit": "",
+    "pr": ""
+  },
+
+  "env": {
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+    "CLAUDE_CODE_ATTRIBUTION_HEADER": "0",
+    "DISABLE_TELEMETRY": "1",
+    "DISABLE_ERROR_REPORTING": "1",
+    "DISABLE_FEEDBACK_COMMAND": "1",
+    "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "1",
+    "ENABLE_CLAUDEAI_MCP_SERVERS": "false",
+    "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
+    "DISABLE_INSTALL_GITHUB_APP_COMMAND": "1",
+    "CLAUDE_CODE_NO_FLICKER": "1",
+    "DISABLE_NON_ESSENTIAL_MODEL_CALLS": "1",
+    "DISABLE_BUG_COMMAND": "1",
+    "API_TIMEOUT_MS": "600000",
+    "NO_PROXY": "127.0.0.1"
+  },
+
+  "sandbox": {
+    "enabled": true,
+    "failIfUnavailable": true,
+    "autoAllowBashIfSandboxed": true,
+    "allowUnsandboxedCommands": false,
+    "filesystem": {
+      "denyRead": [
+        "~/.ssh",
+        "~/.gnupg",
+        "~/.aws",
+        "~/.azure",
+        "~/.config/gh",
+        "~/.git-credentials",
+        "~/.docker/config.json",
+        "~/.kube",
+        "~/.npmrc",
+        "~/.npm",
+        "~/.pypirc",
+        "~/.profile",
+        "~/.bashrc",
+        "~/.bash_profile",
+        "~/.bash_login",
+        "~/.zshenv",
+        "~/.zshrc",
+        "~/.zprofile",
+        "~/.gem/credentials",
+        "~/.config/litellm",
+        "~/.config/litellm/config.yaml",
+        "~/.config/litellm/env",
+        "//root",
+        "//etc/shadow",
+        "//etc/passwd",
+        "//etc/group",
+        "//etc/claude-code"
+      ],
+      "denyWrite": [
+        "//etc",
+        "//var",
+        "//usr",
+        "//root",
+        "//etc/claude-code",
+        "~/.ssh",
+        "~/.gnupg",
+        "~/.profile",
+        "~/.zshenv",
+        "~/.zshrc",
+        "~/.zprofile",
+        "~/.bash_profile",
+        "~/.bash_login",
+        "~/.bashrc",
+        "~/.claude/settings.json",
+        "~/.claude/CLAUDE.md",
+        "~/.config/litellm"
+      ]
+    },
+    "network": {
+      "allowedDomains": [
+        "github.com", 
+        "*.npmjs.org",
+        "pypi.org"
+      ],
+      "deniedDomains": ["uploads.github.com"],
+      "allowUnixSockets": [ "~/.agent-browser/default.sock" ],
+      "allowManagedDomainsOnly": false
+    }
+  },
+
+  "permissions": {
+    "deny": [
+      "Bash(rm -rf *)",
+      "Bash(rm -fr *)",
+      "Bash(sudo *)",
+      "Bash(su *)",
+      "Bash(mkfs *)",
+      "Bash(dd *)",
+      "Bash(mount *)",
+      "Bash(chmod +s *)",
+      "Bash(chmod 777 *)",
+      "Bash(chown root *)",
+      "Bash(* > /dev/tcp/*)",
+      "Bash(wget *|bash*)",
+      "Bash(wget *| bash*)",
+      "Bash(curl *|sh*)",
+      "Bash(curl *| sh*)",
+      "Bash(curl *|bash*)",
+      "Bash(curl *| bash*)",
+      "Bash(ssh *)",
+      "Bash(scp *)",
+      "Bash(apt *)",
+      "Bash(apt-get *)",
+      "Bash(dpkg *)",
+      "Bash(git push --force*)",
+      "Bash(git push *--force*)",
+      "Bash(git reset --hard*)",
+
+      "Read(~/.ssh/**)",
+      "Read(~/.gnupg/**)",
+      "Read(~/.aws/**)",
+      "Read(~/.azure/**)",
+      "Read(~/.config/gh/**)",
+      "Read(~/.git-credentials)",
+      "Read(~/.docker/config.json)",
+      "Read(~/.kube/**)",
+      "Read(~/.npmrc)",
+      "Read(~/.npm/**)",
+      "Read(~/.pypirc)",
+      "Read(~/.gem/credentials)",
+      "Read(~/.netrc)",
+      "Read(~/.config/litellm/config.yaml)",
+      "Read(~/.config/litellm/env)",
+      "Read(**/.env)",
+      "Read(**/.env.*)",
+      "Read(**/*.pem)",
+      "Read(**/*.key)",
+      "Read(**/id_rsa)",
+      "Read(**/id_ed25519)",
+      "Read(//root/**)",
+      "Read(//etc/shadow)",
+      "Read(//etc/passwd)",
+      "Read(//etc/group)",
+
+      "Read(~/.profile)",
+      "Read(~/.zshenv)",
+      "Read(~/.bashrc)",
+      "Read(~/.zshrc)",
+      "Read(~/.zprofile)",
+
+      "Edit(~/.bashrc)",
+      "Edit(~/.zshrc)",
+      "Edit(~/.profile)",
+      "Edit(~/.zshenv)",
+      "Edit(~/.zprofile)",
+      "Edit(~/.bash_profile)",
+      "Edit(~/.bash_login)",
+
+      "Edit(~/.ssh/**)",
+
+      "Edit(~/.claude/**)",
+      "Edit(~/.config/litellm/**)",
+
+      "Bash(curl *)",
+      "Bash(* | curl *)",
+      "Bash(wget *)",
+      "Bash(* | wget *)",
+      "Bash(nc *)",
+      "Bash(* | nc *)",
+      "Bash(ncat *)",
+      "Bash(* | ncat *)",
+      "Bash(node -e *)",
+
+      "Bash(pip install *)",
+      "Bash(pip3 install *)",
+      "Bash(npm install *)",
+      "Bash(bun install *)",
+      "Bash(bun add *)",
+      "Bash(systemctl *)",
+      "Bash(journalctl *)",
+
+      "Bash(env)",
+      "Bash(env *)",
+      "Bash(printenv)",
+      "Bash(printenv *)",
+      "Bash(set)",
+
+      "NotebookEdit",
+      "CronCreate",
+      "CronDelete",
+      "CronList"
+    ],
+    "allow": [
+      "mcp__microsoft-learn__microsoft_docs_search",
+      "mcp__microsoft-learn__microsoft_docs_fetch",
+      "mcp__microsoft-learn__microsoft_code_sample_search"
+    ]
+  },
+
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash __REPO_DIR__/linux/hooks/pretooluse-rm-guard.sh"
+          },
+          {
+            "type": "command",
+            "command": "bash __REPO_DIR__/linux/hooks/pretooluse-push-guard.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
