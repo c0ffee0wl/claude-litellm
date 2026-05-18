@@ -386,7 +386,25 @@ update_profile_export "API_TIMEOUT_MS"       "600000"
 # when they need provider env vars to reach spawned subprocesses.
 update_profile_export "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB" "1"
 
-# Telemetry opt-outs (shell-wide; Claude-Code-specific opt-outs are in managed-settings)
+# Claude Code feature/privacy toggles. Also duplicated in managed-settings'
+# env: block for full/harden modes; written here as well so they apply under
+# --router-only (no managed-settings install) and reach subprocesses spawned
+# by Claude Code. Grouped to mirror the managed-settings ordering.
+update_profile_export "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC" "1"
+update_profile_export "DISABLE_TELEMETRY"                        "1"
+update_profile_export "DISABLE_ERROR_REPORTING"                  "1"
+
+update_profile_export "DISABLE_FEEDBACK_COMMAND"                 "1"
+update_profile_export "DISABLE_INSTALL_GITHUB_APP_COMMAND"       "1"
+
+update_profile_export "ENABLE_CLAUDEAI_MCP_SERVERS"              "false"
+update_profile_export "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"   "1"
+
+# Non-hardening toggles
+update_profile_export "CLAUDE_CODE_ATTRIBUTION_HEADER"           "0"
+update_profile_export "CLAUDE_CODE_NO_FLICKER"                   "1"
+
+# Shell-wide telemetry opt-outs (not Claude Code specific)
 update_profile_export "DO_NOT_TRACK"             "1"
 update_profile_export "VSCODE_TELEMETRY_DISABLE" "1"
 update_profile_export "VSCODE_CRASH_REPORTER_DISABLE" "1"
