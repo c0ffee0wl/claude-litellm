@@ -4,7 +4,7 @@
   "allowManagedPermissionRulesOnly": false,
   "allowManagedHooksOnly": false,
   "allowManagedMcpServersOnly": false,
-  "enableAllProjectMcpServers": true,
+  "enableAllProjectMcpServers": false,
   "voiceEnabled": false,
   "channelsEnabled": false,
   "disableDeepLinkRegistration": "disable",
