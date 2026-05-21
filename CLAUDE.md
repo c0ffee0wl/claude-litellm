@@ -83,7 +83,7 @@ If LiteLLM fails to start, the service runs at `LITELLM_LOG=ERROR` which hides P
 bash -n linux/setup.sh && bash -n linux/common.sh                    # Syntax check
 python3 -c "import yaml; yaml.safe_load(open('linux/configs/litellm-config.yaml'))"
 jq . linux/configs/claude-managed-settings.json
-systemctl --user status litellm claude-history                       # Service health
+systemctl --user status litellm claude-history claude-devtools       # Service health
 systemctl status postgresql                                          # DB up
 curl -sf http://127.0.0.1:4000/health/liveliness                     # LiteLLM liveness
 sudo -u postgres psql -d litellm -c '\dt' | grep LiteLLM_ProxyModelTable  # Prisma migrated
