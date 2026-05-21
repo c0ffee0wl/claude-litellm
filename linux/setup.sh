@@ -600,16 +600,16 @@ CLAUDE_DEVTOOLS_DEPLOYED=0
 CLAUDE_DEVTOOLS_RAM_OK=0
 if [ "$HARDEN_ONLY" != "true" ]; then
     # RAM gate: vite's renderer build (mermaid + react + dnd-kit, 4333 modules)
-    # peaks at ~3-4 GB RSS and gets OOM-killed on smaller boxes. Skip outright
-    # below 4 GB total RAM — the env hedges below (BUN_OPTIONS=--smol, GOMEMLIMIT,
-    # MALLOC_ARENA_MAX) buy a few hundred MB of headroom which should make 4 GB
-    # boxes viable in practice.
+    # peaks at ~3-4 GB RSS and gets OOM-killed on smaller boxes. Floor is 3.5 GB
+    # MemTotal — a nominally-4-GB VM typically reports ~3.8 GB after kernel
+    # reservations, and the env hedges below (BUN_OPTIONS=--smol, GOMEMLIMIT,
+    # MALLOC_ARENA_MAX) plus a bit of swap make the build succeed in practice.
     devtools_ram_kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
-    if [ "${devtools_ram_kb:-0}" -ge 4194304 ]; then
+    if [ "${devtools_ram_kb:-0}" -ge 3670016 ]; then
         CLAUDE_DEVTOOLS_RAM_OK=1
     else
         devtools_ram_gb=$(awk -v kb="$devtools_ram_kb" 'BEGIN {printf "%.1f", kb/1024/1024}')
-        warn "Skipping Phase 10 (claude-devtools) — needs >=4 GB RAM (found ${devtools_ram_gb} GB)"
+        warn "Skipping Phase 10 (claude-devtools) — needs >=3.5 GB RAM (found ${devtools_ram_gb} GB)"
         warn "  vite's renderer build OOMs on smaller boxes; bump VM RAM or add swap to enable"
     fi
 fi
@@ -674,7 +674,7 @@ if [ "$CLAUDE_DEVTOOLS_RAM_OK" = "1" ]; then
                 log "Building claude-devtools (this may take 2-3 min)..."
                 # Memory mitigations stacked across runtime layers (each saves a few
                 # hundred MB; together they buy headroom for borderline boxes — the
-                # hard skip below 4 GB is enforced above):
+                # hard skip below 3.5 GB is enforced above):
                 #   MALLOC_ARENA_MAX    glibc: cap per-thread malloc arenas
                 #   GOMEMLIMIT          esbuild's Go runtime: soft GC ceiling
                 #   BUN_OPTIONS=--smol  bun: docs-recommended low-memory mode (node->bun shim runs the build)
