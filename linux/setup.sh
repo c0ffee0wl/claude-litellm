@@ -593,10 +593,87 @@ if [ "$HARDEN_ONLY" != "true" ]; then
 fi
 
 #############################################################################
-# PHASE 10: APT cleanup
+# PHASE 10: Claude DevTools
 #############################################################################
 
-log "=== Phase 10: Cleanup ==="
+if [ "$HARDEN_ONLY" != "true" ]; then
+    log "=== Phase 10: Claude DevTools ==="
+
+    CLAUDE_DEVTOOLS_PORT=12002
+    CLAUDE_DEVTOOLS_DIR="${HOME}/.local/share/claude-devtools"
+    CLAUDE_DEVTOOLS_REPO="https://github.com/matt1398/claude-devtools.git"
+    CLAUDE_DEVTOOLS_BUN="${HOME}/.bun/bin/bun"
+    CLAUDE_DEVTOOLS_STAMP="${CLAUDE_DEVTOOLS_DIR}/.dt-installed-tag"
+    CLAUDE_DEVTOOLS_BUILD="${CLAUDE_DEVTOOLS_DIR}/dist-standalone/index.cjs"
+
+    if [ ! -d "${CLAUDE_DEVTOOLS_DIR}/.git" ]; then
+        log "Cloning claude-devtools..."
+        mkdir -p "$CLAUDE_DEVTOOLS_DIR"
+        git clone --depth 1 --no-tags "$CLAUDE_DEVTOOLS_REPO" "$CLAUDE_DEVTOOLS_DIR" \
+            || warn "Failed to clone claude-devtools — skipping phase"
+    fi
+
+    CLAUDE_DEVTOOLS_LATEST_TAG=""
+    if [ -d "${CLAUDE_DEVTOOLS_DIR}/.git" ]; then
+        # ls-remote queries the server directly — works on shallow/--no-tags clones.
+        CLAUDE_DEVTOOLS_LATEST_TAG=$(cd "$CLAUDE_DEVTOOLS_DIR" && git ls-remote --refs --tags --sort=-v:refname origin 'v*' 2>/dev/null | head -1 | awk -F'refs/tags/' '{print $2}' || true)
+        if [ -z "$CLAUDE_DEVTOOLS_LATEST_TAG" ]; then
+            CLAUDE_DEVTOOLS_LATEST_TAG=$(cd "$CLAUDE_DEVTOOLS_DIR" && git ls-remote --refs --tags --sort=-v:refname origin 2>/dev/null | head -1 | awk -F'refs/tags/' '{print $2}' || true)
+        fi
+
+        # Defense in depth: a hostile upstream could push a tag with shell
+        # metacharacters. Restrict to characters git allows in tag names that
+        # are also shell-safe.
+        if [ -n "$CLAUDE_DEVTOOLS_LATEST_TAG" ] && ! [[ "$CLAUDE_DEVTOOLS_LATEST_TAG" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+            warn "Refusing claude-devtools tag with unsafe characters: ${CLAUDE_DEVTOOLS_LATEST_TAG}"
+            CLAUDE_DEVTOOLS_LATEST_TAG=""
+        fi
+
+        CLAUDE_DEVTOOLS_INSTALLED_TAG=""
+        [ -f "$CLAUDE_DEVTOOLS_STAMP" ] && CLAUDE_DEVTOOLS_INSTALLED_TAG=$(cat "$CLAUDE_DEVTOOLS_STAMP" 2>/dev/null || true)
+
+        if [ -z "$CLAUDE_DEVTOOLS_LATEST_TAG" ]; then
+            warn "Could not resolve latest claude-devtools tag — keeping existing build"
+        elif [ "$CLAUDE_DEVTOOLS_INSTALLED_TAG" = "$CLAUDE_DEVTOOLS_LATEST_TAG" ] && [ -f "$CLAUDE_DEVTOOLS_BUILD" ]; then
+            log "claude-devtools is up to date at $CLAUDE_DEVTOOLS_INSTALLED_TAG"
+        else
+            log "claude-devtools: ${CLAUDE_DEVTOOLS_INSTALLED_TAG:-<none>} -> ${CLAUDE_DEVTOOLS_LATEST_TAG}"
+            if ! (cd "$CLAUDE_DEVTOOLS_DIR" && git fetch --depth 1 --no-tags origin tag "$CLAUDE_DEVTOOLS_LATEST_TAG" && git -c advice.detachedHead=false checkout --force "refs/tags/$CLAUDE_DEVTOOLS_LATEST_TAG" && git clean -fdx -e .dt-installed-tag); then
+                warn "Failed to check out claude-devtools tag $CLAUDE_DEVTOOLS_LATEST_TAG"
+            else
+                log "Building claude-devtools (this may take 2-3 min)..."
+                if ! (cd "$CLAUDE_DEVTOOLS_DIR" && export ELECTRON_SKIP_BINARY_DOWNLOAD=1 npm_config_electron_skip_binary_download=true && "$CLAUDE_DEVTOOLS_BUN" install --no-save && "$CLAUDE_DEVTOOLS_BUN" run standalone:build); then
+                    warn "claude-devtools build failed — service will not be (re)deployed"
+                elif [ ! -f "$CLAUDE_DEVTOOLS_BUILD" ]; then
+                    warn "claude-devtools build finished but $CLAUDE_DEVTOOLS_BUILD missing"
+                else
+                    echo "$CLAUDE_DEVTOOLS_LATEST_TAG" | write_if_changed "$CLAUDE_DEVTOOLS_STAMP"
+                    log "claude-devtools built successfully at $CLAUDE_DEVTOOLS_LATEST_TAG"
+                fi
+            fi
+        fi
+    fi
+
+    if [ -f "$CLAUDE_DEVTOOLS_BUILD" ]; then
+        deploy_user_systemd_service claude-devtools "$SCRIPT_DIR/systemd/claude-devtools.service" \
+            -e "s|__CLAUDE_DEVTOOLS_DIR__|${CLAUDE_DEVTOOLS_DIR}|g" \
+            -e "s|__CLAUDE_DEVTOOLS_PORT__|${CLAUDE_DEVTOOLS_PORT}|g" \
+            -e "s|__BUN_BIN__|${CLAUDE_DEVTOOLS_BUN}|g" \
+            -e "s|__HOME__|${HOME}|g" \
+            -e "s|__PATH__|${CLAUDE_RUN_PATH}|g" || true
+
+        systemctl --user enable claude-devtools &>/dev/null || true
+        systemctl --user restart claude-devtools || warn "Failed to start claude-devtools"
+    else
+        warn "claude-devtools build output missing — service deployment skipped"
+    fi
+fi
+
+#############################################################################
+# PHASE 11: APT cleanup
+#############################################################################
+
+log "=== Phase 11: Cleanup ==="
 
 sudo apt-get autoremove -y
 
@@ -611,6 +688,7 @@ log "claude-litellm setup complete!"
 if [ "$HARDEN_ONLY" != "true" ]; then
     log "  LiteLLM UI:  http://127.0.0.1:${LITELLM_PORT}/ui/"
     log "  History UI:  http://127.0.0.1:${CLAUDE_RUN_PORT}"
+    log "  DevTools UI: http://127.0.0.1:${CLAUDE_DEVTOOLS_PORT}"
 fi
 log ""
 log "Open a new shell (or 'source ~/.profile') to get the env vars."

@@ -1,0 +1,20 @@
+[Unit]
+Description=Claude DevTools - Web UI for Claude Code session inspection
+After=network.target
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
+[Service]
+Type=simple
+WorkingDirectory=__CLAUDE_DEVTOOLS_DIR__
+ExecStart=__BUN_BIN__ run __CLAUDE_DEVTOOLS_DIR__/dist-standalone/index.cjs
+Restart=on-failure
+RestartSec=5
+Environment=PATH=__PATH__
+Environment=PORT=__CLAUDE_DEVTOOLS_PORT__
+Environment=HOST=127.0.0.1
+Environment=CLAUDE_ROOT=__HOME__/.claude
+Environment=ELECTRON_SKIP_BINARY_DOWNLOAD=1
+
+[Install]
+WantedBy=default.target

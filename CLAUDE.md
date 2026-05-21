@@ -12,9 +12,9 @@ There is no build system, test suite, or linter — this is a deployment automat
 
 Single execution context: Linux. Runs as the current `$USER` (no devuser, no sudo for the script itself; `sudo` is invoked only for `apt`, `loginctl enable-linger`, and writing `/etc/claude-code/managed-settings.json`).
 
-Entry point: `linux/setup.sh`. It sources `linux/common.sh` for utilities and runs nine phases. Key flags (mutually exclusive; not persisted across reruns):
-- `--router-only` skips Phase 4d (ACP install) and Phase 8a–8b (system-level: managed-settings.json sudo-install + `/tmp/claude` sandbox prereq). User-level Phase 8c–8d (`~/.claude/settings.json` statusLine, `~/.claude/statusline.sh`) still run. LiteLLM + Claude Code + claude-history all install locally — useful for a dev box where you want to route through LiteLLM without system-level policy enforcement.
-- `--harden-only` is the inverse: skips Phases 4a (LiteLLM), 4b (claude-run), 4d (ACP), Phase 5b (provider-secret collection), Phase 6 (Postgres + LiteLLM env file), Phase 7 (`litellm.service`), and Phase 9 (`claude-history.service`). Phase 5a's `~/.profile` writes still run. Installs only Claude Code + managed-settings — useful when LiteLLM runs on another host. To point at a remote router, set `ANTHROPIC_GATEWAY_URL=http://<remote>:4000` in `.env` before running — `set -a` sourcing lets `.env` override the localhost default, which then lands in `~/.profile` as `ANTHROPIC_BASE_URL`.
+Entry point: `linux/setup.sh`. It sources `linux/common.sh` for utilities and runs ten phases. Key flags (mutually exclusive; not persisted across reruns):
+- `--router-only` skips Phase 4d (ACP install) and Phase 8a–8b (system-level: managed-settings.json sudo-install + `/tmp/claude` sandbox prereq). User-level Phase 8c–8d (`~/.claude/settings.json` statusLine, `~/.claude/statusline.sh`) still run. LiteLLM + Claude Code + claude-history + claude-devtools all install locally — useful for a dev box where you want to route through LiteLLM without system-level policy enforcement.
+- `--harden-only` is the inverse: skips Phases 4a (LiteLLM), 4b (claude-run), 4d (ACP), Phase 5b (provider-secret collection), Phase 6 (Postgres + LiteLLM env file), Phase 7 (`litellm.service`), Phase 9 (`claude-history.service`), and Phase 10 (`claude-devtools.service`). Phase 5a's `~/.profile` writes still run. Installs only Claude Code + managed-settings — useful when LiteLLM runs on another host. To point at a remote router, set `ANTHROPIC_GATEWAY_URL=http://<remote>:4000` in `.env` before running — `set -a` sourcing lets `.env` override the localhost default, which then lands in `~/.profile` as `ANTHROPIC_BASE_URL`.
 
 API keys come from `.env` in the repo root (gitignored; create from `.env.example`) — or from any provider env var you happen to have exported in your shell / `~/.profile`. `.env` is optional: if it's missing, Phase 5 logs a warning and continues, picking up whatever is already exported. `setup.sh` Phase 5 auto-discovers them via `collect_litellm_provider_vars` in `common.sh` (pattern `*_API_{KEY,BASE,VERSION,TOKEN}` plus a named list for AWS/GCP/watsonx/Azure-AD/OpenAI-org/HF extras) and writes the matches plus the LiteLLM master key + DB URL **only** to `~/.config/litellm/env` (the systemd EnvironmentFile, mode 600). The user's `~/.profile` gets only the gateway URL, the master key as `ANTHROPIC_AUTH_TOKEN`, and telemetry opt-outs — no upstream provider secrets.
 
@@ -39,7 +39,8 @@ LiteLLM speaks Anthropic on `/v1/messages` (the unified endpoint, not the `/anth
 | 8a–8b | (skipped under `--router-only`) Token-substitute managed-settings → `/etc/claude-code/managed-settings.json` (sudo); create `/tmp/claude` sandbox prereq |
 | 8c–8d | User-level Claude Code state (runs in every mode): `~/.claude/settings.json` (statusLine — only deployed on a fresh install, never clobbered on re-runs), `~/.claude/statusline.sh` |
 | 9 | Install + start `claude-history.service` (UI on port 12001) |
-| 10 | `apt autoremove` |
+| 10 | Clone `matt1398/claude-devtools` to `~/.local/share/claude-devtools`, pin to latest release tag, bun-build standalone bundle, install + start `claude-devtools.service` on port 12002. Build failures are non-fatal — any existing build keeps serving. Skipped under `--harden-only`. |
+| 11 | `apt autoremove` |
 
 ## Key Conventions
 
@@ -64,7 +65,8 @@ LiteLLM speaks Anthropic on `/v1/messages` (the unified endpoint, not the `/anth
 - `~/.local/share/uv/tools/litellm/` — uv-managed virtualenv for LiteLLM and its deps
 - `~/.config/litellm/{config.yaml, env}` — LiteLLM runtime state (env file holds master key, auto-discovered provider secrets, `DATABASE_URL`, `STORE_MODEL_IN_DB=True`, `LITELLM_DB_PASSWORD`)
 - `/var/lib/postgresql/<version>/main/` — Postgres data dir (system-managed); database `litellm`, role `litellm`. Browse the LiteLLM UI at `http://127.0.0.1:4000/ui` with `admin` / the `LITELLM_MASTER_KEY` to add models without editing YAML
-- `~/.config/systemd/user/{litellm.service, claude-history.service}` — systemd user units
+- `~/.local/share/claude-devtools/` — claude-devtools clone + build output (`dist-standalone/index.cjs`); `.dt-installed-tag` stamps the active release
+- `~/.config/systemd/user/{litellm.service, claude-history.service, claude-devtools.service}` — systemd user units
 - `/etc/claude-code/managed-settings.json` — system-level Claude Code policy (full + harden-only; skipped under `--router-only`; root-owned)
 - `~/.claude/{settings.json, statusline.sh, projects/}` — user-level Claude Code state
 - `~/.profile` — gateway URL, master key (as `ANTHROPIC_AUTH_TOKEN`), telemetry opt-outs (sourced by bash + zsh login shells)
