@@ -642,15 +642,23 @@ if [ "$HARDEN_ONLY" != "true" ]; then
                 warn "Failed to check out claude-devtools tag $CLAUDE_DEVTOOLS_LATEST_TAG"
             else
                 log "Building claude-devtools (this may take 2-3 min)..."
-                # `find … *.node -delete` works around an upstream bug: claude-devtools'
-                # vite.standalone.config.ts stubs .node addons but its plugin lacks
-                # `enforce: 'pre'`, so rollup's commonjs resolver wins the race when
-                # ssh2's native sshcrypto.node is present. On distros without a C toolchain
-                # the .node never gets built and the stub is never needed; on Kali (gcc/python
-                # preinstalled) it does, and rollup chokes. ssh2 has a JS fallback.
+                # Two workarounds for upstream bugs:
+                # 1. `rm pnpm-lock.yaml` — bun's lockfile migration from pnpm drops
+                #    Rollup's platform-specific optional native deps (e.g.
+                #    @rollup/rollup-linux-x64-gnu), causing the build to crash with
+                #    "Cannot find module". Without a lockfile, bun resolves fresh
+                #    from package.json and installs optionals correctly.
+                # 2. `find … *.node -delete` — claude-devtools' vite.standalone.config.ts
+                #    stubs .node addons but its plugin lacks `enforce: 'pre'`, so
+                #    rollup's commonjs resolver wins the race when ssh2's native
+                #    sshcrypto.node is present. On distros without a C toolchain the
+                #    .node never gets built and the stub is never needed; on Kali
+                #    (gcc/python preinstalled) it does, and rollup chokes. ssh2 has
+                #    a JS fallback.
                 if ! (
                     cd "$CLAUDE_DEVTOOLS_DIR" &&
                     export ELECTRON_SKIP_BINARY_DOWNLOAD=1 npm_config_electron_skip_binary_download=true &&
+                    rm -f pnpm-lock.yaml &&
                     "$CLAUDE_DEVTOOLS_BUN" install --no-save &&
                     { find node_modules -name '*.node' -type f -delete 2>/dev/null || true; } &&
                     "$CLAUDE_DEVTOOLS_BUN" run standalone:build
