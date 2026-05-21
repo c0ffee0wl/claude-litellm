@@ -603,8 +603,20 @@ if [ "$HARDEN_ONLY" != "true" ]; then
     CLAUDE_DEVTOOLS_DIR="${HOME}/.local/share/claude-devtools"
     CLAUDE_DEVTOOLS_REPO="https://github.com/matt1398/claude-devtools.git"
     CLAUDE_DEVTOOLS_BUN="${HOME}/.bun/bin/bun"
+    CLAUDE_DEVTOOLS_PNPM="${HOME}/.bun/bin/pnpm"
     CLAUDE_DEVTOOLS_STAMP="${CLAUDE_DEVTOOLS_DIR}/.dt-installed-tag"
     CLAUDE_DEVTOOLS_BUILD="${CLAUDE_DEVTOOLS_DIR}/dist-standalone/index.cjs"
+
+    # pnpm is the build-time package manager: claude-devtools declares it via
+    # package.json's `packageManager` field, ships a pnpm-lock.yaml, and is a
+    # pnpm workspace. Bun mis-handles all three. Bun stays as the *runtime*
+    # (systemd service still does `bun run dist-standalone/index.cjs`).
+    if [ -L "$CLAUDE_DEVTOOLS_PNPM" ] || [ -x "$CLAUDE_DEVTOOLS_PNPM" ]; then
+        log "pnpm already installed — skipping"
+    else
+        log "Installing pnpm (build-time dep of claude-devtools)..."
+        bun add -g pnpm@10 || warn "Failed to install pnpm — claude-devtools build will fail"
+    fi
 
     if [ ! -d "${CLAUDE_DEVTOOLS_DIR}/.git" ]; then
         log "Cloning claude-devtools..."
@@ -642,26 +654,11 @@ if [ "$HARDEN_ONLY" != "true" ]; then
                 warn "Failed to check out claude-devtools tag $CLAUDE_DEVTOOLS_LATEST_TAG"
             else
                 log "Building claude-devtools (this may take 2-3 min)..."
-                # Two workarounds for upstream bugs:
-                # 1. `rm pnpm-lock.yaml` — bun's lockfile migration from pnpm drops
-                #    Rollup's platform-specific optional native deps (e.g.
-                #    @rollup/rollup-linux-x64-gnu), causing the build to crash with
-                #    "Cannot find module". Without a lockfile, bun resolves fresh
-                #    from package.json and installs optionals correctly.
-                # 2. `find … *.node -delete` — claude-devtools' vite.standalone.config.ts
-                #    stubs .node addons but its plugin lacks `enforce: 'pre'`, so
-                #    rollup's commonjs resolver wins the race when ssh2's native
-                #    sshcrypto.node is present. On distros without a C toolchain the
-                #    .node never gets built and the stub is never needed; on Kali
-                #    (gcc/python preinstalled) it does, and rollup chokes. ssh2 has
-                #    a JS fallback.
                 if ! (
                     cd "$CLAUDE_DEVTOOLS_DIR" &&
                     export ELECTRON_SKIP_BINARY_DOWNLOAD=1 npm_config_electron_skip_binary_download=true &&
-                    rm -f pnpm-lock.yaml &&
-                    "$CLAUDE_DEVTOOLS_BUN" install --no-save &&
-                    { find node_modules -name '*.node' -type f -delete 2>/dev/null || true; } &&
-                    "$CLAUDE_DEVTOOLS_BUN" run standalone:build
+                    "$CLAUDE_DEVTOOLS_PNPM" install --frozen-lockfile &&
+                    "$CLAUDE_DEVTOOLS_PNPM" run standalone:build
                 ); then
                     warn "claude-devtools build failed — service will not be (re)deployed"
                 elif [ ! -f "$CLAUDE_DEVTOOLS_BUILD" ]; then
