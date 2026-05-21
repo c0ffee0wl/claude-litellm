@@ -654,9 +654,16 @@ if [ "$HARDEN_ONLY" != "true" ]; then
                 warn "Failed to check out claude-devtools tag $CLAUDE_DEVTOOLS_LATEST_TAG"
             else
                 log "Building claude-devtools (this may take 2-3 min)..."
+                # MALLOC_ARENA_MAX caps glibc's per-thread malloc arenas — saves
+                # several hundred MB of fragmentation for multithreaded Node/bun
+                # builds. NODE_OPTIONS is a V8-only hedge (ignored under bun, the
+                # current node-shim runtime) for when this script runs under real
+                # Node. Both help avoid OOM on small-RAM VMs (Kali < 4 GB).
                 if ! (
                     cd "$CLAUDE_DEVTOOLS_DIR" &&
-                    export ELECTRON_SKIP_BINARY_DOWNLOAD=1 npm_config_electron_skip_binary_download=true &&
+                    export ELECTRON_SKIP_BINARY_DOWNLOAD=1 npm_config_electron_skip_binary_download=true \
+                        MALLOC_ARENA_MAX=2 \
+                        NODE_OPTIONS="--max-old-space-size=2048 --optimize-for-size" &&
                     "$CLAUDE_DEVTOOLS_PNPM" install --frozen-lockfile &&
                     "$CLAUDE_DEVTOOLS_PNPM" run standalone:build
                 ); then
