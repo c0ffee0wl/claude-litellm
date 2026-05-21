@@ -596,7 +596,25 @@ fi
 # PHASE 10: Claude DevTools
 #############################################################################
 
+CLAUDE_DEVTOOLS_DEPLOYED=0
+CLAUDE_DEVTOOLS_RAM_OK=0
 if [ "$HARDEN_ONLY" != "true" ]; then
+    # RAM gate: vite's renderer build (mermaid + react + dnd-kit, 4333 modules)
+    # peaks at ~3-4 GB RSS and gets OOM-killed on smaller boxes. Skip outright
+    # below 4 GB total RAM — the env hedges below (BUN_OPTIONS=--smol, GOMEMLIMIT,
+    # MALLOC_ARENA_MAX) buy a few hundred MB of headroom which should make 4 GB
+    # boxes viable in practice.
+    devtools_ram_kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
+    if [ "${devtools_ram_kb:-0}" -ge 4194304 ]; then
+        CLAUDE_DEVTOOLS_RAM_OK=1
+    else
+        devtools_ram_gb=$(awk -v kb="$devtools_ram_kb" 'BEGIN {printf "%.1f", kb/1024/1024}')
+        warn "Skipping Phase 10 (claude-devtools) — needs >=4 GB RAM (found ${devtools_ram_gb} GB)"
+        warn "  vite's renderer build OOMs on smaller boxes; bump VM RAM or add swap to enable"
+    fi
+fi
+
+if [ "$CLAUDE_DEVTOOLS_RAM_OK" = "1" ]; then
     log "=== Phase 10: Claude DevTools ==="
 
     CLAUDE_DEVTOOLS_PORT=12002
@@ -654,15 +672,19 @@ if [ "$HARDEN_ONLY" != "true" ]; then
                 warn "Failed to check out claude-devtools tag $CLAUDE_DEVTOOLS_LATEST_TAG"
             else
                 log "Building claude-devtools (this may take 2-3 min)..."
-                # MALLOC_ARENA_MAX caps glibc's per-thread malloc arenas — saves
-                # several hundred MB of fragmentation for multithreaded Node/bun
-                # builds. NODE_OPTIONS is a V8-only hedge (ignored under bun, the
-                # current node-shim runtime) for when this script runs under real
-                # Node. Both help avoid OOM on small-RAM VMs (Kali < 4 GB).
+                # Memory mitigations stacked across runtime layers (each saves a few
+                # hundred MB; together they buy headroom for borderline boxes — the
+                # hard skip below 4 GB is enforced above):
+                #   MALLOC_ARENA_MAX    glibc: cap per-thread malloc arenas
+                #   GOMEMLIMIT          esbuild's Go runtime: soft GC ceiling
+                #   BUN_OPTIONS=--smol  bun: docs-recommended low-memory mode (node->bun shim runs the build)
+                #   NODE_OPTIONS        V8 hedge if a future run uses real Node
                 if ! (
                     cd "$CLAUDE_DEVTOOLS_DIR" &&
                     export ELECTRON_SKIP_BINARY_DOWNLOAD=1 npm_config_electron_skip_binary_download=true \
                         MALLOC_ARENA_MAX=2 \
+                        GOMEMLIMIT=2048MiB \
+                        BUN_OPTIONS="--smol" \
                         NODE_OPTIONS="--max-old-space-size=2048 --optimize-for-size" &&
                     "$CLAUDE_DEVTOOLS_PNPM" install --frozen-lockfile &&
                     "$CLAUDE_DEVTOOLS_PNPM" run standalone:build
@@ -687,7 +709,11 @@ if [ "$HARDEN_ONLY" != "true" ]; then
             -e "s|__PATH__|${CLAUDE_RUN_PATH}|g" || true
 
         systemctl --user enable claude-devtools &>/dev/null || true
-        systemctl --user restart claude-devtools || warn "Failed to start claude-devtools"
+        if systemctl --user restart claude-devtools; then
+            CLAUDE_DEVTOOLS_DEPLOYED=1
+        else
+            warn "Failed to start claude-devtools"
+        fi
     else
         warn "claude-devtools build output missing — service deployment skipped"
     fi
@@ -712,7 +738,9 @@ log "claude-litellm setup complete!"
 if [ "$HARDEN_ONLY" != "true" ]; then
     log "  LiteLLM UI:  http://127.0.0.1:${LITELLM_PORT}/ui/"
     log "  History UI:  http://127.0.0.1:${CLAUDE_RUN_PORT}"
-    log "  DevTools UI: http://127.0.0.1:${CLAUDE_DEVTOOLS_PORT}"
+    if [ "$CLAUDE_DEVTOOLS_DEPLOYED" = "1" ]; then
+        log "  DevTools UI: http://127.0.0.1:${CLAUDE_DEVTOOLS_PORT}"
+    fi
 fi
 log ""
 log "Open a new shell (or 'source ~/.profile') to get the env vars."
