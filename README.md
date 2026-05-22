@@ -29,9 +29,9 @@ Now run `claude`. Traffic goes to `http://127.0.0.1:4000` (LiteLLM's unified Ant
 
 | Command | What happens |
 |---|---|
-| `./linux/setup.sh` | Full setup: LiteLLM + Claude Code + managed-settings hardening + ACP + claude-history + claude-devtools |
-| `./linux/setup.sh --router-only` | LiteLLM + Claude Code + claude-history + claude-devtools. Skips ACP and managed-settings hardening. Dev-box mode |
-| `./linux/setup.sh --harden-only` | Claude Code + managed-settings only. Skips LiteLLM, claude-history, and claude-devtools. Use when LiteLLM runs on another host |
+| `./linux/setup.sh` | Full setup: LiteLLM + Claude Code + managed-settings hardening + ACP + claude-devtools |
+| `./linux/setup.sh --router-only` | LiteLLM + Claude Code + claude-devtools. Skips ACP and managed-settings hardening. Dev-box mode |
+| `./linux/setup.sh --harden-only` | Claude Code + managed-settings only. Skips LiteLLM and claude-devtools. Use when LiteLLM runs on another host |
 | `./linux/setup.sh --yes` | Non-interactive (combine with any of the above) |
 
 ## Architecture
@@ -47,14 +47,13 @@ Claude Code  ──►  http://127.0.0.1:4000 (LiteLLM /v1/messages)  ──► 
 - **Model discovery**: `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1` is left on so any `claude-*` / `anthropic-*`-named entry added later via the LiteLLM `/ui` auto-appears in `/model`. The baseline upstream-named entries are reachable but not listed there (the discovery filter only surfaces names matching that prefix); use `/model azure/gpt-5.4-mini` to switch.
 - **Auth**: a `sk-…` master key is auto-generated on first run, stored in `~/.config/litellm/env` (mode 600) and in `~/.profile` as `ANTHROPIC_AUTH_TOKEN`.
 - **Observability**: bundled LiteLLM admin UI at `http://127.0.0.1:4000/ui/`, backed by the Postgres instance Phase 6 provisions (spend tracking, virtual keys, persistent logs, `/ui` model management all on by default).
-- **Conversation history**: [claude-run](https://github.com/nilbuild/claude-run) web UI at `http://127.0.0.1:12001`.
 - **Session inspection**: [claude-devtools](https://github.com/matt1398/claude-devtools) standalone web UI at `http://127.0.0.1:12002` (pinned to the upstream's latest release tag; built locally with bun, no Electron).
 
 ## Important Files
 
 - `linux/configs/litellm-config.yaml`: model_list, retries, master-key reference, commented guardrails block
 - `linux/configs/claude-managed-settings.json`: sandbox, permissions, telemetry opt-outs, bash guard hooks
-- `linux/setup.sh`: phases 0-11 (see [CLAUDE.md](CLAUDE.md) for the full phase breakdown, key conventions, and troubleshooting)
+- `linux/setup.sh`: phases 0-10 (see [CLAUDE.md](CLAUDE.md) for the full phase breakdown, key conventions, and troubleshooting)
 - `.env`: API keys (gitignored; create from `.env.example`)
 
 ## Future Work
