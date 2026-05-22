@@ -29,8 +29,8 @@ Now run `claude`. Traffic goes to `http://127.0.0.1:4000` (LiteLLM's unified Ant
 
 | Command | What happens |
 |---|---|
-| `./linux/setup.sh` | Full setup: LiteLLM + Claude Code + managed-settings hardening + ACP + claude-devtools |
-| `./linux/setup.sh --router-only` | LiteLLM + Claude Code + claude-devtools. Skips ACP and managed-settings hardening. Dev-box mode |
+| `./linux/setup.sh` | Full setup: LiteLLM + Claude Code + managed-settings hardening + ACP + claude-history + claude-devtools |
+| `./linux/setup.sh --router-only` | LiteLLM + Claude Code + claude-history + claude-devtools. Skips ACP and managed-settings hardening. Dev-box mode |
 | `./linux/setup.sh --harden-only` | Claude Code + managed-settings only. Skips LiteLLM stack. Use when LiteLLM runs on another host |
 | `./linux/setup.sh --yes` | Non-interactive (combine with any of the above) |
 
@@ -47,6 +47,7 @@ Claude Code  ──►  http://127.0.0.1:4000 (LiteLLM /v1/messages)  ──► 
 - **Model discovery**: `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1` is left on so any `claude-*` / `anthropic-*`-named entry added later via the LiteLLM `/ui` auto-appears in `/model`. The baseline upstream-named entries are reachable but not listed there (the discovery filter only surfaces names matching that prefix); use `/model azure/gpt-5.4-mini` to switch.
 - **Auth**: a `sk-…` master key is auto-generated on first run, stored in `~/.config/litellm/env` (mode 600) and in `~/.profile` as `ANTHROPIC_AUTH_TOKEN`.
 - **Observability**: bundled LiteLLM admin UI at `http://127.0.0.1:4000/ui/` (degraded read-only without a backing Postgres).
+- **Conversation history**: [claude-run](https://github.com/nilbuild/claude-run) web UI at `http://127.0.0.1:12001`.
 - **Session inspection**: [claude-devtools](https://github.com/matt1398/claude-devtools) standalone web UI at `http://127.0.0.1:12002` (pinned to the upstream's latest release tag; built locally with bun, no Electron).
 
 ## Important Files

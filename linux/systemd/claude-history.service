@@ -1,0 +1,15 @@
+[Unit]
+Description=Claude Code History Viewer - Web UI for conversation history
+After=network.target
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
+[Service]
+Type=simple
+ExecStart=__CLAUDE_RUN_BIN__ --no-open -p __CLAUDE_RUN_PORT__
+Restart=on-failure
+RestartSec=5
+Environment=PATH=__PATH__
+
+[Install]
+WantedBy=default.target
