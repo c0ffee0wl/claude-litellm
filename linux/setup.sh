@@ -356,9 +356,46 @@ if [ -z "$ANTHROPIC_AUTH_TOKEN" ] || [ "$ANTHROPIC_AUTH_TOKEN" = "test" ]; then
 fi
 
 log "Writing gateway + telemetry env vars to ~/.profile..."
-update_profile_export "ANTHROPIC_BASE_URL"   "$ANTHROPIC_GATEWAY_URL"
-update_profile_export "ANTHROPIC_AUTH_TOKEN" "$ANTHROPIC_AUTH_TOKEN"
-update_profile_export "LITELLM_API_KEY"      "$ANTHROPIC_AUTH_TOKEN"
+
+# Shell-wide telemetry opt-outs (not Claude Code specific)
+update_profile_export "DO_NOT_TRACK"             "1"
+update_profile_export "VSCODE_TELEMETRY_DISABLE" "1"
+update_profile_export "VSCODE_CRASH_REPORTER_DISABLE" "1"
+update_profile_export "DOTNET_CLI_TELEMETRY_OPTOUT"   "1"
+update_profile_export "POWERSHELL_TELEMETRY_OPTOUT"   "1"
+update_profile_export "HF_HUB_DISABLE_TELEMETRY"      "1"
+update_profile_export "PYPI_DISABLE_TELEMETRY"        "1"
+update_profile_export "UV_NO_TELEMETRY"               "1"
+update_profile_export "DISABLE_GROWTHBOOK"            "1"
+update_profile_export "SCARF_ANALYTICS"               "false"
+
+# Subprocess env scrubbing: kept in ~/.profile (not managed-settings) so users
+# can `unset CLAUDE_CODE_SUBPROCESS_ENV_SCRUB` before `claude --dangerously-skip-permissions`
+# when they need provider env vars to reach spawned subprocesses.
+update_profile_export "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB" "1"
+
+# Claude Code feature/privacy toggles. Also duplicated in managed-settings'
+# env: block for full/harden modes; written here as well so they apply under
+# --router-only (no managed-settings install) and reach subprocesses spawned
+# by Claude Code. Grouped to mirror the managed-settings ordering.
+update_profile_export "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC" "1"
+update_profile_export "DISABLE_TELEMETRY"                        "1"
+update_profile_export "DISABLE_ERROR_REPORTING"                  "1"
+
+update_profile_export "DISABLE_FEEDBACK_COMMAND"                 "1"
+update_profile_export "DISABLE_INSTALL_GITHUB_APP_COMMAND"       "1"
+
+update_profile_export "ENABLE_CLAUDEAI_MCP_SERVERS"              "false"
+update_profile_export "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"   "1"
+
+# Non-hardening toggles
+update_profile_export "CLAUDE_CODE_ATTRIBUTION_HEADER"           "0"
+
+# Scrub IS_DEMO=1 from ~/.profile if a prior tool / demo container left it
+# behind. Claude Code treats it as a "demo session" marker that silently
+# suppresses the workspace-trust prompt without granting trust, breaking
+# statusline + hooks (anthropics/claude-code #37780).
+remove_profile_export "IS_DEMO"
 
 # Default model selectors + gateway discovery. In ~/.profile (not managed-settings)
 # so they apply in --router-only too. Values are the upstream provider-prefixed
@@ -387,46 +424,9 @@ update_profile_export "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY" "1"
 update_profile_export "NO_PROXY"             "127.0.0.1"
 update_profile_export "API_TIMEOUT_MS"       "600000"
 
-# Subprocess env scrubbing: kept in ~/.profile (not managed-settings) so users
-# can `unset CLAUDE_CODE_SUBPROCESS_ENV_SCRUB` before `claude --dangerously-skip-permissions`
-# when they need provider env vars to reach spawned subprocesses.
-update_profile_export "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB" "1"
-
-# Claude Code feature/privacy toggles. Also duplicated in managed-settings'
-# env: block for full/harden modes; written here as well so they apply under
-# --router-only (no managed-settings install) and reach subprocesses spawned
-# by Claude Code. Grouped to mirror the managed-settings ordering.
-update_profile_export "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC" "1"
-update_profile_export "DISABLE_TELEMETRY"                        "1"
-update_profile_export "DISABLE_ERROR_REPORTING"                  "1"
-
-update_profile_export "DISABLE_FEEDBACK_COMMAND"                 "1"
-update_profile_export "DISABLE_INSTALL_GITHUB_APP_COMMAND"       "1"
-
-update_profile_export "ENABLE_CLAUDEAI_MCP_SERVERS"              "false"
-update_profile_export "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"   "1"
-
-# Non-hardening toggles
-update_profile_export "CLAUDE_CODE_ATTRIBUTION_HEADER"           "0"
-update_profile_export "CLAUDE_CODE_NO_FLICKER"                   "1"
-
-# Shell-wide telemetry opt-outs (not Claude Code specific)
-update_profile_export "DO_NOT_TRACK"             "1"
-update_profile_export "VSCODE_TELEMETRY_DISABLE" "1"
-update_profile_export "VSCODE_CRASH_REPORTER_DISABLE" "1"
-update_profile_export "DOTNET_CLI_TELEMETRY_OPTOUT"   "1"
-update_profile_export "POWERSHELL_TELEMETRY_OPTOUT"   "1"
-update_profile_export "HF_HUB_DISABLE_TELEMETRY"      "1"
-update_profile_export "PYPI_DISABLE_TELEMETRY"        "1"
-update_profile_export "UV_NO_TELEMETRY"               "1"
-update_profile_export "DISABLE_GROWTHBOOK"            "1"
-update_profile_export "SCARF_ANALYTICS"               "false"
-
-# Scrub IS_DEMO=1 from ~/.profile if a prior tool / demo container left it
-# behind. Claude Code treats it as a "demo session" marker that silently
-# suppresses the workspace-trust prompt without granting trust, breaking
-# statusline + hooks (anthropics/claude-code #37780).
-remove_profile_export "IS_DEMO"
+update_profile_export "ANTHROPIC_BASE_URL"   "$ANTHROPIC_GATEWAY_URL"
+update_profile_export "ANTHROPIC_AUTH_TOKEN" "$ANTHROPIC_AUTH_TOKEN"
+update_profile_export "LITELLM_API_KEY"      "$ANTHROPIC_AUTH_TOKEN"
 
 # 5b. Provider secrets → in-memory env content. Auto-discovers every
 # LiteLLM-relevant provider env var from current shell + ~/.profile + .env
