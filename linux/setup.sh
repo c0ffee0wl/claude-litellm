@@ -191,11 +191,16 @@ else
     curl_secure -fsSL https://astral.sh/uv/install.sh | sh
 fi
 
-# Symlink bun→node and bunx→npx so #!/usr/bin/env node shebangs (claude-run, ACP)
-# resolve to bun. Idempotent.
+# Symlink bun→node so #!/usr/bin/env node shebangs (claude-run, ACP) resolve to
+# bun. npx is a wrapper, not a symlink: bun's argv[0] sniffing only recognises
+# "bunx"/"node", so a symlink invoked as "npx" runs `bun <arg>` and fails with
+# `Script not found`. The wrapper calls `bun x` explicitly. Idempotent.
 if [ -x "${HOME}/.bun/bin/bun" ]; then
-    ln -sf "${HOME}/.bun/bin/bun"  "${HOME}/.bun/bin/node"
-    ln -sf "${HOME}/.bun/bin/bunx" "${HOME}/.bun/bin/npx"
+    ln -sf "${HOME}/.bun/bin/bun" "${HOME}/.bun/bin/node"
+    install -m 755 /dev/stdin "${HOME}/.bun/bin/npx" << NPX_EOF
+#!/bin/sh
+exec "${HOME}/.bun/bin/bun" x "\$@"
+NPX_EOF
 fi
 
 # Ensure PATH entry for bun + uv in profile (idempotent)
