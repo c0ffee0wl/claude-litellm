@@ -353,6 +353,7 @@ fi
 log "Writing gateway + telemetry env vars to ~/.profile..."
 update_profile_export "ANTHROPIC_BASE_URL"   "$ANTHROPIC_GATEWAY_URL"
 update_profile_export "ANTHROPIC_AUTH_TOKEN" "$ANTHROPIC_AUTH_TOKEN"
+update_profile_export "LITELLM_API_KEY"      "$ANTHROPIC_AUTH_TOKEN"
 
 # Default model selectors + gateway discovery. In ~/.profile (not managed-settings)
 # so they apply in --router-only too. Values are the upstream provider-prefixed
