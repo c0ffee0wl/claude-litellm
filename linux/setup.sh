@@ -424,9 +424,10 @@ update_profile_export "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY" "1"
 update_profile_export "NO_PROXY"             "127.0.0.1"
 update_profile_export "API_TIMEOUT_MS"       "600000"
 
+update_profile_export "LITELLM_API_KEY"      "$ANTHROPIC_AUTH_TOKEN"
+
 update_profile_export "ANTHROPIC_BASE_URL"   "$ANTHROPIC_GATEWAY_URL"
 update_profile_export "ANTHROPIC_AUTH_TOKEN" "$ANTHROPIC_AUTH_TOKEN"
-update_profile_export "LITELLM_API_KEY"      "$ANTHROPIC_AUTH_TOKEN"
 
 # 5b. Provider secrets → in-memory env content. Auto-discovers every
 # LiteLLM-relevant provider env var from current shell + ~/.profile + .env
