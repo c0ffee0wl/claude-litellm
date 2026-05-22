@@ -121,18 +121,17 @@ fi
 #############################################################################
 
 LITELLM_PORT=4000
-CLAUDE_RUN_PORT=12001
 # Unified Anthropic /v1/messages endpoint — translates to any provider in
 # model_list. NOT the /anthropic pass-through (that one only proxies to api.anthropic.com).
 ANTHROPIC_GATEWAY_URL="http://127.0.0.1:${LITELLM_PORT}"
 # uv tool venv bin first: `prisma` CLI lives there (we install via --with prisma),
 # and LiteLLM shells out to `prisma migrate deploy` on startup. Without this,
 # migrations silently fail and UI-required tables like LiteLLM_UserTable never get created.
-# Kept separate from CLAUDE_RUN_PATH: the venv exposes generic names (httpx,
+# Kept separate from USER_TOOL_PATH: the venv exposes generic names (httpx,
 # openai, fastapi, nodeenv, mcp, …) that would shadow system tools for unrelated
 # services.
 LITELLM_PATH="${HOME}/.local/share/uv/tools/litellm/bin:${HOME}/.local/bin:${HOME}/.bun/bin:/usr/local/bin:/usr/bin:/bin"
-CLAUDE_RUN_PATH="${HOME}/.local/bin:${HOME}/.bun/bin:/usr/local/bin:/usr/bin:/bin"
+USER_TOOL_PATH="${HOME}/.local/bin:${HOME}/.bun/bin:/usr/local/bin:/usr/bin:/bin"
 
 #############################################################################
 # PHASE 1: shell profile setup (Bash + zsh)
@@ -191,7 +190,7 @@ else
     curl_secure -fsSL https://astral.sh/uv/install.sh | sh
 fi
 
-# Symlink bun→node and bunx→npx so #!/usr/bin/env node shebangs (claude-run, ACP)
+# Symlink bun→node and bunx→npx so #!/usr/bin/env node shebangs (ACP)
 # resolve to bun. Idempotent.
 if [ -x "${HOME}/.bun/bin/bun" ]; then
     ln -sf "${HOME}/.bun/bin/bun"  "${HOME}/.bun/bin/node"
@@ -207,7 +206,7 @@ export PATH="${HOME}/.bun/bin:${HOME}/.local/bin:${PATH}"
 log "bun + uv ready"
 
 #############################################################################
-# PHASE 4: Tools (LiteLLM, claude-run, optional Claude Code + ACP)
+# PHASE 4: Tools (LiteLLM, optional Claude Code + ACP)
 #############################################################################
 
 log "=== Phase 4: Tools ==="
@@ -264,17 +263,6 @@ if [ "$HARDEN_ONLY" != "true" ]; then
             npm_config_min_release_age=0 \
                 "${UV_LITELLM_VENV}/bin/prisma" generate --schema="$LITELLM_SCHEMA"
         fi
-    fi
-fi
-
-# 4b. claude-run (install-if-missing via bun; skipped in harden-only — LiteLLM
-# isn't local, so its log-viewer service is moot too).
-if [ "$HARDEN_ONLY" != "true" ]; then
-    if [ -L "${HOME}/.bun/bin/claude-run" ] || [ -x "${HOME}/.bun/bin/claude-run" ]; then
-        log "claude-run already installed — skipping"
-    else
-        log "Installing claude-run..."
-        bun add -g claude-run
     fi
 fi
 
@@ -494,7 +482,7 @@ fi
 # PHASE 7: LiteLLM config + service
 #############################################################################
 
-# Enable systemd --user lingering so user services (litellm, claude-history)
+# Enable systemd --user lingering so user services (litellm, claude-devtools)
 # run without an active session. Needed in every mode.
 if ! loginctl show-user "$USER" 2>/dev/null | grep -q "Linger=yes"; then
     sudo loginctl enable-linger "$USER" 2>/dev/null || warn "Could not enable lingering for $USER"
@@ -572,25 +560,17 @@ install -m 755 "$SCRIPT_DIR/scripts/statusline.sh" "${HOME}/.claude/statusline.s
 log "Claude Code settings deployed"
 
 #############################################################################
-# PHASE 9: claude-history Web UI Service
+# PHASE 9: Remove legacy claude-history service (was claude-run web UI)
 #############################################################################
 
-if [ "$HARDEN_ONLY" != "true" ]; then
-    log "=== Phase 9: claude-history ==="
-
-    CLAUDE_RUN_BIN="${HOME}/.bun/bin/claude-run"
-
-    # Pre-create projects dir so claude-run's chokidar watcher has an inode
-    mkdir -p "${HOME}/.claude/projects"
-    chmod 700 "${HOME}/.claude/projects"
-
-    deploy_user_systemd_service claude-history "$SCRIPT_DIR/systemd/claude-history.service" \
-        -e "s|__CLAUDE_RUN_BIN__|${CLAUDE_RUN_BIN}|g" \
-        -e "s|__CLAUDE_RUN_PORT__|${CLAUDE_RUN_PORT}|g" \
-        -e "s|__PATH__|${CLAUDE_RUN_PATH}|g" || true
-
-    systemctl --user enable claude-history &>/dev/null || true
-    systemctl --user restart claude-history || warn "Failed to start claude-history"
+# Older installs deployed a claude-history.service backed by `claude-run`.
+# Both have been dropped; this stops and removes any leftover unit so a
+# re-run doesn't leave a broken service behind. No-op on fresh installs.
+if [ -f "${HOME}/.config/systemd/user/claude-history.service" ]; then
+    log "=== Phase 9: removing legacy claude-history service ==="
+    systemctl --user disable --now claude-history &>/dev/null || true
+    rm -f "${HOME}/.config/systemd/user/claude-history.service"
+    systemctl --user daemon-reload &>/dev/null || true
 fi
 
 #############################################################################
@@ -707,7 +687,7 @@ if [ "$CLAUDE_DEVTOOLS_RAM_OK" = "1" ]; then
             -e "s|__CLAUDE_DEVTOOLS_PORT__|${CLAUDE_DEVTOOLS_PORT}|g" \
             -e "s|__BUN_BIN__|${CLAUDE_DEVTOOLS_BUN}|g" \
             -e "s|__HOME__|${HOME}|g" \
-            -e "s|__PATH__|${CLAUDE_RUN_PATH}|g" || true
+            -e "s|__PATH__|${USER_TOOL_PATH}|g" || true
 
         systemctl --user enable claude-devtools &>/dev/null || true
         if systemctl --user restart claude-devtools; then
@@ -738,7 +718,6 @@ ensure_managed_bash_profile
 log "claude-litellm setup complete!"
 if [ "$HARDEN_ONLY" != "true" ]; then
     log "  LiteLLM UI:  http://127.0.0.1:${LITELLM_PORT}/ui/"
-    log "  History UI:  http://127.0.0.1:${CLAUDE_RUN_PORT}"
     if [ "$CLAUDE_DEVTOOLS_DEPLOYED" = "1" ]; then
         log "  DevTools UI: http://127.0.0.1:${CLAUDE_DEVTOOLS_PORT}"
     fi
