@@ -378,6 +378,7 @@ update_profile_export "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"   "1"
 
 # Non-hardening toggles
 update_profile_export "CLAUDE_CODE_ATTRIBUTION_HEADER"           "0"
+update_profile_export "CLAUDE_CODE_NO_FLICKER"                   "1"
 
 # Scrub IS_DEMO=1 from ~/.profile if a prior tool / demo container left it
 # behind. Claude Code treats it as a "demo session" marker that silently
