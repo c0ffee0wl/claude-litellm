@@ -164,9 +164,14 @@ log "=== Phase 2: System packages ==="
 # Common packages always needed:
 APT_PACKAGES="git curl jq ca-certificates unzip rsync"
 
-# bubblewrap + socat only for full mode (Claude Code sandbox uses bwrap):
+# bubblewrap + socat only for full mode (Claude Code sandbox uses bwrap).
+# ripgrep too: the /sandbox UI only renders its Mode/Overrides toggle tabs once
+# every sandbox dependency resolves, and `rg` is an undocumented one — if Claude
+# Code's bundled rg isn't found (it has regressed to a shell-shim before, see
+# anthropics/claude-code#31804, #31708) the user gets a deps-only screen with
+# nothing to toggle. Installing a real rg binary keeps the toggle reachable.
 if [ "$ROUTER_ONLY" != "true" ]; then
-    APT_PACKAGES="$APT_PACKAGES bubblewrap socat"
+    APT_PACKAGES="$APT_PACKAGES bubblewrap socat ripgrep"
 fi
 
 export DEBIAN_FRONTEND=noninteractive
@@ -709,9 +714,13 @@ if [ "$ROUTER_ONLY" != "true" ] && { command -v claude &>/dev/null || [ -x "${HO
     #
     # Plugin schema (verified via `claude plugin list --json` on a real install):
     # bare array of { id: "<plugin>@<marketplace>", scope, enabled, version,
-    # installedAt, ... }. No .name field. `enabled` does NOT auto-flip true on
-    # install — a user (or `claude plugin disable`) can leave it installed-but-
-    # disabled, in which case the hook is inert. We distinguish three states.
+    # installedAt, ... }. No .name field. `claude plugin install` enables the
+    # plugin by default, so the `absent` branch below installs *and* enables
+    # (the explicit enable is a tolerant no-op if install already did it, and a
+    # safety net on the odd build that leaves it disabled). Consequently an
+    # `enabled: false` at detection time means the user *deliberately* disabled
+    # it after we installed it (`claude plugin disable`) — Phase 8e respects
+    # that and leaves it off (it does NOT re-enable). We distinguish three states.
     if [ "$nah_marketplace_ok" = "1" ]; then
         # Note: `// "absent"` won't work as a fallback because jq's // operator
         # treats both null AND false as missing — so an installed-but-disabled
@@ -745,15 +754,21 @@ if [ "$ROUTER_ONLY" != "true" ] && { command -v claude &>/dev/null || [ -x "${HO
                 log "nah plugin already installed and enabled — skipping"
                 ;;
             false)
-                log "nah plugin installed but disabled — re-enabling (comment Phase 8e out to opt out permanently)"
-                if ! nah_enable_out=$(timeout -k 15 60 claude plugin enable nah@nah --scope user </dev/null 2>&1); then
-                    warn "Failed to enable nah plugin. Output: ${nah_enable_out}"
-                fi
+                # User deliberately disabled it (install enables by default, and
+                # the absent branch re-asserts enable, so a disabled state can only
+                # come from `claude plugin disable`). Respect that — do NOT re-enable.
+                log "nah plugin installed but disabled — leaving disabled (user opted out; run 'claude plugin enable nah@nah --scope user' to re-enable)"
                 ;;
             absent)
                 log "Installing nah Claude Code plugin..."
                 if nah_install_out=$(timeout -k 15 180 claude plugin install nah@nah --scope user </dev/null 2>&1); then
                     log "nah plugin installed"
+                    # install enables by default; assert it on first install so a
+                    # fresh box ends up enabled regardless of build behaviour. A
+                    # benign "already enabled" error here is expected and ignored.
+                    # We do this ONLY on first install — never in the `false`
+                    # branch, where a disabled plugin is the user's choice.
+                    timeout -k 15 60 claude plugin enable nah@nah --scope user </dev/null >/dev/null 2>&1 || true
                 else
                     warn "Failed to install nah plugin — try 'claude plugin marketplace list' to confirm marketplace registration. Output: ${nah_install_out}"
                 fi
@@ -943,7 +958,7 @@ if [ "$HARDEN_ONLY" != "true" ]; then
     fi
 fi
 log ""
-log "Open a new shell (or 'source ~/.profile') to get the env vars."
+log "Log out and back in (or run 'source ~/.profile') to load the env vars — a plain new terminal won't read ~/.profile."
 if [ "$HARDEN_ONLY" = "true" ]; then
     log "ANTHROPIC_BASE_URL in ~/.profile is currently: ${ANTHROPIC_GATEWAY_URL}"
     log "Edit ~/.profile (or set ANTHROPIC_GATEWAY_URL in .env and re-run) to point at your remote LiteLLM."
@@ -980,7 +995,7 @@ if [ "${NEEDS_MODEL_CONFIG:-0}" = "1" ] && [ -t 1 ]; then
     echo -e "    3. If that name is not \`claude-*\`/\`anthropic-*\`, also declare its"
     echo -e "       capabilities or Claude Code leaves thinking + effort OFF:"
     echo -e "         ${GREEN}export ANTHROPIC_DEFAULT_{HAIKU,SONNET,OPUS}_MODEL_SUPPORTED_CAPABILITIES=\"thinking,adaptive_thinking,interleaved_thinking,effort\"${NC}"
-    echo -e "    4. ${GREEN}source ~/.profile${NC} (or open a new shell) before \`claude\`."
+    echo -e "    4. ${GREEN}source ~/.profile${NC} (or log out and back in) before \`claude\`."
     echo -e "${YELLOW}${rule}${NC}"
     echo ""
 fi

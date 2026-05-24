@@ -54,7 +54,8 @@ Claude Code  ──►  http://127.0.0.1:4000 (LiteLLM /v1/messages)  ──► 
 ## Important Files
 
 - `linux/configs/litellm-config.yaml`: model_list, retries, master-key reference, commented guardrails block
-- `linux/configs/claude-managed-settings.json`: sandbox, permissions, telemetry opt-outs, bash guard hooks
+- `linux/configs/claude-managed-settings.json`: permissions (deny/allow), telemetry opt-outs, bash guard hooks (root-enforced)
+- `linux/configs/claude-settings.json`: user-scope `~/.claude/settings.json` template — statusLine + the `sandbox` block (`enabled:true`, user-toggleable via `/sandbox`)
 - `linux/setup.sh`: phases 0-10 (see [CLAUDE.md](CLAUDE.md) for the full phase breakdown, key conventions, and troubleshooting)
 - `.env`: API keys (gitignored; create from `.env.example`)
 

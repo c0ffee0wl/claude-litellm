@@ -3,5 +3,69 @@
     "type": "command",
     "command": "~/.claude/statusline.sh"
   },
-  "theme": "auto"
+  "theme": "auto",
+
+  "sandbox": {
+    "enabled": true,
+    "autoAllowBashIfSandboxed": true,
+    "filesystem": {
+      "denyRead": [
+        "~/.ssh",
+        "~/.gnupg",
+        "~/.aws",
+        "~/.azure",
+        "~/.config/gh",
+        "~/.git-credentials",
+        "~/.docker/config.json",
+        "~/.kube",
+        "~/.npmrc",
+        "~/.npm",
+        "~/.pypirc",
+        "~/.profile",
+        "~/.bashrc",
+        "~/.bash_profile",
+        "~/.bash_login",
+        "~/.zshenv",
+        "~/.zshrc",
+        "~/.zprofile",
+        "~/.gem/credentials",
+        "~/.config/litellm",
+        "~/.config/litellm/config.yaml",
+        "~/.config/litellm/env",
+        "//root",
+        "//etc/shadow",
+        "//etc/passwd",
+        "//etc/group",
+        "//etc/claude-code"
+      ],
+      "denyWrite": [
+        "//etc",
+        "//var",
+        "//usr",
+        "//root",
+        "//etc/claude-code",
+        "~/.ssh",
+        "~/.gnupg",
+        "~/.profile",
+        "~/.zshenv",
+        "~/.zshrc",
+        "~/.zprofile",
+        "~/.bash_profile",
+        "~/.bash_login",
+        "~/.bashrc",
+        "~/.claude/settings.json",
+        "~/.claude/CLAUDE.md",
+        "~/.config/litellm"
+      ]
+    },
+    "network": {
+      "allowedDomains": [
+        "github.com",
+        "*.npmjs.org",
+        "pypi.org"
+      ],
+      "deniedDomains": ["uploads.github.com"],
+      "allowUnixSockets": ["~/.agent-browser/default.sock"]
+    }
+  }
 }
