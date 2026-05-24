@@ -30,7 +30,7 @@ Now run `claude`. Traffic goes to `http://127.0.0.1:4000` (LiteLLM's unified Ant
 | Command | What happens |
 |---|---|
 | `./linux/setup.sh` | Full setup: LiteLLM + Claude Code + managed-settings hardening + `nah` plugin + claude-devtools |
-| `./linux/setup.sh --router-only` | LiteLLM + Claude Code + claude-devtools. Skips managed-settings hardening and the `nah` plugin. Dev-box mode |
+| `./linux/setup.sh --router-only` | LiteLLM + Claude Code + claude-devtools. Skips managed-settings hardening and the `nah` plugin; ships the sandbox **off** by default (block stripped from user settings, but bwrap is still installed so `/sandbox` can enable it). Dev-box mode |
 | `./linux/setup.sh --harden-only` | Claude Code + managed-settings + `nah` plugin only. Skips LiteLLM and claude-devtools. Use when LiteLLM runs on another host |
 | `./linux/setup.sh --install-obsidian` | Also installs the ACP adapter + the latest Obsidian (`.deb`). Additive — combine with any mode |
 | `./linux/setup.sh --yes` | Non-interactive (combine with any of the above) |
@@ -55,7 +55,7 @@ Claude Code  ──►  http://127.0.0.1:4000 (LiteLLM /v1/messages)  ──► 
 
 - `linux/configs/litellm-config.yaml`: model_list, retries, master-key reference, commented guardrails block
 - `linux/configs/claude-managed-settings.json`: permissions (deny/allow), telemetry opt-outs, bash guard hooks (root-enforced)
-- `linux/configs/claude-settings.json`: user-scope `~/.claude/settings.json` template — statusLine + the `sandbox` block (`enabled:true`, user-toggleable via `/sandbox`)
+- `linux/configs/claude-settings.json`: user-scope `~/.claude/settings.json` template — statusLine + the `sandbox` block (`enabled:true`, user-toggleable via `/sandbox`; the `sandbox` block is stripped on `--router-only`, which ships it off by default)
 - `linux/setup.sh`: phases 0-10 (see [CLAUDE.md](CLAUDE.md) for the full phase breakdown, key conventions, and troubleshooting)
 - `.env`: API keys (gitignored; create from `.env.example`)
 

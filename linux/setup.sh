@@ -164,15 +164,14 @@ log "=== Phase 2: System packages ==="
 # Common packages always needed:
 APT_PACKAGES="git curl jq ca-certificates unzip rsync"
 
-# bubblewrap + socat only for full mode (Claude Code sandbox uses bwrap).
-# ripgrep too: the /sandbox UI only renders its Mode/Overrides toggle tabs once
-# every sandbox dependency resolves, and `rg` is an undocumented one — if Claude
-# Code's bundled rg isn't found (it has regressed to a shell-shim before, see
-# anthropics/claude-code#31804, #31708) the user gets a deps-only screen with
-# nothing to toggle. Installing a real rg binary keeps the toggle reachable.
-if [ "$ROUTER_ONLY" != "true" ]; then
-    APT_PACKAGES="$APT_PACKAGES bubblewrap socat ripgrep"
-fi
+# bubblewrap + socat + ripgrep in every mode. router-only ships the sandbox OFF by
+# default (Phase 8c strips the block), but we still install the runtime so a user can
+# opt in via /sandbox in the UI without re-running apt. The packages are tiny + benign.
+# ripgrep is an undocumented /sandbox dep: the Mode/Overrides toggle tabs only render
+# once every sandbox dependency resolves, and if Claude Code's bundled rg isn't found
+# (it has regressed to a shell-shim before, anthropics/claude-code#31804, #31708) the
+# user gets a deps-only screen with nothing to toggle. A real rg binary keeps it reachable.
+APT_PACKAGES="$APT_PACKAGES bubblewrap socat ripgrep"
 
 export DEBIAN_FRONTEND=noninteractive
 sudo apt-get update
@@ -180,10 +179,9 @@ sudo apt-get update
 sudo apt-get install -y $APT_PACKAGES
 log "System packages installed: $APT_PACKAGES"
 
-# AppArmor profile for bwrap, only relevant in full mode
-if [ "$ROUTER_ONLY" != "true" ]; then
-    configure_bwrap_apparmor
-fi
+# AppArmor profile for bwrap — configured in all modes so the sandbox works if a user
+# opts into it via /sandbox (even under --router-only, which ships it off by default).
+configure_bwrap_apparmor
 
 #############################################################################
 # PHASE 3: bun + uv (install-if-missing-only)
@@ -633,7 +631,16 @@ fi
 # running it owns this file (theme, plugins, accepted-bypass state); a
 # re-run of setup must not clobber it.
 if [ ! -f "${HOME}/.claude/settings.json" ]; then
-    deploy_config "$SCRIPT_DIR/configs/claude-settings.json" "${HOME}/.claude/settings.json"
+    if [ "$ROUTER_ONLY" = "true" ]; then
+        # router-only ships the sandbox OFF by default: strip the block so we don't
+        # deploy an enabled sandbox in a mode meant to be minimal. The bwrap runtime
+        # is still installed (Phase 2), so the user can `/sandbox` on whenever they
+        # want (writes settings.local.json) — only the default config is absent.
+        jq 'del(.sandbox)' "$SCRIPT_DIR/configs/claude-settings.json" \
+            | write_if_changed "${HOME}/.claude/settings.json" 644 "${USER}:${USER}"
+    else
+        deploy_config "$SCRIPT_DIR/configs/claude-settings.json" "${HOME}/.claude/settings.json"
+    fi
 fi
 
 # 8d. Statusline script
