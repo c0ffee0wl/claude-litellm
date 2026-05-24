@@ -29,9 +29,10 @@ Now run `claude`. Traffic goes to `http://127.0.0.1:4000` (LiteLLM's unified Ant
 
 | Command | What happens |
 |---|---|
-| `./linux/setup.sh` | Full setup: LiteLLM + Claude Code + managed-settings hardening + `nah` plugin + ACP + claude-devtools |
-| `./linux/setup.sh --router-only` | LiteLLM + Claude Code + claude-devtools. Skips ACP, managed-settings hardening, and the `nah` plugin. Dev-box mode |
+| `./linux/setup.sh` | Full setup: LiteLLM + Claude Code + managed-settings hardening + `nah` plugin + claude-devtools |
+| `./linux/setup.sh --router-only` | LiteLLM + Claude Code + claude-devtools. Skips managed-settings hardening and the `nah` plugin. Dev-box mode |
 | `./linux/setup.sh --harden-only` | Claude Code + managed-settings + `nah` plugin only. Skips LiteLLM and claude-devtools. Use when LiteLLM runs on another host |
+| `./linux/setup.sh --install-obsidian` | Also installs the ACP adapter + the latest Obsidian (`.deb`). Additive — combine with any mode |
 | `./linux/setup.sh --yes` | Non-interactive (combine with any of the above) |
 
 ## Architecture
@@ -63,4 +64,4 @@ Claude Code  ──►  http://127.0.0.1:4000 (LiteLLM /v1/messages)  ──► 
 
 ## Idempotency
 
-`setup.sh` is idempotent and uses **install-if-missing-only**: if uv, bun, LiteLLM, Claude Code, ACP, or the `nah` plugin are already present, they are not touched (no auto-update). Updates are managed by the user (`uv tool upgrade litellm`, `claude update`, `claude plugin update nah --scope user`, etc.).
+`setup.sh` is idempotent and uses **install-if-missing-only**: if uv, bun, LiteLLM, Claude Code, ACP, Obsidian, or the `nah` plugin are already present, they are not touched (no auto-update). Updates are managed by the user (`uv tool upgrade litellm`, `claude update`, `claude plugin update nah --scope user`, etc.).

@@ -7,12 +7,14 @@
 #
 # Usage:
 #   ./linux/setup.sh                  # Full setup: LiteLLM + Claude Code + managed settings
-#   ./linux/setup.sh --router-only    # LiteLLM gateway + Claude Code, no managed-settings hardening or ACP
+#   ./linux/setup.sh --router-only    # LiteLLM gateway + Claude Code, no managed-settings hardening
 #   ./linux/setup.sh --harden-only    # Only Claude Code + managed settings (no LiteLLM; remote router)
+#   ./linux/setup.sh --install-obsidian  # Also install the ACP adapter + latest Obsidian (.deb); combinable with any mode
 #   ./linux/setup.sh --yes            # Non-interactive (skip prompts)
 #
-# --router-only and --harden-only are mutually exclusive. Flags are NOT persisted —
-# each invocation is fresh; rerunning without a flag falls through to full mode.
+# --router-only and --harden-only are mutually exclusive. --install-obsidian is additive
+# (combinable with any mode). Flags are NOT persisted — each invocation is fresh;
+# rerunning without a flag falls through to full mode.
 
 set -e
 
@@ -27,6 +29,7 @@ source "$SCRIPT_DIR/common.sh"
 
 ROUTER_ONLY=false
 HARDEN_ONLY=false
+INSTALL_OBSIDIAN=false
 ORIGINAL_ARGS=("$@")
 
 while [[ $# -gt 0 ]]; do
@@ -37,6 +40,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --harden-only)
             HARDEN_ONLY=true
+            shift
+            ;;
+        --install-obsidian)
+            INSTALL_OBSIDIAN=true
             shift
             ;;
         --yes)
@@ -75,6 +82,9 @@ fi
 log "  REPO_DIR: $REPO_DIR"
 log "  USER:     $USER"
 log "  HOME:     $HOME"
+if [ "$INSTALL_OBSIDIAN" = "true" ]; then
+    log "  Obsidian + ACP install: enabled"
+fi
 
 #############################################################################
 # Active Session Check
@@ -281,15 +291,48 @@ else
     ensure_managed_bash_profile
 fi
 
-# 4c. ACP adapter (install-if-missing; skipped in router-only and harden-only —
-# IDE integration belongs with full Claude Code installs).
-if [ "$ROUTER_ONLY" != "true" ] && [ "$HARDEN_ONLY" != "true" ]; then
+# 4c. ACP adapter (install-if-missing). Only installed with --install-obsidian:
+# the ACP bridge exists to drive Claude Code from editors like Obsidian.
+if [ "$INSTALL_OBSIDIAN" = "true" ]; then
     ACP_PACKAGE="@agentclientprotocol/claude-agent-acp"
     if [ -L "${HOME}/.bun/bin/claude-agent-acp" ] || [ -x "${HOME}/.bun/bin/claude-agent-acp" ]; then
         log "ACP adapter already installed — skipping"
     else
         log "Installing ACP adapter (${ACP_PACKAGE})..."
         bun add -g "$ACP_PACKAGE" || warn "ACP adapter install failed, continuing"
+    fi
+fi
+
+# 4d. Obsidian desktop (install-if-missing). Resolve the latest amd64 .deb from
+# the GitHub releases API and install via apt (apt resolves the .deb's deps).
+# Only with --install-obsidian; failures are non-fatal.
+if [ "$INSTALL_OBSIDIAN" = "true" ]; then
+    # dpkg -s returns 0 even for removed-but-not-purged packages (config-files
+    # state), so match the actual "install ok installed" status — otherwise an
+    # `apt remove`d Obsidian would never get reinstalled here.
+    if dpkg-query -W -f='${Status}' obsidian 2>/dev/null | grep -q 'install ok installed'; then
+        log "Obsidian already installed — skipping (upgrade manually if needed)"
+    else
+        log "Resolving latest Obsidian amd64 .deb..."
+        OBSIDIAN_DEB_URL="$(curl_secure -fsSL \
+            https://api.github.com/repos/obsidianmd/obsidian-releases/releases/latest \
+            | jq -r '.assets[] | select(.name | test("_amd64\\.deb$")) | .browser_download_url' \
+            | head -n1)"
+        if [ -z "$OBSIDIAN_DEB_URL" ] || [ "$OBSIDIAN_DEB_URL" = "null" ]; then
+            warn "Could not resolve Obsidian amd64 .deb URL — skipping"
+        # A bare `VAR=$(mktemp)` would abort the whole script under `set -e` if
+        # mktemp fails; guard it so this block stays non-fatal as intended.
+        elif ! OBSIDIAN_DEB="$(mktemp --suffix=.deb)"; then
+            warn "Could not create temp file for Obsidian download — skipping"
+        else
+            log "Downloading Obsidian: $OBSIDIAN_DEB_URL"
+            if curl_secure -fsSL -o "$OBSIDIAN_DEB" "$OBSIDIAN_DEB_URL"; then
+                sudo apt-get install -y "$OBSIDIAN_DEB" || warn "Obsidian install failed, continuing"
+            else
+                warn "Obsidian download failed, continuing"
+            fi
+            rm -f "$OBSIDIAN_DEB"
+        fi
     fi
 fi
 
