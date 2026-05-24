@@ -1,13 +1,16 @@
 #!/bin/bash
 # Two-line statusline.
-# Line 1: (user@host)-[cwd] | session duration [(sandboxed)]
+# Line 1: (user@host)-[cwd] | session duration [(unsandboxed)]
 # Line 2: [Model] [bar] PCT% (CTX_SIZE) | (mode-specific suffix)
 #
-# A red "(sandboxed)" tag trails the duration when the bubblewrap sandbox is
-# effectively enabled. Claude Code does not expose sandbox state to statuslines
-# (no JSON field, no env var — anthropics/claude-code#30772), so this is
-# best-effort: the effective sandbox.enabled is read across the settings
-# precedence chain AND bwrap must be present (else CC silently runs unsandboxed).
+# A red "(unsandboxed)" tag trails the duration UNLESS the bubblewrap sandbox is
+# positively confirmed active. Claude Code does not expose sandbox state to
+# statuslines (no JSON field, no env var — anthropics/claude-code#30772), so
+# this is best-effort and deliberately FAIL-SAFE: the warning shows unless the
+# effective sandbox.enabled is true across the settings precedence chain AND
+# bwrap is present. "Off", "can't determine", and "enabled but bwrap missing"
+# (CC's silent fallback to unsandboxed) all warn — a detection gap over-warns
+# rather than falsely reassuring.
 #
 # Mode is detected via ANTHROPIC_BASE_URL:
 #   DIRECT  — empty or non-local: show 5h/7d rate-limit budgets (Claude.ai
@@ -97,7 +100,9 @@ for sb_file in /etc/claude-code/managed-settings.json \
         false) SANDBOX_ON=""; break ;;
     esac
 done
-# Require bubblewrap present, else CC silently runs unsandboxed (e.g. --router-only).
+# SANDBOXED is set ONLY on positive confirmation: effective enabled:true AND
+# bwrap present (without bwrap, CC silently runs unsandboxed, e.g. --router-only).
+# Anything else stays empty and triggers the fail-safe warning below.
 SANDBOXED=""
 [ -n "$SANDBOX_ON" ] && command -v bwrap >/dev/null 2>&1 && SANDBOXED=1
 
@@ -187,7 +192,7 @@ if [ "$DURATION_MS" -gt 0 ]; then
     printf " | \033[0;${info_color}m%sm %ss" \
         "$((DURATION_MS / 60000))" "$(((DURATION_MS % 60000) / 1000))"
 fi
-[ -n "$SANDBOXED" ] && printf " \033[31m(sandboxed)\033[0m"
+[ -z "$SANDBOXED" ] && printf " \033[31m(unsandboxed)\033[0m"
 printf "\033[0m\n"
 
 # Line 2 is suppressed for unknown local proxies (data shape is unclear)
