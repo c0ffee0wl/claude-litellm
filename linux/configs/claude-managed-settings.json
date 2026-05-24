@@ -98,6 +98,10 @@
     "deny": [
       "Bash(rm -rf *)",
       "Bash(rm -fr *)",
+      "Bash(rm -Rf *)",
+      "Bash(rm -fR *)",
+      "Bash(rm -Rfv *)",
+      "Bash(rm -vRf *)",
       "Bash(sudo *)",
       "Bash(su *)",
       "Bash(mkfs *)",

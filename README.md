@@ -29,9 +29,9 @@ Now run `claude`. Traffic goes to `http://127.0.0.1:4000` (LiteLLM's unified Ant
 
 | Command | What happens |
 |---|---|
-| `./linux/setup.sh` | Full setup: LiteLLM + Claude Code + managed-settings hardening + ACP + claude-devtools |
-| `./linux/setup.sh --router-only` | LiteLLM + Claude Code + claude-devtools. Skips ACP and managed-settings hardening. Dev-box mode |
-| `./linux/setup.sh --harden-only` | Claude Code + managed-settings only. Skips LiteLLM and claude-devtools. Use when LiteLLM runs on another host |
+| `./linux/setup.sh` | Full setup: LiteLLM + Claude Code + managed-settings hardening + `nah` plugin + ACP + claude-devtools |
+| `./linux/setup.sh --router-only` | LiteLLM + Claude Code + claude-devtools. Skips ACP, managed-settings hardening, and the `nah` plugin. Dev-box mode |
+| `./linux/setup.sh --harden-only` | Claude Code + managed-settings + `nah` plugin only. Skips LiteLLM and claude-devtools. Use when LiteLLM runs on another host |
 | `./linux/setup.sh --yes` | Non-interactive (combine with any of the above) |
 
 ## Architecture
@@ -48,6 +48,7 @@ Claude Code  ──►  http://127.0.0.1:4000 (LiteLLM /v1/messages)  ──► 
 - **Auth**: a `sk-…` master key is auto-generated on first run, stored in `~/.config/litellm/env` (mode 600) and in `~/.profile` as `ANTHROPIC_AUTH_TOKEN`.
 - **Observability**: bundled LiteLLM admin UI at `http://127.0.0.1:4000/ui/`, backed by the Postgres instance Phase 6 provisions (spend tracking, virtual keys, persistent logs, `/ui` model management all on by default).
 - **Session inspection**: [claude-devtools](https://github.com/matt1398/claude-devtools) standalone web UI at `http://127.0.0.1:12002` (pinned to the upstream's latest release tag; built locally with bun, no Electron).
+- **Action-aware safety guard**: [nah](https://github.com/manuelschipper/nah) installed as a Claude Code plugin (full + `--harden-only`). Classifies commands into action types and adds an independent `allow`/`ask`/`block` gate alongside `claude-managed-settings.json` denies — catches wrapper-evasion the regex denies miss (`bash -c "rm -rf …"`, `python -c`, `git push -f`, …). Per Anthropic's docs both layers fire independently; a hook `"allow"` cannot override `deny[]`. **Survives `--dangerously-skip-permissions`**: PreToolUse hooks still fire in bypass mode per Anthropic docs (the flag skips the prompt + deny/ask/allow rules, but hooks run before the prompt and remain active), so under that flag nah is the *only* active policy layer. See [CLAUDE.md](CLAUDE.md) for the full caveats list (no `.nah.yaml` tuning, unpinned marketplace, known interaction bugs).
 
 ## Important Files
 
@@ -62,4 +63,4 @@ Claude Code  ──►  http://127.0.0.1:4000 (LiteLLM /v1/messages)  ──► 
 
 ## Idempotency
 
-`setup.sh` is idempotent and uses **install-if-missing-only**: if uv, bun, LiteLLM, Claude Code, or ACP are already present, they are not touched (no auto-update). Updates are managed by the user (`uv tool upgrade litellm`, `claude update`, etc.).
+`setup.sh` is idempotent and uses **install-if-missing-only**: if uv, bun, LiteLLM, Claude Code, ACP, or the `nah` plugin are already present, they are not touched (no auto-update). Updates are managed by the user (`uv tool upgrade litellm`, `claude update`, `claude plugin update nah --scope user`, etc.).

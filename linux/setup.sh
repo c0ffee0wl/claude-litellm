@@ -563,6 +563,109 @@ fi
 # 8d. Statusline script
 install -m 755 "$SCRIPT_DIR/scripts/statusline.sh" "${HOME}/.claude/statusline.sh"
 
+# 8e. nah Claude Code plugin — deterministic action-aware guard. Catches
+# wrapper-evasion patterns the Bash(...) deny rules in managed-settings can't
+# (sh -c, python -c, xargs rm, find -delete, git push -f short-form, …) by
+# classifying commands into action types (filesystem_delete, lang_exec,
+# git_history_rewrite, …) and resolving allow/ask/block with sensitive-path
+# + content-scan context. Skipped under --router-only (no policy enforcement
+# in that mode). PreToolUse hooks still fire under --dangerously-skip-permissions
+# per Anthropic docs — the flag skips the deny/ask/allow rule chain and the
+# user prompt, but hooks run *before* the prompt and remain active, so nah
+# is the only active policy layer in that mode (and `permissions.deny[]` is
+# idle). Marketplace ref uses @claude-marketplace branch (where upstream's
+# marketplace.json lives) and is otherwise unpinned — same install-if-missing-
+# then-latest convention as Claude Code (4b) and ACP (4c); user runs
+# `claude plugin update nah --scope user` to upgrade.
+if [ "$ROUTER_ONLY" != "true" ] && { command -v claude &>/dev/null || [ -x "${HOME}/.local/bin/claude" ]; }; then
+    # Marketplace add: schema (verified via `claude plugin marketplace list
+    # --json`) is bare array of { name, source, repo, installLocation } —
+    # .source is the source TYPE ("github"), .repo holds "owner/repo". Match
+    # on .repo for exact identity (avoids fork/mirror false positives).
+    # Stdin redirected + 60s timeout so a trust prompt under headless/CI
+    # invocation can't wedge the script.
+    nah_marketplace_ok=0
+    # `claude plugin marketplace list --json` emits CRLF line endings and a
+    # trailing ANSI escape (\e[?25h) past the closing `]` — strip both before
+    # jq sees the input. Same workaround applied to `claude plugin list --json`
+    # below; see comment there for the empirical evidence.
+    if claude plugin marketplace list --json 2>/dev/null \
+        | tr -d '\r' \
+        | sed -n '/^\[/,/^\]/p' \
+        | jq -e '.[]? | select(.repo == "manuelschipper/nah")' >/dev/null 2>&1; then
+        log "nah marketplace already added — skipping"
+        nah_marketplace_ok=1
+    else
+        log "Adding nah plugin marketplace..."
+        # @claude-marketplace is the git ref where marketplace.json lives in
+        # the upstream repo — the default branch does not contain it, so the
+        # bare `manuelschipper/nah` form fails with "marketplace.json not found".
+        # The .repo field in `claude plugin marketplace list --json` drops the
+        # ref suffix, so the idempotency selector above still matches.
+        if timeout 60 claude plugin marketplace add manuelschipper/nah@claude-marketplace --scope user </dev/null; then
+            nah_marketplace_ok=1
+        else
+            warn "Failed to add nah marketplace — try 'claude update' (the 'plugin' subcommand may be missing in older Claude Code)"
+        fi
+    fi
+
+    # Only attempt install if the marketplace is registered — otherwise the
+    # install call is guaranteed to fail with a less informative error.
+    #
+    # Plugin schema (verified via `claude plugin list --json` on a real install):
+    # bare array of { id: "<plugin>@<marketplace>", scope, enabled, version,
+    # installedAt, ... }. No .name field. `enabled` does NOT auto-flip true on
+    # install — a user (or `claude plugin disable`) can leave it installed-but-
+    # disabled, in which case the hook is inert. We distinguish three states.
+    if [ "$nah_marketplace_ok" = "1" ]; then
+        # Note: `// "absent"` won't work as a fallback because jq's // operator
+        # treats both null AND false as missing — so an installed-but-disabled
+        # plugin (enabled: false) would silently look "absent". Use if/else.
+        #
+        # Defensive: stage the raw output so we can distinguish "empty output"
+        # (claude crashed / subcommand missing) from "parse error" (claude
+        # emitted JSON + trailing noise) from "valid output, plugin absent".
+        # An ambiguous state should NOT trigger reinstall (would spam install
+        # attempts on every re-run); warn and skip until the next run.
+        #
+        # `claude plugin list --json` (verified empirically) writes JSON with
+        # CRLF line endings AND appends a trailing ANSI escape `\e[?25h`
+        # (show-cursor) past the closing `]`. Strip CR with `tr -d '\r'` and
+        # extract just the bracketed array with `sed -n '/^\[/,/^\]/p'` so jq
+        # gets clean input. The sed range tolerates a single-line `[]` (both
+        # anchors match the same line, printed once).
+        plugin_list=$(claude plugin list --json 2>/dev/null \
+            | tr -d '\r' \
+            | sed -n '/^\[/,/^\]/p' \
+            || true)
+        if [ -z "$plugin_list" ]; then
+            nah_state="unknown"
+        else
+            nah_state=$(printf '%s' "$plugin_list" \
+                | jq -r '[.[]? | select(.id == "nah@nah" and .scope == "user")] | if length == 0 then "absent" else .[0].enabled end' 2>/dev/null \
+                || echo "parse-error")
+        fi
+        case "$nah_state" in
+            true)
+                log "nah plugin already installed and enabled — skipping"
+                ;;
+            false)
+                log "nah plugin installed but disabled — re-enabling (comment Phase 8e out to opt out permanently)"
+                timeout 60 claude plugin enable nah@nah --scope user </dev/null \
+                    || warn "Failed to enable nah plugin"
+                ;;
+            absent)
+                log "Installing nah Claude Code plugin..."
+                timeout 60 claude plugin install nah@nah --scope user </dev/null \
+                    || warn "Failed to install nah plugin — try 'claude plugin marketplace list' to confirm marketplace registration"
+                ;;
+            *)
+                warn "Could not determine nah plugin state ('$nah_state') — skipping mutation; re-run setup.sh to retry"
+                ;;
+        esac
+    fi
+fi
+
 log "Claude Code settings deployed"
 
 #############################################################################
