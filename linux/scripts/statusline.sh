@@ -57,8 +57,22 @@ tsv_output=$(printf '%s' "$input" | jq -er '[
     .session_id // "-"
 ] | @tsv' 2>/dev/null)
 
+# Identity colors (root → red info_color as a warning) are resolved up here so
+# the empty-input fallback below renders root-aware too.
+prompt_symbol="@"
+if [ "$EUID" -eq 0 ]; then
+    prompt_color="94"
+    info_color="31"
+else
+    prompt_color="32"
+    info_color="34"
+fi
+# The session-duration counter is always blue, independent of the login
+# identity, so root's red info_color doesn't bleed into it.
+dur_color="34"
+
 if [ -z "$tsv_output" ]; then
-    printf "\033[1;32m(%s@%s)\033[0m" "$user" "$host"
+    printf "\033[1;${info_color}m(%s%s%s)\033[0m" "$user" "$prompt_symbol" "$host"
     exit 0
 fi
 
@@ -71,15 +85,6 @@ IFS=$'\t' read -r cwd proj_dir DURATION_MS MODEL MODEL_ID PCT CTX_SIZE FIVE_H WE
 # "-" is the absent-field sentinel from the jq @tsv above; restore empty for
 # fields whose emptiness carries meaning.
 [ "$MODEL_ID" = "-" ] && MODEL_ID=""
-
-prompt_symbol="@"
-if [ "$EUID" -eq 0 ]; then
-    prompt_color="94"
-    info_color="31"
-else
-    prompt_color="32"
-    info_color="34"
-fi
 
 # Sandbox detection drives the fail-safe "(unsandboxed)" warning below.
 # SANDBOXED is set only on positive confirmation that bash commands are
@@ -227,10 +232,10 @@ if [ "$MODE" = "LITELLM" ]; then
 fi
 
 # Line 1: identity + directory + (duration, only once the first turn completes)
-printf "\033[1;${info_color}m(%s%s%s\033[0;${prompt_color}m)-[\033[0;1m%s\033[0;${prompt_color}m]" \
+printf "\033[1;${prompt_color}m(\033[1;${info_color}m%s%s%s\033[0;1;${prompt_color}m)\033[0;${prompt_color}m-[\033[0;1m%s\033[0;${prompt_color}m]" \
     "$user" "$prompt_symbol" "$host" "$cwd"
 if [ "$DURATION_MS" -gt 0 ]; then
-    printf " | \033[0;${info_color}m%sm %ss" \
+    printf " | \033[0;${dur_color}m%sm %ss" \
         "$((DURATION_MS / 60000))" "$(((DURATION_MS % 60000) / 1000))"
 fi
 [ -z "$SANDBOXED" ] && printf " \033[31m(unsandboxed)\033[0m"
