@@ -6,10 +6,13 @@
 # Retained as a repo-owned, root-enforced, bypass-surviving floor: PreToolUse
 # hooks fire even under --dangerously-skip-permissions (where the
 # permissions.deny[] rm rules are skipped and nah's filesystem_delete=context
-# likely allows non-sensitive deletes), so this exit-2 guard is the only layer
-# that hard-blocks recursive-force deletes in that mode. Complements (does not
-# replace) the deny rules and the nah plugin. See CLAUDE.md > "Action-aware
-# permission layer".
+# likely allows non-sensitive deletes). Scope is deliberately narrow: it blocks
+# only DIRECT top-level recursive-force `rm` (-rf / -Rf / --recursive --force,
+# any flag order/case). It does NOT catch wrapped forms — `sudo rm -rf`,
+# `sh -c`/`bash -c '… rm -rf'`, `xargs rm`, `find -delete` — those are nah's job
+# (action/content scan) and ultimately the bubblewrap sandbox's. Complements
+# (does not replace) the deny rules and the nah plugin. See CLAUDE.md >
+# "Action-aware permission layer".
 
 CMD=$(jq -r '.tool_input.command')
 

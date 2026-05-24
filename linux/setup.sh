@@ -227,9 +227,14 @@ log "bun + uv ready"
 log "=== Phase 4: Tools ==="
 
 # 4a. LiteLLM via uv tool install (install-if-missing). uv was installed in
-# Phase 3. Pin away from PyPI 1.82.7 and 1.82.8 — those releases were
-# compromised with credential-stealing malware (see Anthropic's Claude Code
-# LLM-gateway docs).
+# Phase 3. Floor at >=1.84.0 (a floor, not a hard pin — fresh installs still get
+# the latest, and a dependency cooldown picks the newest aged-in release). This
+# floor sits above the compromised 1.82.7/1.82.8 PyPI releases (credential-
+# stealing malware; see Anthropic's Claude Code LLM-gateway docs), so the old
+# explicit `!=` excludes are no longer needed. It also guarantees the reasoning
+# fixes this setup relies on for Azure GPT-5.4 thinking: the chat→Responses
+# auto-route (1.83.0+) and the output_config.effort→reasoning_effort mapping
+# (1.83.1+).
 LITELLM_BIN="${HOME}/.local/bin/litellm"
 
 if [ "$HARDEN_ONLY" != "true" ]; then
@@ -237,9 +242,9 @@ if [ "$HARDEN_ONLY" != "true" ]; then
         log "LiteLLM already installed at $LITELLM_BIN — skipping"
     else
         log "Installing LiteLLM via uv tool install..."
-        uv tool install --with prisma 'litellm[proxy,proxy-runtime]>=1.83.0,!=1.82.7,!=1.82.8'
+        uv tool install --with prisma 'litellm[proxy,proxy-runtime]>=1.84.0'
         # To enable optional LiteLLM features, swap the line above for:
-        #   uv tool install 'litellm[proxy,proxy-runtime,extra_proxy]>=1.83.0,!=1.82.7,!=1.82.8'
+        #   uv tool install 'litellm[proxy,proxy-runtime,extra_proxy]>=1.84.0'
         # The extra_proxy extra adds: RedisVL semantic caching, Google Cloud KMS
         # + Azure Key Vault as secret backends, and Resend for email — plus
         # prisma, which makes --with prisma redundant.
@@ -436,12 +441,35 @@ remove_profile_export "IS_DEMO"
 # user to add a model via /ui and fill these in. CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
 # is always on so any `claude-*` model added later via /ui auto-appears in
 # /model. See CLAUDE.md > "Model naming".
+#
+# The *_SUPPORTED_CAPABILITIES companions tell Claude Code which features the
+# pinned model supports. Claude Code's built-in detection only matches
+# claude-*/anthropic-* ids, so with upstream-prefixed ids like azure/gpt-5.4 it
+# would otherwise leave extended thinking + effort DISABLED (and never send a
+# thinking block). Values are tuned for Azure GPT-5.4: `effort` is capped at
+# low/medium/high (xhigh_effort/max_effort omitted — gpt-5.4 rejects those and
+# LiteLLM passes them through unclamped → Azure 400); `adaptive_thinking` routes
+# effort via output_config.effort and avoids the manual-budget→"minimal" path
+# that gpt-5.4 also rejects. See CLAUDE.md > "Model naming".
 NEEDS_MODEL_CONFIG=0
 if [ -n "${AZURE_OPENAI_API_KEY:-}" ] && [ -n "${AZURE_RESOURCE_ENDPOINT:-}" ]; then
+    update_profile_export "ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES"   "thinking,adaptive_thinking,interleaved_thinking,effort"
+    update_profile_export "ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES" "thinking,adaptive_thinking,interleaved_thinking,effort"
+    update_profile_export "ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES"  "thinking,adaptive_thinking,effort"
     update_profile_export "ANTHROPIC_DEFAULT_HAIKU_MODEL"  "azure/gpt-5.4-mini"
     update_profile_export "ANTHROPIC_DEFAULT_SONNET_MODEL" "azure/gpt-5.4"
     update_profile_export "ANTHROPIC_DEFAULT_OPUS_MODEL"   "azure/gpt-5.4"
 else
+    # Capability declarations track the model ids; clear them when no model is
+    # pinned (preserving any manual value). Kept out of the NEEDS_MODEL_CONFIG
+    # loop above — capabilities aren't themselves a reason to nag for a model id.
+    for var in ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES \
+               ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES \
+               ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES; do
+        if [ -z "$(read_profile_export "$var")" ]; then
+            update_profile_export "$var" ""
+        fi
+    done
     for var in ANTHROPIC_DEFAULT_HAIKU_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL; do
         existing="$(read_profile_export "$var")"
         if [ -z "$existing" ]; then
@@ -632,7 +660,7 @@ if [ "$ROUTER_ONLY" != "true" ] && { command -v claude &>/dev/null || [ -x "${HO
     # trailing ANSI escape (\e[?25h) past the closing `]` — strip both before
     # jq sees the input. Same workaround applied to `claude plugin list --json`
     # below; see comment there for the empirical evidence.
-    if claude plugin marketplace list --json 2>/dev/null \
+    if timeout 60 claude plugin marketplace list --json </dev/null 2>/dev/null \
         | tr -d '\r' \
         | sed -n '/^\[/,/^\]/p' \
         | jq -e '.[]? | select(.repo == "manuelschipper/nah")' >/dev/null 2>&1; then
@@ -645,7 +673,7 @@ if [ "$ROUTER_ONLY" != "true" ] && { command -v claude &>/dev/null || [ -x "${HO
         # bare `manuelschipper/nah` form fails with "marketplace.json not found".
         # The .repo field in `claude plugin marketplace list --json` drops the
         # ref suffix, so the idempotency selector above still matches.
-        if timeout 60 claude plugin marketplace add manuelschipper/nah@claude-marketplace --scope user </dev/null; then
+        if timeout 60 claude plugin marketplace add manuelschipper/nah@claude-marketplace </dev/null; then
             nah_marketplace_ok=1
         else
             warn "Failed to add nah marketplace — try 'claude update' (the 'plugin' subcommand may be missing in older Claude Code)"
@@ -677,7 +705,7 @@ if [ "$ROUTER_ONLY" != "true" ] && { command -v claude &>/dev/null || [ -x "${HO
         # extract just the bracketed array with `sed -n '/^\[/,/^\]/p'` so jq
         # gets clean input. The sed range tolerates a single-line `[]` (both
         # anchors match the same line, printed once).
-        plugin_list=$(claude plugin list --json 2>/dev/null \
+        plugin_list=$(timeout 60 claude plugin list --json </dev/null 2>/dev/null \
             | tr -d '\r' \
             | sed -n '/^\[/,/^\]/p' \
             || true)
@@ -921,7 +949,10 @@ if [ "${NEEDS_MODEL_CONFIG:-0}" = "1" ] && [ -t 1 ]; then
     echo -e "         ${GREEN}export ANTHROPIC_DEFAULT_HAIKU_MODEL=\"<name>\"${NC}"
     echo -e "         ${GREEN}export ANTHROPIC_DEFAULT_SONNET_MODEL=\"<name>\"${NC}"
     echo -e "         ${GREEN}export ANTHROPIC_DEFAULT_OPUS_MODEL=\"<name>\"${NC}"
-    echo -e "    3. ${GREEN}source ~/.profile${NC} (or open a new shell) before \`claude\`."
+    echo -e "    3. If that name is not \`claude-*\`/\`anthropic-*\`, also declare its"
+    echo -e "       capabilities or Claude Code leaves thinking + effort OFF:"
+    echo -e "         ${GREEN}export ANTHROPIC_DEFAULT_{HAIKU,SONNET,OPUS}_MODEL_SUPPORTED_CAPABILITIES=\"thinking,adaptive_thinking,interleaved_thinking,effort\"${NC}"
+    echo -e "    4. ${GREEN}source ~/.profile${NC} (or open a new shell) before \`claude\`."
     echo -e "${YELLOW}${rule}${NC}"
     echo ""
 fi
