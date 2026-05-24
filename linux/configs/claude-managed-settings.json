@@ -195,10 +195,7 @@
       "Bash(printenv *)",
       "Bash(set)",
 
-      "NotebookEdit",
-      "CronCreate",
-      "CronDelete",
-      "CronList"
+      "NotebookEdit"
     ],
     "allow": [
       "mcp__microsoft-learn__microsoft_docs_search",
