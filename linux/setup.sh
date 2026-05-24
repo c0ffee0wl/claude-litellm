@@ -653,19 +653,29 @@ if [ "$ROUTER_ONLY" != "true" ] && { command -v claude &>/dev/null || [ -x "${HO
     # --json`) is bare array of { name, source, repo, installLocation } —
     # .source is the source TYPE ("github"), .repo holds "owner/repo". Match
     # on .repo for exact identity (avoids fork/mirror false positives).
-    # Stdin redirected + timeout so a trust prompt under headless/CI
-    # invocation can't wedge the script. Use `timeout -k <grace>`: plain
-    # `timeout N` only sends SIGTERM and then waits for the child to exit —
-    # the Node-based `claude` can swallow SIGTERM or keep its event loop alive
-    # after printing success (background marketplace-cache refresh / keep-alive
-    # socket), so `timeout` would wait forever and the script hangs with no
-    # error. `-k` escalates to uncatchable SIGKILL after the grace window,
-    # guaranteeing the call returns. The mutating add/install calls also clone
-    # over the network and run claude's *own* 120s internal git timeout, so
-    # their outer bound is 180s (above 120s) to avoid cutting off a slow-but-
-    # working first clone; force-kill after a 15s grace still caps the worst
-    # case. The on-disk state is committed before any post-success lingering,
-    # so a force-kill never corrupts it (re-runs find it "already added").
+    # Stdin redirected + timeout so a headless/CI invocation can't wedge the
+    # script. Two independent hazards, two guards:
+    #
+    #   1. TTY probing (the real wedger). `claude` is a Node TUI: when its
+    #      stdout is an interactive terminal it emits terminal-capability
+    #      queries (OSC 11 background-colour, DA1 device-attributes) AFTER
+    #      doing its work and blocks waiting for the replies — which arrive on
+    #      stdin, but stdin is </dev/null here, so they never come and it hangs
+    #      forever (it has already printed "Successfully installed", so the
+    #      on-disk action is done). The read-only calls dodge this for free by
+    #      piping stdout into tr|sed|jq — a pipe is not a tty, so isTTY is
+    #      false and claude stays non-interactive. The mutating calls must do
+    #      the same: wrap in `$(... 2>&1)` so stdout/stderr are pipes, not the
+    #      terminal. Output is captured and surfaced only on failure.
+    #   2. timeout signal escalation (belt-and-suspenders). Plain `timeout N`
+    #      sends only SIGTERM then waits for the child; a Node process that
+    #      traps it or keeps a handle open is never killed and timeout waits
+    #      forever. `-k <grace>` escalates to uncatchable SIGKILL. The
+    #      add/install calls clone over the network under claude's own 120s
+    #      internal git timeout, so their outer bound is 180s (above 120s) to
+    #      avoid cutting a slow-but-working first clone; -k 15 force-kills 15s
+    #      later. State is committed before any lingering, so a force-kill
+    #      never corrupts it (re-runs find it "already added"/installed).
     nah_marketplace_ok=0
     # `claude plugin marketplace list --json` emits CRLF line endings and a
     # trailing ANSI escape (\e[?25h) past the closing `]` — strip both before
@@ -684,10 +694,13 @@ if [ "$ROUTER_ONLY" != "true" ] && { command -v claude &>/dev/null || [ -x "${HO
         # bare `manuelschipper/nah` form fails with "marketplace.json not found".
         # The .repo field in `claude plugin marketplace list --json` drops the
         # ref suffix, so the idempotency selector above still matches.
-        if timeout -k 15 180 claude plugin marketplace add manuelschipper/nah@claude-marketplace </dev/null; then
+        # $(... 2>&1) keeps stdout/stderr off the tty (hazard 1 above) so the
+        # add doesn't block on terminal-capability probes; if-condition form is
+        # set -e-safe (substitution failure doesn't abort the script).
+        if nah_add_out=$(timeout -k 15 180 claude plugin marketplace add manuelschipper/nah@claude-marketplace </dev/null 2>&1); then
             nah_marketplace_ok=1
         else
-            warn "Failed to add nah marketplace — try 'claude update' (the 'plugin' subcommand may be missing in older Claude Code)"
+            warn "Failed to add nah marketplace — try 'claude update' (the 'plugin' subcommand may be missing in older Claude Code). Output: ${nah_add_out}"
         fi
     fi
 
@@ -733,13 +746,17 @@ if [ "$ROUTER_ONLY" != "true" ] && { command -v claude &>/dev/null || [ -x "${HO
                 ;;
             false)
                 log "nah plugin installed but disabled — re-enabling (comment Phase 8e out to opt out permanently)"
-                timeout -k 15 60 claude plugin enable nah@nah --scope user </dev/null \
-                    || warn "Failed to enable nah plugin"
+                if ! nah_enable_out=$(timeout -k 15 60 claude plugin enable nah@nah --scope user </dev/null 2>&1); then
+                    warn "Failed to enable nah plugin. Output: ${nah_enable_out}"
+                fi
                 ;;
             absent)
                 log "Installing nah Claude Code plugin..."
-                timeout -k 15 180 claude plugin install nah@nah --scope user </dev/null \
-                    || warn "Failed to install nah plugin — try 'claude plugin marketplace list' to confirm marketplace registration"
+                if nah_install_out=$(timeout -k 15 180 claude plugin install nah@nah --scope user </dev/null 2>&1); then
+                    log "nah plugin installed"
+                else
+                    warn "Failed to install nah plugin — try 'claude plugin marketplace list' to confirm marketplace registration. Output: ${nah_install_out}"
+                fi
                 ;;
             *)
                 warn "Could not determine nah plugin state ('$nah_state') — skipping mutation; re-run setup.sh to retry"
