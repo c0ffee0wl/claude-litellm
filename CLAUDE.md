@@ -87,6 +87,7 @@ If LiteLLM fails to start, the service runs at `LITELLM_LOG=ERROR` which hides P
 bash -n linux/setup.sh && bash -n linux/common.sh                    # Syntax check
 python3 -c "import yaml; yaml.safe_load(open('linux/configs/litellm-config.yaml'))"
 jq . linux/configs/claude-managed-settings.json
+jq . linux/configs/claude-settings.json                              # user settings + sandbox block
 systemctl --user status litellm claude-devtools                      # Service health
 systemctl status postgresql                                          # DB up
 curl -sf http://127.0.0.1:4000/health/liveliness                     # LiteLLM liveness
