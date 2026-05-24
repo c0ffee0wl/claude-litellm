@@ -653,14 +653,25 @@ if [ "$ROUTER_ONLY" != "true" ] && { command -v claude &>/dev/null || [ -x "${HO
     # --json`) is bare array of { name, source, repo, installLocation } —
     # .source is the source TYPE ("github"), .repo holds "owner/repo". Match
     # on .repo for exact identity (avoids fork/mirror false positives).
-    # Stdin redirected + 60s timeout so a trust prompt under headless/CI
-    # invocation can't wedge the script.
+    # Stdin redirected + timeout so a trust prompt under headless/CI
+    # invocation can't wedge the script. Use `timeout -k <grace>`: plain
+    # `timeout N` only sends SIGTERM and then waits for the child to exit —
+    # the Node-based `claude` can swallow SIGTERM or keep its event loop alive
+    # after printing success (background marketplace-cache refresh / keep-alive
+    # socket), so `timeout` would wait forever and the script hangs with no
+    # error. `-k` escalates to uncatchable SIGKILL after the grace window,
+    # guaranteeing the call returns. The mutating add/install calls also clone
+    # over the network and run claude's *own* 120s internal git timeout, so
+    # their outer bound is 180s (above 120s) to avoid cutting off a slow-but-
+    # working first clone; force-kill after a 15s grace still caps the worst
+    # case. The on-disk state is committed before any post-success lingering,
+    # so a force-kill never corrupts it (re-runs find it "already added").
     nah_marketplace_ok=0
     # `claude plugin marketplace list --json` emits CRLF line endings and a
     # trailing ANSI escape (\e[?25h) past the closing `]` — strip both before
     # jq sees the input. Same workaround applied to `claude plugin list --json`
     # below; see comment there for the empirical evidence.
-    if timeout 60 claude plugin marketplace list --json </dev/null 2>/dev/null \
+    if timeout -k 15 60 claude plugin marketplace list --json </dev/null 2>/dev/null \
         | tr -d '\r' \
         | sed -n '/^\[/,/^\]/p' \
         | jq -e '.[]? | select(.repo == "manuelschipper/nah")' >/dev/null 2>&1; then
@@ -673,7 +684,7 @@ if [ "$ROUTER_ONLY" != "true" ] && { command -v claude &>/dev/null || [ -x "${HO
         # bare `manuelschipper/nah` form fails with "marketplace.json not found".
         # The .repo field in `claude plugin marketplace list --json` drops the
         # ref suffix, so the idempotency selector above still matches.
-        if timeout 60 claude plugin marketplace add manuelschipper/nah@claude-marketplace </dev/null; then
+        if timeout -k 15 180 claude plugin marketplace add manuelschipper/nah@claude-marketplace </dev/null; then
             nah_marketplace_ok=1
         else
             warn "Failed to add nah marketplace — try 'claude update' (the 'plugin' subcommand may be missing in older Claude Code)"
@@ -705,7 +716,7 @@ if [ "$ROUTER_ONLY" != "true" ] && { command -v claude &>/dev/null || [ -x "${HO
         # extract just the bracketed array with `sed -n '/^\[/,/^\]/p'` so jq
         # gets clean input. The sed range tolerates a single-line `[]` (both
         # anchors match the same line, printed once).
-        plugin_list=$(timeout 60 claude plugin list --json </dev/null 2>/dev/null \
+        plugin_list=$(timeout -k 15 60 claude plugin list --json </dev/null 2>/dev/null \
             | tr -d '\r' \
             | sed -n '/^\[/,/^\]/p' \
             || true)
@@ -722,12 +733,12 @@ if [ "$ROUTER_ONLY" != "true" ] && { command -v claude &>/dev/null || [ -x "${HO
                 ;;
             false)
                 log "nah plugin installed but disabled — re-enabling (comment Phase 8e out to opt out permanently)"
-                timeout 60 claude plugin enable nah@nah --scope user </dev/null \
+                timeout -k 15 60 claude plugin enable nah@nah --scope user </dev/null \
                     || warn "Failed to enable nah plugin"
                 ;;
             absent)
                 log "Installing nah Claude Code plugin..."
-                timeout 60 claude plugin install nah@nah --scope user </dev/null \
+                timeout -k 15 180 claude plugin install nah@nah --scope user </dev/null \
                     || warn "Failed to install nah plugin — try 'claude plugin marketplace list' to confirm marketplace registration"
                 ;;
             *)
