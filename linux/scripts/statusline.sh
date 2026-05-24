@@ -20,8 +20,10 @@
 #            Pro/Max), each with a reset countdown from rate_limits.*.resets_at
 #   LITELLM — 127.0.0.1:4000: show progress bar + model + ctx %, with the
 #            upstream model (e.g. gpt-5.4) appended after an arrow when
-#            available via LiteLLM's /model/info endpoint, plus month-to-date
-#            gateway spend (labelled "/mo") from LiteLLM's /global/spend
+#            available via LiteLLM's /model/info endpoint, plus trailing
+#            30-day gateway spend (labelled "/30d") from LiteLLM's
+#            /global/spend (the MonthlyGlobalSpend view is a rolling
+#            CURRENT_DATE - 30 days window, NOT calendar month-to-date)
 #   OTHER   — other local proxy (CCR etc.): hide line 2 like the upstream script
 
 # Errors must never leak to Claude Code's UI
@@ -213,8 +215,11 @@ if [ "$MODE" = "LITELLM" ]; then
         fi
     fi
 
-    # Month-to-date gateway spend via /global/spend (cached 1min). The master
+    # Trailing-30-day gateway spend via /global/spend (cached 1min). The master
     # key is proxy admin, so user_api_key_auth passes; returns {"spend": <usd>}.
+    # NB: /global/spend sums the MonthlyGlobalSpend view, whose WHERE clause is
+    # "startTime >= CURRENT_DATE - INTERVAL '30 days'" — a rolling 30-day window,
+    # not calendar month-to-date. Labelled "/30d" below to match.
     SPEND_CACHE="${CACHE_DIR}/claude-litellm-spend-${EUID}.json"
     if [ ! -s "$SPEND_CACHE" ] || [ -z "$(find "$SPEND_CACHE" -mmin -1 2>/dev/null)" ]; then
         resolve_token
@@ -299,10 +304,11 @@ if [ "$MODE" = "DIRECT" ]; then
         r=$(fmt_reset "$WEEK_RESET"); SUFFIX="${SUFFIX:+$SUFFIX, }7d: $(LC_ALL=C printf '%.0f' "$WEEK")%${r:+ ($r)}"
     fi
 elif [ "$MODE" = "LITELLM" ] && [[ "$SPEND" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
-    # Month-to-date gateway spend, explicitly labelled "/mo" so it can't be
-    # mistaken for session cost; awk for the float compare
-    if   LC_ALL=C awk "BEGIN{exit !($SPEND>=0.01)}"; then SUFFIX="$(LC_ALL=C printf '$%.2f/mo' "$SPEND")"
-    elif LC_ALL=C awk "BEGIN{exit !($SPEND>0)}";    then SUFFIX="$(LC_ALL=C printf '$%.4f/mo' "$SPEND")"; fi
+    # Trailing-30-day gateway spend, explicitly labelled "/30d" so it can't be
+    # mistaken for session cost or for calendar month-to-date; awk for the float
+    # compare
+    if   LC_ALL=C awk "BEGIN{exit !($SPEND>=0.01)}"; then SUFFIX="$(LC_ALL=C printf '$%.2f/30d' "$SPEND")"
+    elif LC_ALL=C awk "BEGIN{exit !($SPEND>0)}";    then SUFFIX="$(LC_ALL=C printf '$%.4f/30d' "$SPEND")"; fi
 fi
 
 [ -n "$SUFFIX" ] && LINE2="${LINE2} | ${SUFFIX}"
