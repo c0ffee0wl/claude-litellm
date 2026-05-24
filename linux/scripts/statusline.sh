@@ -3,13 +3,16 @@
 # Line 1: (user@host)-[cwd] | session duration [(unsandboxed)]
 # Line 2: [Model] [bar] PCT% (CTX_SIZE) | (mode-specific suffix)
 #
-# A red "(unsandboxed)" tag trails the duration UNLESS the bubblewrap sandbox is
-# positively confirmed active. Claude Code does not expose sandbox state to
+# A red "(unsandboxed)" tag trails the duration UNLESS bash commands are
+# positively confirmed contained. Claude Code does not expose sandbox state to
 # statuslines (no JSON field, no env var — anthropics/claude-code#30772), so
-# this is best-effort and deliberately FAIL-SAFE: the warning shows unless the
-# effective sandbox.enabled is true across the settings precedence chain AND
-# bwrap is present. "Off", "can't determine", and "enabled but bwrap missing"
-# (CC's silent fallback to unsandboxed) all warn — a detection gap over-warns
+# this is best-effort and deliberately FAIL-SAFE: the warning shows unless one
+# of two things holds — (a) Claude Code itself runs inside an OUTER sandbox
+# (bubblewrap via blaude, Landlock via nono, or a container; detected from the
+# kernel / an env marker — see below),
+# or (b) CC's per-command sandbox is effectively enabled across the settings
+# precedence chain AND bwrap is present. "Off", "can't determine", and "enabled
+# but bwrap missing" (CC's silent fallback) all warn — a detection gap over-warns
 # rather than falsely reassuring.
 #
 # Mode is detected via ANTHROPIC_BASE_URL:
@@ -78,33 +81,71 @@ else
     info_color="34"
 fi
 
-# Best-effort sandbox detection. Resolve the effective sandbox.enabled across
-# the settings precedence chain (highest first), taking the first file that
-# *defines* the key — so an explicit higher-layer `false` wins over a lower
-# `true`. The try/catch always emits exactly one token, mapping an absent or
-# malformed sandbox block to "unset" (keep looking) and keeping an explicit
-# `false` distinct from absent.
-# Project-level files are read from project_dir (the launch dir, where /sandbox
-# persists its runtime toggle) — NOT current_dir, which drifts as the session
-# cd's into subdirs. proj_dir already falls back to current_dir in the jq above.
-SANDBOX_ON=""
-sb_root="$proj_dir"
-for sb_file in /etc/claude-code/managed-settings.json \
-               "$sb_root/.claude/settings.local.json" \
-               "$sb_root/.claude/settings.json" \
-               "$HOME/.claude/settings.json"; do
-    [ -r "$sb_file" ] || continue
-    sb_val=$(jq -r 'try (.sandbox.enabled) catch null | if .==true then "true" elif .==false then "false" else "unset" end' "$sb_file" 2>/dev/null)
-    case "$sb_val" in
-        true) SANDBOX_ON=1; break ;;
-        false) SANDBOX_ON=""; break ;;
-    esac
-done
-# SANDBOXED is set ONLY on positive confirmation: effective enabled:true AND
-# bwrap present (without bwrap, CC silently runs unsandboxed, e.g. --router-only).
-# Anything else stays empty and triggers the fail-safe warning below.
+# Sandbox detection drives the fail-safe "(unsandboxed)" warning below.
+# SANDBOXED is set only on positive confirmation that bash commands are
+# contained; anything else warns.
 SANDBOXED=""
-[ -n "$SANDBOX_ON" ] && command -v bwrap >/dev/null 2>&1 && SANDBOXED=1
+
+# (a) Outer sandbox: Claude Code itself may run inside an external sandbox — then
+# the per-command sandbox is moot and we suppress the warning. Detected, in order
+# (all fork-free; the statusline shares CC's namespaces, so /proc/self is its own
+# accurate view):
+#   1. CLAUDE_SANDBOX / $container env marker — set by the wrapper. Deterministic
+#      and mechanism-agnostic; blaude/nono can export it (recommended).
+#   2. container runtime marker files (docker/podman).
+#   3. user namespace — bubblewrap (blaude) and rootless containers remap uids.
+#      The initial (host) userns is ALWAYS exactly "0 0 4294967295" for every user
+#      (root or 1000 — it's the namespace's map, not your uid), so any other value
+#      means we're in a user namespace.
+#   4. NoNewPrivs=1 — Landlock *requires* no_new_privs, so this catches nono
+#      (Landlock-only, leaves no namespace) as well as bwrap. Caveat: unrelated
+#      hardening (e.g. a systemd NoNewPrivileges= unit) also sets it, so this can
+#      over-suppress — an accepted trade to detect Landlock, which exposes no
+#      other portable marker (/proc/self/attr/landlock/domain is kernel-6.x+ only
+#      and refuses self-reads). Set CLAUDE_SANDBOX to make detection exact.
+outer_sandbox=""
+if [ -n "${CLAUDE_SANDBOX:-}" ] || [ -n "${container:-}" ] \
+   || [ -e /.dockerenv ] || [ -e /run/.containerenv ]; then
+    outer_sandbox=1
+elif [ -r /proc/self/uid_map ] \
+     && read -r u1 u2 u3 _ < /proc/self/uid_map \
+     && [[ "$u1" =~ ^[0-9]+$ && "$u2" =~ ^[0-9]+$ && "$u3" =~ ^[0-9]+$ ]] \
+     && [ "$u1 $u2 $u3" != "0 0 4294967295" ]; then
+    # Suppress ONLY on a well-formed, non-host mapping. An empty/garbage read
+    # (read fails or fields aren't numeric) falls through rather than suppressing
+    # — "can't determine" must warn, not falsely reassure (fail-safe contract).
+    outer_sandbox=1
+elif [ -r /proc/self/status ]; then
+    while IFS=$' \t:' read -r nnp_k nnp_v _; do
+        [ "$nnp_k" = NoNewPrivs ] && { [ "$nnp_v" = 1 ] && outer_sandbox=1; break; }
+    done < /proc/self/status
+fi
+
+if [ -n "$outer_sandbox" ]; then
+    SANDBOXED=1
+else
+    # (b) CC per-command sandbox: resolve the effective sandbox.enabled across
+    # the settings precedence chain (highest first), taking the first file that
+    # *defines* the key — an explicit higher-layer `false` wins over a lower
+    # `true`. try/catch emits exactly one token, mapping an absent/malformed
+    # block to "unset" (keep looking). Project-level files come from project_dir
+    # (the /sandbox toggle location), NOT current_dir which drifts on `cd`.
+    # Requires bwrap present too, else CC silently runs unsandboxed.
+    SANDBOX_ON=""
+    sb_root="$proj_dir"
+    for sb_file in /etc/claude-code/managed-settings.json \
+                   "$sb_root/.claude/settings.local.json" \
+                   "$sb_root/.claude/settings.json" \
+                   "$HOME/.claude/settings.json"; do
+        [ -r "$sb_file" ] || continue
+        sb_val=$(jq -r 'try (.sandbox.enabled) catch null | if .==true then "true" elif .==false then "false" else "unset" end' "$sb_file" 2>/dev/null)
+        case "$sb_val" in
+            true) SANDBOX_ON=1; break ;;
+            false) SANDBOX_ON=""; break ;;
+        esac
+    done
+    [ -n "$SANDBOX_ON" ] && command -v bwrap >/dev/null 2>&1 && SANDBOXED=1
+fi
 
 # Mode detection
 MODE="DIRECT"
