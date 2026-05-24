@@ -605,8 +605,8 @@ fi
 
 log "=== Phase 8: Claude Code Settings ==="
 
-# 8a + 8b: system-level hardening (managed-settings + sandbox prereq). Skipped
-# in --router-only — that mode opts out of system-wide policy enforcement.
+# 8a: system-level hardening (managed-settings). Skipped in --router-only —
+# that mode opts out of system-wide policy enforcement.
 if [ "$ROUTER_ONLY" != "true" ]; then
     # 8a. Managed settings (system-level, root-owned). Token-substitute __REPO_DIR__ in hooks paths.
     sudo install -d -m 755 /etc/claude-code
@@ -619,13 +619,15 @@ if [ "$ROUTER_ONLY" != "true" ]; then
     sudo install -m 644 -o root -g root "$MANAGED_TMP" /etc/claude-code/managed-settings.json
     rm -f "$MANAGED_TMP"
     log "Managed settings deployed to /etc/claude-code/managed-settings.json"
-
-    # 8b. /tmp/claude (sandbox prerequisite; bashrc-ct.sh is gone, do it here)
-    mkdir -p /tmp/claude
-    chmod 755 /tmp/claude
 fi
 
-# 8c + 8d: user-level state — runs in every mode (8a/8b are root-only).
+# 8b. /tmp/claude (sandbox prerequisite; bashrc-ct.sh is gone, do it here). Runs in
+# every mode — no sudo needed, and the sandbox runtime now ships in all modes (incl.
+# --router-only, which can /sandbox on), so the prereq dir must exist everywhere.
+mkdir -p /tmp/claude
+chmod 755 /tmp/claude
+
+# 8c + 8d: user-level state — runs in every mode (8a is root-only; 8b ran above).
 
 # 8c. User settings. Deploy only on a fresh install — once Claude Code is
 # running it owns this file (theme, plugins, accepted-bypass state); a
@@ -636,7 +638,12 @@ if [ ! -f "${HOME}/.claude/settings.json" ]; then
         # deploy an enabled sandbox in a mode meant to be minimal. The bwrap runtime
         # is still installed (Phase 2), so the user can `/sandbox` on whenever they
         # want (writes settings.local.json) — only the default config is absent.
-        jq 'del(.sandbox)' "$SCRIPT_DIR/configs/claude-settings.json" \
+        # Capture jq's output first: a bare `jq | write_if_changed` pipeline has no
+        # pipefail (set -o pipefail isn't set), so a jq failure would be masked and
+        # write_if_changed would write an empty settings.json and return 0. The
+        # `VAR=$(jq …)` form aborts the script under `set -e` if jq fails.
+        SANDBOX_STRIPPED_SETTINGS=$(jq 'del(.sandbox)' "$SCRIPT_DIR/configs/claude-settings.json")
+        printf '%s\n' "$SANDBOX_STRIPPED_SETTINGS" \
             | write_if_changed "${HOME}/.claude/settings.json" 644 "${USER}:${USER}"
     else
         deploy_config "$SCRIPT_DIR/configs/claude-settings.json" "${HOME}/.claude/settings.json"

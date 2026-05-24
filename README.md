@@ -30,7 +30,7 @@ Now run `claude`. Traffic goes to `http://127.0.0.1:4000` (LiteLLM's unified Ant
 | Command | What happens |
 |---|---|
 | `./linux/setup.sh` | Full setup: LiteLLM + Claude Code + managed-settings hardening + `nah` plugin + claude-devtools |
-| `./linux/setup.sh --router-only` | LiteLLM + Claude Code + claude-devtools. Skips managed-settings hardening and the `nah` plugin; ships the sandbox **off** by default (block stripped from user settings, but bwrap is still installed so `/sandbox` can enable it). Dev-box mode |
+| `./linux/setup.sh --router-only` | LiteLLM + Claude Code + claude-devtools. Skips managed-settings hardening and the `nah` plugin; on a **fresh install** ships the sandbox **off** by default (the `sandbox` block is stripped from user settings, but bwrap is still installed so `/sandbox` can enable it; an existing `~/.claude/settings.json` is left untouched). Dev-box mode |
 | `./linux/setup.sh --harden-only` | Claude Code + managed-settings + `nah` plugin only. Skips LiteLLM and claude-devtools. Use when LiteLLM runs on another host |
 | `./linux/setup.sh --install-obsidian` | Also installs the ACP adapter + the latest Obsidian (`.deb`). Additive — combine with any mode |
 | `./linux/setup.sh --yes` | Non-interactive (combine with any of the above) |
