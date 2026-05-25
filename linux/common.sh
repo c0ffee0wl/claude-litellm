@@ -306,19 +306,35 @@ APPARMOR
 # /opt/linux-setup); only the activation tail differs (rootless setuptool rather
 # than the root daemon + `usermod -aG docker` the convenience path uses).
 #
-# Idempotent: skips the apt install when `docker` is already present, and skips
-# the rootless setup when the per-user docker.service already exists.
+# Idempotent: skips the engine install when `docker` is already present (but
+# still ensures the rootless runtime deps — uidmap/slirp4netns/dbus-user-session/
+# rootless-extras — which a pre-existing *rootful* engine commonly lacks), and
+# skips the rootless setup when the per-user docker.service already exists.
 install_docker_rootless() {
     local docker_distro docker_codename
+    local need_engine=false need_rootless_deps=false pkg
 
-    if ! command -v docker &>/dev/null; then
-        log "Installing Docker CE (official apt repo)..."
+    command -v docker &>/dev/null || need_engine=true
+    # Rootless runtime prereqs: uidmap (newuidmap/newgidmap), slirp4netns
+    # (userspace networking), dbus-user-session (user systemd manager), and
+    # docker-ce-rootless-extras (dockerd-rootless.sh + the setuptool). A
+    # pre-existing rootful engine often lacks these, which makes
+    # dockerd-rootless-setuptool.sh abort with "Missing system requirements …
+    # apt-get install -y uidmap" — so ensure them regardless of engine presence.
+    for pkg in uidmap slirp4netns dbus-user-session docker-ce-rootless-extras; do
+        dpkg -s "$pkg" &>/dev/null || { need_rootless_deps=true; break; }
+    done
 
-        # Remove conflicting/old packages (ignore failures — they may be absent).
-        local pkg
-        for pkg in docker.io docker-doc docker-compose docker-compose-v2 podman-docker containerd runc; do
-            sudo apt-get remove -y "$pkg" 2>/dev/null || true
-        done
+    if [ "$need_engine" = true ] || [ "$need_rootless_deps" = true ]; then
+        log "Installing Docker CE / rootless deps (official apt repo)..."
+
+        # Remove conflicting/old packages only when installing the engine fresh
+        # (ignore failures — they may be absent); never touch a working engine.
+        if [ "$need_engine" = true ]; then
+            for pkg in docker.io docker-doc docker-compose docker-compose-v2 podman-docker containerd runc; do
+                sudo apt-get remove -y "$pkg" 2>/dev/null || true
+            done
+        fi
 
         # Detect distribution + codename for the Docker repo. Docker only ships
         # repos for specific Debian/Ubuntu releases; fall back to Debian trixie
@@ -361,16 +377,21 @@ install_docker_rootless() {
             | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
 
         sudo apt-get update
+        if [ "$need_engine" = true ]; then
+            sudo apt-get install -y \
+                docker-ce docker-ce-cli containerd.io \
+                docker-buildx-plugin docker-compose-plugin
+        fi
         # docker-ce-rootless-extras provides dockerd-rootless-setuptool.sh +
         # dockerd-rootless.sh; uidmap provides newuidmap/newgidmap; slirp4netns
         # provides userspace networking; dbus-user-session lets the user systemd
-        # manager start the daemon.
+        # manager start the daemon. Always (re)installed — a pre-existing rootful
+        # engine may predate them (the setuptool's "Missing system requirements …
+        # uidmap" abort); apt is a no-op for any already present.
         sudo apt-get install -y \
-            docker-ce docker-ce-cli containerd.io \
-            docker-buildx-plugin docker-compose-plugin \
             docker-ce-rootless-extras uidmap slirp4netns dbus-user-session
     else
-        log "Docker already installed — skipping apt install"
+        log "Docker + rootless deps already installed — skipping apt install"
     fi
 
     # Rootless dockerd uses the per-user socket ($XDG_RUNTIME_DIR/docker.sock),
