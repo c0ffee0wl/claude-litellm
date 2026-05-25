@@ -401,8 +401,22 @@ install_docker_rootless() {
         local setuptool
         setuptool="$(command -v dockerd-rootless-setuptool.sh 2>/dev/null || echo /usr/bin/dockerd-rootless-setuptool.sh)"
         if [ -x "$setuptool" ]; then
+            # When a rootful Docker daemon is already running its socket is
+            # writable, and the setuptool aborts ("Aborting because rootful
+            # Docker (/var/run/docker.sock) is running and accessible. Set
+            # --force to ignore."). Rootless coexists with it on a separate
+            # per-user socket — litellm-docker.service pins DOCKER_HOST to the
+            # rootless socket — so pass --force to proceed. Force ONLY when the
+            # rootful socket is actually present: on a clean box the bare
+            # `install` keeps the setuptool's RootlessKit smoke-test fatal
+            # (--force would also downgrade that genuine failure to a warning).
+            local install_args=(install)
+            if [ -w /var/run/docker.sock ]; then
+                log "Rootful Docker detected — installing rootless alongside it (coexists on a separate per-user socket; passing --force)"
+                install_args+=(--force)
+            fi
             # Needs $XDG_RUNTIME_DIR + a running user systemd (dbus-user-session).
-            if ! "$setuptool" install; then
+            if ! "$setuptool" "${install_args[@]}"; then
                 warn "dockerd-rootless-setuptool.sh install reported an error — rootless Docker may not work (see output above)"
             fi
         else
