@@ -1,0 +1,60 @@
+# Dockerized LiteLLM — deployed by `setup.sh --docker` to
+# ~/.config/litellm/docker-compose.yml and run by the `litellm` systemd --user
+# unit against the rootless Docker daemon (see linux/systemd/litellm-docker.service).
+#
+# Scope: ONLY LiteLLM runs in a container. Postgres stays on the HOST (apt/systemd,
+# provisioned by setup.sh Phase 6) and is reached over its bind-mounted Unix
+# socket — no TCP listener, no network exposure (Postgres keeps its default
+# loopback-only/socket binding). The host DB is reused as-is, so /ui-added models,
+# keys, and spend history persist across the native<->docker switch (no fresh DB
+# volume). claude-devtools also stays native (Phase 9).
+#
+# Relative paths (./config.yaml, ./env) resolve against this file's directory
+# (~/.config/litellm), so no token substitution is needed.
+
+services:
+  litellm:
+    # Pinned image — a deliberate floor/pin like the uv `>=1.84.0` floor and the
+    # claude-devtools release-tag pin (CLAUDE.md > "install-if-missing"). `-stable`
+    # is LiteLLM's production channel. Bump intentionally; ExecStartPre re-pulls.
+    image: ghcr.io/berriai/litellm:v1.86.0-stable
+    restart: unless-stopped
+    # Publish to loopback only — same localhost-only exposure as the native unit
+    # (which binds --host 127.0.0.1). The container itself listens on 0.0.0.0
+    # (required so the published port reaches it); it is NOT reachable off-host.
+    ports:
+      - "127.0.0.1:4000:4000"
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      # Host Postgres Unix socket — the container connects over this (DATABASE_URL
+      # carries `?host=/run/postgresql`), so there is no TCP listener and nothing
+      # exposed on any network interface. (/var/run is a symlink to /run on Debian.)
+      - /run/postgresql:/run/postgresql
+    # Master key, DATABASE_URL (socket: ?host=/run/postgresql), STORE_MODEL_IN_DB,
+    # and auto-discovered provider secrets — the same mode-600 file the native unit
+    # uses as its systemd EnvironmentFile.
+    env_file:
+      - ./env
+    environment:
+      LITELLM_MODE: "PRODUCTION"
+      LITELLM_LOG: "ERROR"
+      LITELLM_LOCAL_ANTHROPIC_BETA_HEADERS: "true"
+    command:
+      - "--config"
+      - "/app/config.yaml"
+      - "--port"
+      - "4000"
+      - "--host"
+      - "0.0.0.0"
+      - "--num_workers"
+      - "1"
+      - "--telemetry"
+      - "False"
+    # The image runs Prisma migrations on startup (against the host DB), so the
+    # first boot can take a while — generous start_period before unhealthy.
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:4000/health/liveliness')\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s

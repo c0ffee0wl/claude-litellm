@@ -294,6 +294,152 @@ APPARMOR
 }
 
 #############################################################################
+# Rootless Docker (optional --docker mode)
+#############################################################################
+
+# Install Docker CE from Docker's official apt repo, then set it up *rootless*:
+# dockerd runs as a `systemd --user` service, with no root daemon and no
+# `docker` group. Rootless is deliberate — adding the user to the `docker` group
+# grants effective root via the daemon socket, which would undercut this repo's
+# hardening posture (managed-settings denies, sandbox, rm/push guards). The
+# apt-repo-setup block is reused near-verbatim from Docker's official docs (and
+# /opt/linux-setup); only the activation tail differs (rootless setuptool rather
+# than the root daemon + `usermod -aG docker` the convenience path uses).
+#
+# Idempotent: skips the apt install when `docker` is already present, and skips
+# the rootless setup when the per-user docker.service already exists.
+install_docker_rootless() {
+    local docker_distro docker_codename
+
+    if ! command -v docker &>/dev/null; then
+        log "Installing Docker CE (official apt repo)..."
+
+        # Remove conflicting/old packages (ignore failures — they may be absent).
+        local pkg
+        for pkg in docker.io docker-doc docker-compose docker-compose-v2 podman-docker containerd runc; do
+            sudo apt-get remove -y "$pkg" 2>/dev/null || true
+        done
+
+        # Detect distribution + codename for the Docker repo. Docker only ships
+        # repos for specific Debian/Ubuntu releases; fall back to Debian trixie
+        # for anything unrecognised (incl. Kali, which tracks Debian testing).
+        if [ -f /etc/os-release ]; then
+            # shellcheck disable=SC1091
+            . /etc/os-release
+            if [ "${ID:-}" = "ubuntu" ] || echo "${ID_LIKE:-}" | grep -q "ubuntu"; then
+                docker_distro="ubuntu"
+                docker_codename="${UBUNTU_CODENAME:-$VERSION_CODENAME}"
+                case "$docker_codename" in
+                    resolute|questing|noble|jammy) ;;
+                    *)
+                        warn "Ubuntu codename '$docker_codename' unsupported by Docker — falling back to Debian trixie"
+                        docker_distro="debian"; docker_codename="trixie" ;;
+                esac
+            elif [ "${ID:-}" = "debian" ] || [ "${ID:-}" = "kali" ] || echo "${ID_LIKE:-}" | grep -q "debian"; then
+                docker_distro="debian"
+                docker_codename="${VERSION_CODENAME:-trixie}"
+                case "$docker_codename" in
+                    trixie|bookworm|bullseye) ;;
+                    *) docker_codename="trixie" ;;   # kali-rolling + anything else -> trixie
+                esac
+            else
+                warn "Unknown distribution '${ID:-?}' — falling back to Debian trixie"
+                docker_distro="debian"; docker_codename="trixie"
+            fi
+        else
+            warn "Cannot detect distribution — falling back to Debian trixie"
+            docker_distro="debian"; docker_codename="trixie"
+        fi
+
+        log "Using Docker repository: ${docker_distro}/${docker_codename}"
+
+        # Docker's official GPG key + apt source.
+        sudo install -m 0755 -d /etc/apt/keyrings
+        sudo curl --proto '=https' --tlsv1.2 -fsSL "https://download.docker.com/linux/${docker_distro}/gpg" -o /etc/apt/keyrings/docker.asc
+        sudo chmod a+r /etc/apt/keyrings/docker.asc
+        echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/${docker_distro} ${docker_codename} stable" \
+            | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+        sudo apt-get update
+        # docker-ce-rootless-extras provides dockerd-rootless-setuptool.sh +
+        # dockerd-rootless.sh; uidmap provides newuidmap/newgidmap; slirp4netns
+        # provides userspace networking; dbus-user-session lets the user systemd
+        # manager start the daemon.
+        sudo apt-get install -y \
+            docker-ce docker-ce-cli containerd.io \
+            docker-buildx-plugin docker-compose-plugin \
+            docker-ce-rootless-extras uidmap slirp4netns dbus-user-session
+    else
+        log "Docker already installed — skipping apt install"
+    fi
+
+    # Rootless dockerd uses the per-user socket ($XDG_RUNTIME_DIR/docker.sock),
+    # which our litellm unit targets via DOCKER_HOST. We deliberately do NOT touch
+    # any system-wide docker.service: rootless coexists with it (separate socket),
+    # and disabling it here would stop a user's other root-daemon containers.
+    # Disabling the system daemon (per Docker's rootless docs) is the user's call,
+    # not a silent side effect of this opt-in flag.
+
+    # Rootless prerequisite: unprivileged user namespaces (same kernel feature
+    # bwrap/`/sandbox` uses). If AppArmor restricts them and the bwrap profile
+    # isn't in place, warn — configure_bwrap_apparmor (Phase 2) usually clears it.
+    if [ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ] && \
+       [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null)" = "1" ] && \
+       [ ! -f /etc/apparmor.d/bwrap ]; then
+        warn "Unprivileged user namespaces are AppArmor-restricted — rootless Docker may fail to start."
+        warn "  configure_bwrap_apparmor (Phase 2) usually clears this; otherwise see"
+        warn "  https://docs.docker.com/engine/security/rootless/#prerequisites"
+    fi
+
+    # Set up rootless dockerd as a `systemd --user` service. The setuptool writes
+    # ~/.config/systemd/user/docker.service and enables it; guard on that file so
+    # re-runs are no-ops.
+    if [ -f "${HOME}/.config/systemd/user/docker.service" ]; then
+        log "Rootless Docker user service already set up — skipping setuptool"
+    else
+        log "Setting up rootless Docker (dockerd as systemd --user)..."
+        local setuptool
+        setuptool="$(command -v dockerd-rootless-setuptool.sh 2>/dev/null || echo /usr/bin/dockerd-rootless-setuptool.sh)"
+        if [ -x "$setuptool" ]; then
+            # Needs $XDG_RUNTIME_DIR + a running user systemd (dbus-user-session).
+            if ! "$setuptool" install; then
+                warn "dockerd-rootless-setuptool.sh install reported an error — rootless Docker may not work (see output above)"
+            fi
+        else
+            warn "dockerd-rootless-setuptool.sh not found — is docker-ce-rootless-extras installed?"
+        fi
+    fi
+
+    # Enable + start the rootless daemon (linger is enabled just before this
+    # phase so it survives logout). Tolerant: the setuptool may already have done both.
+    systemctl --user enable docker &>/dev/null || true
+    systemctl --user start docker &>/dev/null || warn "Could not start rootless docker.service — start it manually with: systemctl --user start docker"
+}
+
+# Ensure the host Postgres accepts password (scram) auth for the `litellm` role
+# over its Unix socket. Used by --docker, where the (rootless) LiteLLM container
+# connects to the host DB over a bind-mounted socket instead of TCP — no network
+# exposure at all. Debian's default pg_hba uses peer auth for `local`
+# connections, which rejects the litellm role (the container's mapped UID has no
+# matching OS user), so we add a scoped scram rule. Idempotent; inserts the rule
+# ABOVE existing `local` rules (pg_hba is first-match-wins) and reloads Postgres.
+ensure_pg_socket_scram_rule() {
+    local hba_file
+    hba_file="$(sudo -u postgres psql -tAc 'SHOW hba_file;' 2>/dev/null | tr -d '[:space:]' || true)"
+    if [ -z "$hba_file" ]; then
+        warn "Could not determine pg_hba.conf path — skipping socket scram rule (container DB auth may fail)"
+        return 0
+    fi
+    if sudo grep -qE '^[[:space:]]*local[[:space:]]+litellm[[:space:]]+litellm[[:space:]]+scram-sha-256' "$hba_file"; then
+        return 0
+    fi
+    log "Adding scoped pg_hba socket rule (local litellm scram-sha-256)..."
+    # Insert at the top so it precedes Debian's default `local all all peer`.
+    sudo sed -i '1i local   litellm   litellm   scram-sha-256' "$hba_file"
+    sudo systemctl reload postgresql 2>/dev/null || warn "Could not reload Postgres — apply with: sudo systemctl reload postgresql"
+}
+
+#############################################################################
 # LiteLLM service readiness
 #############################################################################
 

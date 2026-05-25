@@ -10,10 +10,12 @@
 #   ./linux/setup.sh --router-only    # LiteLLM gateway + Claude Code, no managed-settings hardening
 #   ./linux/setup.sh --harden-only    # Only Claude Code + managed settings (no LiteLLM; remote router)
 #   ./linux/setup.sh --install-obsidian  # Also install the ACP adapter + latest Obsidian (.deb); combinable with any mode
+#   ./linux/setup.sh --docker         # Run LiteLLM via rootless Docker Compose (Postgres stays on the host); additive
 #   ./linux/setup.sh --yes            # Non-interactive (skip prompts)
 #
-# --router-only and --harden-only are mutually exclusive. --install-obsidian is additive
-# (combinable with any mode). Flags are NOT persisted — each invocation is fresh;
+# --router-only and --harden-only are mutually exclusive. --install-obsidian and
+# --docker are additive (combinable with any mode except --docker + --harden-only,
+# which has no LiteLLM). Flags are NOT persisted — each invocation is fresh;
 # rerunning without a flag falls through to full mode.
 
 set -e
@@ -30,6 +32,7 @@ source "$SCRIPT_DIR/common.sh"
 ROUTER_ONLY=false
 HARDEN_ONLY=false
 INSTALL_OBSIDIAN=false
+DOCKER_MODE=false
 ORIGINAL_ARGS=("$@")
 
 while [[ $# -gt 0 ]]; do
@@ -44,6 +47,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --install-obsidian)
             INSTALL_OBSIDIAN=true
+            shift
+            ;;
+        --docker)
+            DOCKER_MODE=true
             shift
             ;;
         --yes)
@@ -66,6 +73,12 @@ if [ "$ROUTER_ONLY" = "true" ] && [ "$HARDEN_ONLY" = "true" ]; then
     exit 1
 fi
 
+# --docker dockerizes LiteLLM; --harden-only installs no LiteLLM at all.
+if [ "$DOCKER_MODE" = "true" ] && [ "$HARDEN_ONLY" = "true" ]; then
+    error "--docker and --harden-only are incompatible (--harden-only installs no LiteLLM)"
+    exit 1
+fi
+
 # We expect to run as a regular user, not root.
 if [ "$EUID" -eq 0 ]; then
     error "Do not run this script as root. Run it as your normal user; sudo is invoked where needed."
@@ -84,6 +97,9 @@ log "  USER:     $USER"
 log "  HOME:     $HOME"
 if [ "$INSTALL_OBSIDIAN" = "true" ]; then
     log "  Obsidian + ACP install: enabled"
+fi
+if [ "$DOCKER_MODE" = "true" ]; then
+    log "  LiteLLM runtime: rootless Docker Compose (Postgres on host)"
 fi
 
 #############################################################################
@@ -183,6 +199,31 @@ log "System packages installed: $APT_PACKAGES"
 # opts into it via /sandbox (even under --router-only, which ships it off by default).
 configure_bwrap_apparmor
 
+# Enable systemd --user lingering early — needed by every mode's user services
+# (litellm, claude-devtools) and, under --docker, by the rootless dockerd set up
+# in Phase 2b (it runs as a systemd --user service). Enabling it before Phase 2b
+# means the user manager + $XDG_RUNTIME_DIR are in place when the rootless
+# setuptool runs (it uses `systemctl --user`), not just by the time Phase 7 needs it.
+if ! loginctl show-user "$USER" 2>/dev/null | grep -q "Linger=yes"; then
+    sudo loginctl enable-linger "$USER" 2>/dev/null || warn "Could not enable lingering for $USER"
+    sleep 2
+fi
+
+#############################################################################
+# PHASE 2b: Docker CE, rootless (only with --docker)
+#############################################################################
+
+# Installs Docker CE via the official apt repo and sets it up rootless (dockerd
+# as a systemd --user service) so the dockerized LiteLLM in Phase 7 has a daemon
+# to run against. Rootless keeps the repo's no-root-daemon / no-docker-group
+# posture; see install_docker_rootless in common.sh. Only LiteLLM is
+# containerized — Postgres stays on the host (Phase 6) and claude-devtools stays
+# native (Phase 9).
+if [ "$DOCKER_MODE" = "true" ]; then
+    log "=== Phase 2b: Docker (rootless) ==="
+    install_docker_rootless
+fi
+
 #############################################################################
 # PHASE 3: bun + uv (install-if-missing-only)
 #############################################################################
@@ -240,7 +281,10 @@ log "=== Phase 4: Tools ==="
 # (1.83.1+).
 LITELLM_BIN="${HOME}/.local/bin/litellm"
 
-if [ "$HARDEN_ONLY" != "true" ]; then
+# Skipped under --docker: the ghcr.io/berriai/litellm image already bundles
+# LiteLLM + a generated Prisma client, so neither the uv tool install nor the
+# `prisma generate` step below is needed.
+if [ "$HARDEN_ONLY" != "true" ] && [ "$DOCKER_MODE" != "true" ]; then
     if [ -x "$LITELLM_BIN" ]; then
         log "LiteLLM already installed at $LITELLM_BIN — skipping"
     else
@@ -543,7 +587,18 @@ if [ "$HARDEN_ONLY" != "true" ]; then
             log "Created Postgres database 'litellm'"
         fi
 
-        LITELLM_DB_URL="postgresql://litellm:${LITELLM_DB_PASSWORD}@127.0.0.1:5432/litellm"
+        # Same host DB in both modes — only the connection transport differs.
+        # Native: TCP on loopback. --docker: the (rootless) LiteLLM container
+        # connects over the host Postgres *Unix socket*, bind-mounted into the
+        # container (no TCP listener, no network exposure — see CLAUDE.md "Docker
+        # mode"). That needs a scoped `local` scram rule because Debian defaults
+        # to peer auth. Re-running with/without --docker just rewrites the URL.
+        if [ "$DOCKER_MODE" = "true" ]; then
+            ensure_pg_socket_scram_rule
+            LITELLM_DB_URL="postgresql://litellm:${LITELLM_DB_PASSWORD}@localhost/litellm?host=/run/postgresql"
+        else
+            LITELLM_DB_URL="postgresql://litellm:${LITELLM_DB_PASSWORD}@127.0.0.1:5432/litellm"
+        fi
     fi
 
     LITELLM_ENV_CONTENT+="DATABASE_URL=${LITELLM_DB_URL}"$'\n'
@@ -562,12 +617,7 @@ fi
 # PHASE 7: LiteLLM config + service
 #############################################################################
 
-# Enable systemd --user lingering so user services (litellm, claude-devtools)
-# run without an active session. Needed in every mode.
-if ! loginctl show-user "$USER" 2>/dev/null | grep -q "Linger=yes"; then
-    sudo loginctl enable-linger "$USER" 2>/dev/null || warn "Could not enable lingering for $USER"
-    sleep 2
-fi
+# (systemd --user lingering is enabled earlier, before Phase 2b.)
 
 if [ "$HARDEN_ONLY" != "true" ]; then
     log "=== Phase 7: LiteLLM ==="
@@ -579,12 +629,56 @@ if [ "$HARDEN_ONLY" != "true" ]; then
 
     log "LiteLLM config deployed to $LITELLM_APP_DIR"
 
-    deploy_user_systemd_service litellm "$SCRIPT_DIR/systemd/litellm.service" \
-        -e "s|__LITELLM_BIN__|${LITELLM_BIN}|g" \
-        -e "s|__APP_DIR__|${LITELLM_APP_DIR}|g" \
-        -e "s|__PORT__|${LITELLM_PORT}|g" \
-        -e "s|__ENV_FILE__|${LITELLM_ENV_FILE}|g" \
-        -e "s|__PATH__|${LITELLM_PATH}|g" || true
+    # Runtime switch (native<->docker): stop the currently-installed litellm unit
+    # BEFORE deploy_user_systemd_service daemon-reloads its definition, so it's
+    # torn down via its OWN ExecStop. Critical for docker->native: otherwise the
+    # redeployed native unit (which has no `docker compose down` ExecStop) can
+    # leave the litellm container running under the rootless daemon, holding
+    # 127.0.0.1:4000 and blocking the native proxy from binding. Only acts on an
+    # actual variant change — a same-mode re-run is untouched here.
+    INSTALLED_LITELLM_UNIT="${HOME}/.config/systemd/user/litellm.service"
+    if [ -f "$INSTALLED_LITELLM_UNIT" ]; then
+        installed_litellm_variant="native"
+        grep -q 'docker compose' "$INSTALLED_LITELLM_UNIT" && installed_litellm_variant="docker"
+        desired_litellm_variant="native"
+        [ "$DOCKER_MODE" = "true" ] && desired_litellm_variant="docker"
+        if [ "$installed_litellm_variant" != "$desired_litellm_variant" ]; then
+            log "Switching LiteLLM runtime ${installed_litellm_variant} -> ${desired_litellm_variant}; stopping current unit first"
+            stop_user_service_if_active litellm
+        fi
+    fi
+
+    if [ "$DOCKER_MODE" = "true" ]; then
+        # Dockerized LiteLLM: deploy the compose file next to config.yaml + env
+        # (the unit's WorkingDirectory is __APP_DIR__, so `docker compose`
+        # auto-discovers docker-compose.yml and the relative ./config.yaml + ./env
+        # mounts). The systemd --user unit runs `docker compose up` against the
+        # rootless daemon. Postgres + claude-devtools stay native.
+        deploy_config "$SCRIPT_DIR/configs/litellm-docker-compose.yml" "${LITELLM_APP_DIR}/docker-compose.yml"
+        log "LiteLLM docker-compose deployed to ${LITELLM_APP_DIR}/docker-compose.yml"
+
+        deploy_user_systemd_service litellm "$SCRIPT_DIR/systemd/litellm-docker.service" \
+            -e "s|__APP_DIR__|${LITELLM_APP_DIR}|g" \
+            -e "s|__PATH__|${USER_TOOL_PATH}|g" || true
+
+        # Pre-pull the image in the foreground (visible progress) so the unit
+        # start below is fast and wait_for_litellm's 90s window isn't eaten by a
+        # ~367MB first-run download — the unit's ExecStartPre would otherwise pull
+        # silently while we poll. On re-runs with the image cached this is a quick
+        # "up to date" check. Talks to the rootless daemon started in Phase 2b.
+        litellm_docker_sock="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/docker.sock"
+        log "Pulling LiteLLM image (first run downloads ~367MB; cached afterwards)..."
+        DOCKER_HOST="unix://${litellm_docker_sock}" \
+            docker compose -f "${LITELLM_APP_DIR}/docker-compose.yml" pull \
+            || warn "docker compose pull failed — the unit will retry via ExecStartPre on start"
+    else
+        deploy_user_systemd_service litellm "$SCRIPT_DIR/systemd/litellm.service" \
+            -e "s|__LITELLM_BIN__|${LITELLM_BIN}|g" \
+            -e "s|__APP_DIR__|${LITELLM_APP_DIR}|g" \
+            -e "s|__PORT__|${LITELLM_PORT}|g" \
+            -e "s|__ENV_FILE__|${LITELLM_ENV_FILE}|g" \
+            -e "s|__PATH__|${LITELLM_PATH}|g" || true
+    fi
 
     systemctl --user enable litellm &>/dev/null || true
 

@@ -1,0 +1,27 @@
+[Unit]
+Description=LiteLLM (Docker) — Anthropic-compatible gateway via rootless Docker Compose
+# docker.service here is the *rootless* per-user daemon (systemd --user), set up
+# by install_docker_rootless. network-online ordering matters for the image pull.
+After=docker.service network-online.target
+Wants=docker.service network-online.target
+# First boot pulls the image (~367 MB) and runs Prisma migrations against the
+# host DB; give it generous start headroom so retries don't trip start-limit-hit.
+StartLimitBurst=10
+StartLimitIntervalSec=300
+
+[Service]
+Type=simple
+WorkingDirectory=__APP_DIR__
+Environment=PATH=__PATH__
+# Rootless daemon socket lives in the user runtime dir (%t = /run/user/<uid>).
+Environment=DOCKER_HOST=unix://%t/docker.sock
+# Re-pull on (re)start so a bumped image tag in docker-compose.yml is honoured.
+# Leading "-" makes a failed pull (offline / already cached) non-fatal.
+ExecStartPre=-/usr/bin/docker compose pull
+ExecStart=/usr/bin/docker compose up
+ExecStop=/usr/bin/docker compose down
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
