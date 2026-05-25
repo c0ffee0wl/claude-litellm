@@ -14,10 +14,16 @@
 
 services:
   litellm:
-    # Pinned image — a deliberate floor/pin like the uv `>=1.84.0` floor and the
-    # claude-devtools release-tag pin (CLAUDE.md > "install-if-missing"). `-stable`
-    # is LiteLLM's production channel. Bump intentionally; ExecStartPre re-pulls.
-    image: ghcr.io/berriai/litellm:v1.86.0-stable
+    # Pinned image — a deliberate pin like the claude-devtools release-tag pin
+    # (CLAUDE.md > "install-if-missing"). This uses LiteLLM's plain per-release
+    # tag (vX.Y.Z), NOT the `-stable` channel: `-stable` tags are promoted later
+    # and LAG (newest is v1.83.14-stable), so they can't match the native uv
+    # `>=1.84.0` floor. v1.86.0 satisfies that floor, clears the compromised
+    # 1.82.7/1.82.8, and carries the GPT-5.4 reasoning fixes this setup relies on
+    # (chat->Responses auto-route 1.83.0+, output_config.effort->reasoning_effort
+    # 1.83.1+). Bump intentionally; verify the exact tag exists on ghcr.io first
+    # (a given version's `-stable` may not exist). ExecStartPre re-pulls on start.
+    image: ghcr.io/berriai/litellm:v1.86.0
     restart: unless-stopped
     # Publish to loopback only — same localhost-only exposure as the native unit
     # (which binds --host 127.0.0.1). The container itself listens on 0.0.0.0
