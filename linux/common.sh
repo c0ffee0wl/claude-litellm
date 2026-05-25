@@ -307,21 +307,25 @@ APPARMOR
 # than the root daemon + `usermod -aG docker` the convenience path uses).
 #
 # Idempotent: skips the engine install when `docker` is already present (but
-# still ensures the rootless runtime deps — uidmap/slirp4netns/dbus-user-session/
-# rootless-extras — which a pre-existing *rootful* engine commonly lacks), and
-# skips the rootless setup when the per-user docker.service already exists.
+# still ensures the rootless + compose runtime deps — uidmap/slirp4netns/
+# dbus-user-session/rootless-extras/compose-plugin — which a pre-existing engine
+# commonly lacks), and skips the rootless setup when the per-user docker.service
+# already exists.
 install_docker_rootless() {
     local docker_distro docker_codename
     local need_engine=false need_rootless_deps=false pkg
 
     command -v docker &>/dev/null || need_engine=true
-    # Rootless runtime prereqs: uidmap (newuidmap/newgidmap), slirp4netns
-    # (userspace networking), dbus-user-session (user systemd manager), and
-    # docker-ce-rootless-extras (dockerd-rootless.sh + the setuptool). A
-    # pre-existing rootful engine often lacks these, which makes
-    # dockerd-rootless-setuptool.sh abort with "Missing system requirements …
-    # apt-get install -y uidmap" — so ensure them regardless of engine presence.
-    for pkg in uidmap slirp4netns dbus-user-session docker-ce-rootless-extras; do
+    # Rootless + compose runtime prereqs: uidmap (newuidmap/newgidmap), slirp4netns
+    # (userspace networking), dbus-user-session (user systemd manager),
+    # docker-ce-rootless-extras (dockerd-rootless.sh + the setuptool), and
+    # docker-compose-plugin (the `docker compose` subcommand the litellm unit's
+    # ExecStart/ExecStop invoke). A pre-existing engine often lacks these — without
+    # the rootless extras dockerd-rootless-setuptool.sh aborts ("Missing system
+    # requirements … apt-get install -y uidmap"), and without the compose plugin
+    # the litellm unit's `docker compose up` fails outright (a docker.io host has
+    # neither). Ensure them regardless of engine presence.
+    for pkg in uidmap slirp4netns dbus-user-session docker-ce-rootless-extras docker-compose-plugin; do
         dpkg -s "$pkg" &>/dev/null || { need_rootless_deps=true; break; }
     done
 
@@ -380,16 +384,18 @@ install_docker_rootless() {
         if [ "$need_engine" = true ]; then
             sudo apt-get install -y \
                 docker-ce docker-ce-cli containerd.io \
-                docker-buildx-plugin docker-compose-plugin
+                docker-buildx-plugin
         fi
         # docker-ce-rootless-extras provides dockerd-rootless-setuptool.sh +
         # dockerd-rootless.sh; uidmap provides newuidmap/newgidmap; slirp4netns
         # provides userspace networking; dbus-user-session lets the user systemd
-        # manager start the daemon. Always (re)installed — a pre-existing rootful
-        # engine may predate them (the setuptool's "Missing system requirements …
-        # uidmap" abort); apt is a no-op for any already present.
+        # manager start the daemon; docker-compose-plugin provides the
+        # `docker compose` subcommand the litellm unit's ExecStart/ExecStop run.
+        # Always (re)installed — a pre-existing engine may predate them (rootless
+        # setuptool's "Missing system requirements … uidmap" abort, or a docker.io
+        # host with no `docker compose` at all); apt is a no-op for any present.
         sudo apt-get install -y \
-            docker-ce-rootless-extras uidmap slirp4netns dbus-user-session
+            docker-ce-rootless-extras uidmap slirp4netns dbus-user-session docker-compose-plugin
     else
         log "Docker + rootless deps already installed — skipping apt install"
     fi

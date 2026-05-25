@@ -605,6 +605,21 @@ if [ "$HARDEN_ONLY" != "true" ]; then
     LITELLM_ENV_CONTENT+="STORE_MODEL_IN_DB=True"$'\n'
     [ -n "${LITELLM_DB_PASSWORD:-}" ] && LITELLM_ENV_CONTENT+="LITELLM_DB_PASSWORD=${LITELLM_DB_PASSWORD}"$'\n'
 
+    # --docker only: ~/.config/litellm/env is parsed by BOTH systemd
+    # EnvironmentFile (native unit) and docker-compose env_file (container). The
+    # two parsers diverge on inline " #", surrounding quotes, and trailing
+    # whitespace — a value with those reaches the provider intact natively but
+    # garbled in the container (upstream 401/400). Real secrets never contain
+    # these; warn so a stray one is caught instead of silently shipped.
+    if [ "$DOCKER_MODE" = "true" ]; then
+        while IFS= read -r _env_line; do
+            case "$_env_line" in ''|'#'*) continue ;; esac
+            if printf '%s' "${_env_line#*=}" | grep -qE '[[:space:]]#|[[:space:]]$|^["'\'']|["'\'']$'; then
+                warn "env value for '${_env_line%%=*}' has characters docker-compose and systemd parse differently — verify it works under --docker (it may reach the provider garbled)"
+            fi
+        done <<< "$LITELLM_ENV_CONTENT"
+    fi
+
     mkdir -p "$LITELLM_ENV_DIR"
     if printf '%s' "$LITELLM_ENV_CONTENT" | write_if_changed "$LITELLM_ENV_FILE" 600; then
         log "LiteLLM env file updated"
@@ -645,6 +660,17 @@ if [ "$HARDEN_ONLY" != "true" ]; then
         if [ "$installed_litellm_variant" != "$desired_litellm_variant" ]; then
             log "Switching LiteLLM runtime ${installed_litellm_variant} -> ${desired_litellm_variant}; stopping current unit first"
             stop_user_service_if_active litellm
+            # systemd may read the unit inactive while the rootless daemon still
+            # runs the container (restart: unless-stopped), so the ExecStop above
+            # never fired and an orphan still holds 127.0.0.1:4000 — fatal for a
+            # docker->native switch (the native proxy can't bind). Tear the compose
+            # project down directly, independent of the unit state. Idempotent; if
+            # the daemon/socket is down there's no running container to orphan.
+            if [ "$installed_litellm_variant" = "docker" ] && [ -f "${LITELLM_APP_DIR}/docker-compose.yml" ]; then
+                _litellm_sock="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/docker.sock"
+                DOCKER_HOST="unix://${_litellm_sock}" \
+                    docker compose -f "${LITELLM_APP_DIR}/docker-compose.yml" down --remove-orphans 2>/dev/null || true
+            fi
         fi
     fi
 
