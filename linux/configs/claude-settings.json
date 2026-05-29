@@ -30,6 +30,7 @@
         "~/.zshrc",
         "~/.zprofile",
         "~/.gem/credentials",
+        "~/.netrc",
         "~/.config/litellm",
         "~/.config/litellm/config.yaml",
         "~/.config/litellm/env",
