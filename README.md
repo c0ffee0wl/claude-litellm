@@ -7,8 +7,9 @@ Runs on Debian (Bash) and Kali (zsh or Bash) as a regular user. No WSL ties, no 
 ## Quick Start
 
 ```bash
-git clone https://github.com/c0ffee0wl/claude-litellm ~/claude-litellm
-cd ~/claude-litellm
+cd ~
+git clone https://github.com/c0ffee0wl/claude-litellm 
+cd claude-litellm
 cp .env.example .env
 nano .env                     # optional: fill AZURE_OPENAI_API_KEY + AZURE_RESOURCE_ENDPOINT
 ./linux/setup.sh
@@ -32,7 +33,7 @@ Now run `claude`. Traffic goes to `http://127.0.0.1:4000` (LiteLLM's unified Ant
 | `./linux/setup.sh` | Full setup: LiteLLM + Claude Code + managed-settings hardening + `nah` plugin + claude-devtools |
 | `./linux/setup.sh --router-only` | LiteLLM + Claude Code + claude-devtools. Skips managed-settings hardening and the `nah` plugin; on a **fresh install** ships the sandbox **off** by default (the `sandbox` block is stripped from user settings, but bwrap is still installed so `/sandbox` can enable it; an existing `~/.claude/settings.json` is left untouched). Dev-box mode |
 | `./linux/setup.sh --harden-only` | Claude Code + managed-settings + `nah` plugin only. Skips LiteLLM and claude-devtools. Use when LiteLLM runs on another host |
-| `./linux/setup.sh --install-obsidian` | Also installs the ACP adapter + the latest Obsidian (`.deb`). Additive — combine with any mode |
+| `./linux/setup.sh --install-obsidian` | Also installs the ACP adapter + the latest Obsidian (`.deb`). Additive; combine with any mode |
 | `./linux/setup.sh --yes` | Non-interactive (combine with any of the above) |
 
 ## Architecture
@@ -44,18 +45,18 @@ Claude Code  ──►  http://127.0.0.1:4000 (LiteLLM /v1/messages)  ──► 
 ```
 
 - **LiteLLM** runs as a systemd user service on port 4000 (LiteLLM's default).
-- **Model naming**: Claude Code asks for the upstream id directly (`azure/gpt-5.4` for Sonnet/Opus, `azure/gpt-5.4-mini` for Haiku) via `ANTHROPIC_DEFAULT_{HAIKU,SONNET,OPUS}_MODEL` in `~/.profile`. LiteLLM's `model_list` supplies the Azure endpoint + key but adds no alias layer. Anthropic's `/v1/messages` format is preserved end-to-end.
+- **Model naming**: Claude Code asks for the upstream id directly (`azure/gpt-5.4` for Sonnet/Opus, `azure/gpt-5.4-mini` for Haiku) via `ANTHROPIC_DEFAULT_{HAIKU,SONNET,OPUS}_MODEL` in `~/.profile`. LiteLLM's `model_list` supplies the Azure endpoint + key but adds no alias layer. Anthropic's `/v1/messages` format stays intact the whole way.
 - **Model discovery**: `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1` is left on so any `claude-*` / `anthropic-*`-named entry added later via the LiteLLM `/ui` auto-appears in `/model`. The baseline upstream-named entries are reachable but not listed there (the discovery filter only surfaces names matching that prefix); use `/model azure/gpt-5.4-mini` to switch.
 - **Auth**: a `sk-…` master key is auto-generated on first run, stored in `~/.config/litellm/env` (mode 600) and in `~/.profile` as `ANTHROPIC_AUTH_TOKEN`.
 - **Observability**: bundled LiteLLM admin UI at `http://127.0.0.1:4000/ui/`, backed by the Postgres instance Phase 6 provisions (spend tracking, virtual keys, persistent logs, `/ui` model management all on by default).
 - **Session inspection**: [claude-devtools](https://github.com/matt1398/claude-devtools) standalone web UI at `http://127.0.0.1:12002` (pinned to the upstream's latest release tag; built locally with bun, no Electron).
-- **Action-aware safety guard**: [nah](https://github.com/manuelschipper/nah) installed as a Claude Code plugin (full + `--harden-only`). Classifies commands into action types and adds an independent `allow`/`ask`/`block` gate alongside `claude-managed-settings.json` denies — catches wrapper-evasion the regex denies miss (`bash -c "rm -rf …"`, `python -c`, `git push -f`, …). Per Anthropic's docs both layers fire independently; a hook `"allow"` cannot override `deny[]`. **Survives `--dangerously-skip-permissions`**: PreToolUse hooks still fire in bypass mode per Anthropic docs (the flag skips the prompt + deny/ask/allow rules, but hooks run before the prompt and remain active), so under that flag nah is the *only* active policy layer. See [CLAUDE.md](CLAUDE.md) for the full caveats list (no `.nah.yaml` tuning, unpinned marketplace, known interaction bugs).
+- **Action-aware safety guard**: [nah](https://github.com/manuelschipper/nah) installed as a Claude Code plugin (full + `--harden-only`). Classifies commands into action types and adds an independent `allow`/`ask`/`block` gate alongside `claude-managed-settings.json` denies, and catches wrapper-evasion the regex denies miss (`bash -c "rm -rf …"`, `python -c`, `git push -f`, …). Per Anthropic's docs both layers fire independently; a hook `"allow"` cannot override `deny[]`. **Survives `--dangerously-skip-permissions`**: PreToolUse hooks still fire in bypass mode per Anthropic docs (the flag skips the prompt + deny/ask/allow rules, but hooks run before the prompt and remain active), so under that flag nah is the *only* active policy layer. See [CLAUDE.md](CLAUDE.md) for the full caveats list (no `.nah.yaml` tuning, unpinned marketplace, known interaction bugs).
 
 ## Important Files
 
 - `linux/configs/litellm-config.yaml`: model_list, retries, master-key reference, commented guardrails block
 - `linux/configs/claude-managed-settings.json`: permissions (deny/allow), telemetry opt-outs, bash guard hooks (root-enforced)
-- `linux/configs/claude-settings.json`: user-scope `~/.claude/settings.json` template — statusLine + the `sandbox` block (`enabled:true`, user-toggleable via `/sandbox`; the `sandbox` block is stripped on `--router-only`, which ships it off by default)
+- `linux/configs/claude-settings.json`: user-scope `~/.claude/settings.json` template with statusLine and the `sandbox` block (`enabled:true`, user-toggleable via `/sandbox`; the `sandbox` block is stripped on `--router-only`, which ships it off by default)
 - `linux/setup.sh`: phases 0-10 (see [CLAUDE.md](CLAUDE.md) for the full phase breakdown, key conventions, and troubleshooting)
 - `.env`: API keys (gitignored; create from `.env.example`)
 

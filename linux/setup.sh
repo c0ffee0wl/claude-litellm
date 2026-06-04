@@ -81,8 +81,7 @@ fi
 
 # We expect to run as a regular user, not root.
 if [ "$EUID" -eq 0 ]; then
-    error "Do not run this script as root. Run it as your normal user; sudo is invoked where needed."
-    exit 1
+    warn "Running as root is not recommended. Run it as your normal user; sudo is invoked where needed."
 fi
 
 if [ "$HARDEN_ONLY" = "true" ]; then
