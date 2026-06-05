@@ -561,8 +561,37 @@ if [ "$HARDEN_ONLY" != "true" ]; then
             log "Installing postgresql via apt..."
             sudo apt-get install -y postgresql
         fi
-        systemctl is-enabled --quiet postgresql 2>/dev/null || sudo systemctl enable postgresql
-        systemctl is-active --quiet postgresql || sudo systemctl start postgresql
+        # Pick the cluster LiteLLM actually uses. Both the bootstrap below
+        # (`sudo -u postgres psql`, via pg_wrapper) and the runtime DATABASE_URL
+        # (127.0.0.1:5432) resolve to the cluster on port 5432 — postgresql-common's
+        # own rule when several clusters exist ("the one listening on the default
+        # port 5432"). Anchor on the port, not "the first cluster": pg_lsclusters
+        # sorts by version, so after a major upgrade NR==1 can be a stale cluster
+        # on 5433. The Port column is config-derived, so it's right even while down.
+        pg_target=$(pg_lsclusters -h 2>/dev/null | awk '$3==5432 {print $1"-"$2; exit}' || true)
+
+        # Make autostart survive reboot. Kali ships services preset-disabled, and
+        # `postgresql.service` is a /bin/true umbrella whose link to the real
+        # cluster instance is recreated each boot by a systemd generator that can
+        # silently fail (systemd.generator early-boot limits) — leaving only the
+        # dummy running and no socket. Enable the *instance* directly (the
+        # postgresql@.service template ships [Install] WantedBy=multi-user.target)
+        # so boot no longer depends on the generator firing.
+        if [ -n "$pg_target" ]; then
+            systemctl is-enabled --quiet "postgresql@${pg_target}" 2>/dev/null \
+                || sudo systemctl enable "postgresql@${pg_target}"
+            sudo systemctl start "postgresql@${pg_target}" || true
+        else
+            warn "No local Postgres cluster on port 5432 — falling back to 'systemctl start postgresql'"
+            sudo systemctl start postgresql || true
+        fi
+
+        # Gate on the real socket via pg_isready, NOT `is-active postgresql`: the
+        # umbrella reports active(exited) even when no cluster is online, so the old
+        # check was a false positive that let the psql calls below run against a
+        # dead socket (the "No such file or directory" failure on a fresh boot).
+        for _ in {1..30}; do pg_isready -q && break; sleep 1; done
+        pg_isready -q || { error "Postgres not accepting connections on port 5432 after 30s"; exit 1; }
 
         LITELLM_DB_PASSWORD="${PERSISTED_DB_PASSWORD:-$(openssl rand -hex 24)}"
         [ -z "$PERSISTED_DB_PASSWORD" ] && log "Generated new LITELLM_DB_PASSWORD"
