@@ -132,7 +132,7 @@ if git rev-parse --git-dir > /dev/null 2>&1; then
         log "Updates found! Pulling latest changes..."
         git pull --ff-only
         log "Re-executing updated script..."
-        exec "$0" "${ORIGINAL_ARGS[@]}"
+        exec "$SCRIPT_DIR/setup.sh" "${ORIGINAL_ARGS[@]}"
         exit 0
     else
         log "Script is up to date"
