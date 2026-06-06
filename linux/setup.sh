@@ -238,8 +238,16 @@ else
 fi
 
 if command -v uv &>/dev/null || [ -x "${HOME}/.local/bin/uv" ]; then
-    log "uv already installed — upgrading..."
-    "${HOME}/.local/bin/uv" self update || warn "uv self update failed — keeping existing version"
+    # `uv self update` only works for the standalone (astral.sh) build. A uv from
+    # pipx/pip/apt or a host-provided symlink rejects it — that uv is maintained
+    # through its own channel, so treat the rejection as a clean skip, not a
+    # failure. Resolve the real binary; uv may live outside ~/.local/bin.
+    uv_bin="$(command -v uv 2>/dev/null || echo "${HOME}/.local/bin/uv")"
+    if "$uv_bin" self update 2>/dev/null; then
+        log "uv upgraded"
+    else
+        log "uv left as-is (self-update unavailable for this install method)"
+    fi
 else
     log "Installing uv..."
     curl_secure -fsSL https://astral.sh/uv/install.sh | sh
@@ -351,9 +359,11 @@ fi
 if command -v claude &>/dev/null || [ -x "${HOME}/.local/bin/claude" ]; then
     # Upgrade-in-place (not skip): `claude update` is a no-op when already latest
     # and still works under DISABLE_AUTOUPDATER=1 (that gates only the background
-    # check, not the explicit command; DISABLE_UPDATES is not set).
+    # check, not the explicit command; DISABLE_UPDATES is not set). Resolve the
+    # real binary; claude may live outside ~/.local/bin (e.g. a host-provided symlink).
+    claude_bin="$(command -v claude 2>/dev/null || echo "${HOME}/.local/bin/claude")"
     log "Claude Code present — running 'claude update'..."
-    "${HOME}/.local/bin/claude" update || warn "claude update failed — keeping existing version"
+    "$claude_bin" update || warn "claude update failed — keeping existing version"
 else
     log "Installing Claude Code..."
     curl_secure -fsSL https://claude.ai/install.sh | bash
