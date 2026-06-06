@@ -230,14 +230,16 @@ fi
 log "=== Phase 3: bun + uv ==="
 
 if command -v bun &>/dev/null; then
-    log "bun already installed ($(bun --version 2>/dev/null || echo '?')) — skipping install"
+    log "bun already installed ($(bun --version 2>/dev/null || echo '?')) — upgrading..."
+    bun upgrade || warn "bun upgrade failed — keeping existing version"
 else
     log "Installing bun..."
     curl_secure -fsSL https://bun.sh/install | bash
 fi
 
 if command -v uv &>/dev/null || [ -x "${HOME}/.local/bin/uv" ]; then
-    log "uv already installed — skipping install"
+    log "uv already installed — upgrading..."
+    "${HOME}/.local/bin/uv" self update || warn "uv self update failed — keeping existing version"
 else
     log "Installing uv..."
     curl_secure -fsSL https://astral.sh/uv/install.sh | sh
@@ -285,7 +287,18 @@ LITELLM_BIN="${HOME}/.local/bin/litellm"
 # `prisma generate` step below is needed.
 if [ "$HARDEN_ONLY" != "true" ] && [ "$DOCKER_MODE" != "true" ]; then
     if [ -x "$LITELLM_BIN" ]; then
-        log "LiteLLM already installed at $LITELLM_BIN — skipping"
+        # Upgrade-in-place (not skip): re-asserts the >=1.84.0 floor so an existing
+        # install is lifted off a compromised 1.82.7/1.82.8 and picks up newer
+        # aged-in releases. Idempotent no-op when already latest. The litellm.service
+        # (re)start in the systemd step below loads the new version; the Prisma
+        # client is force-regenerated against the (possibly new) schema via
+        # LITELLM_UPGRADED.
+        log "LiteLLM present at $LITELLM_BIN — upgrading (re-asserts >=1.84.0 floor)..."
+        if uv tool install --upgrade --with prisma 'litellm[proxy,proxy-runtime]>=1.84.0'; then
+            LITELLM_UPGRADED=1
+        else
+            warn "LiteLLM upgrade failed — keeping existing version"
+        fi
     else
         log "Installing LiteLLM via uv tool install..."
         uv tool install --with prisma 'litellm[proxy,proxy-runtime]>=1.84.0'
@@ -305,7 +318,9 @@ if [ "$HARDEN_ONLY" != "true" ] && [ "$DOCKER_MODE" != "true" ]; then
     UV_LITELLM_VENV="${HOME}/.local/share/uv/tools/litellm"
     PRISMA_BINARY_CACHE_DIR="${HOME}/.cache/prisma-python/binaries"
     if [ -x "${UV_LITELLM_VENV}/bin/prisma" ]; then
-        if compgen -G "${UV_LITELLM_VENV}/lib/python*/site-packages/prisma/client.py" >/dev/null; then
+        # Force regeneration after an upgrade (the new LiteLLM may ship a changed
+        # schema.prisma); otherwise skip when a client is already present.
+        if [ "${LITELLM_UPGRADED:-0}" != "1" ] && compgen -G "${UV_LITELLM_VENV}/lib/python*/site-packages/prisma/client.py" >/dev/null; then
             log "Prisma client already generated — skipping"
         else
             LITELLM_SCHEMA="$("${UV_LITELLM_VENV}/bin/python" -c 'import os, litellm.proxy as p; print(os.path.join(os.path.dirname(p.__file__), "schema.prisma"))' 2>/dev/null)"
@@ -334,7 +349,11 @@ fi
 
 # 4b. Claude Code (install-if-missing via official installer; runs in all modes)
 if command -v claude &>/dev/null || [ -x "${HOME}/.local/bin/claude" ]; then
-    log "Claude Code already installed — skipping (use 'claude update' manually if needed)"
+    # Upgrade-in-place (not skip): `claude update` is a no-op when already latest
+    # and still works under DISABLE_AUTOUPDATER=1 (that gates only the background
+    # check, not the explicit command; DISABLE_UPDATES is not set).
+    log "Claude Code present — running 'claude update'..."
+    "${HOME}/.local/bin/claude" update || warn "claude update failed — keeping existing version"
 else
     log "Installing Claude Code..."
     curl_secure -fsSL https://claude.ai/install.sh | bash
