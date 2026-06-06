@@ -607,9 +607,12 @@ if [ "$HARDEN_ONLY" != "true" ]; then
         # postgresql@.service template ships [Install] WantedBy=multi-user.target)
         # so boot no longer depends on the generator firing.
         if [ -n "$pg_target" ]; then
-            systemctl is-enabled --quiet "postgresql@${pg_target}" 2>/dev/null \
-                || sudo systemctl enable "postgresql@${pg_target}"
-            sudo systemctl start "postgresql@${pg_target}" || true
+            # Enable UNCONDITIONALLY (idempotent) + start with --now. Do NOT add an
+            # `is-enabled` guard: that same generator marks the instance
+            # "enabled-runtime" (a transient /run symlink) every boot and is-enabled
+            # reports success for it, so any such guard skips the *persistent*
+            # enable forever and the cluster stays dead after every reboot.
+            sudo systemctl enable --now "postgresql@${pg_target}" || true
         else
             warn "No local Postgres cluster on port 5432 — falling back to 'systemctl start postgresql'"
             sudo systemctl start postgresql || true
