@@ -370,7 +370,29 @@ if command -v claude &>/dev/null || [ -x "${HOME}/.local/bin/claude" ]; then
     "$claude_bin" update || warn "claude update failed — keeping existing version"
 else
     log "Installing Claude Code..."
-    curl_secure -fsSL https://claude.ai/install.sh | bash
+    # Download to a file, then run it — NOT `curl | bash`. A piped curl masks HTTP
+    # errors (the pipeline's exit status is bash's, so a transient 403/network blip
+    # from the CDN yields an empty script, bash no-ops, and `claude` is never
+    # installed — downstream consumers then fail with a confusing "claude: not found").
+    # Retry the download, run it, then verify the binary actually landed.
+    cc_installer="$(mktemp)"
+    for cc_attempt in 1 2 3; do
+        if curl_secure -fsSL https://claude.ai/install.sh -o "$cc_installer" && [ -s "$cc_installer" ]; then
+            break
+        fi
+        if [ "$cc_attempt" -lt 3 ]; then
+            warn "Claude Code installer download failed (attempt ${cc_attempt}/3) — retrying in 5s..."
+            sleep 5
+        fi
+    done
+    if [ -s "$cc_installer" ]; then
+        bash "$cc_installer" </dev/null || warn "Claude Code installer exited non-zero"
+    else
+        warn "Could not download Claude Code installer from https://claude.ai/install.sh after 3 attempts"
+    fi
+    rm -f "$cc_installer"
+    command -v claude &>/dev/null || [ -x "${HOME}/.local/bin/claude" ] \
+        || warn "Claude Code is NOT installed — 'claude' unavailable; dependent steps (e.g. MCP registration) will be skipped"
     # Re-establish bash_profile shim (the installer can drop its own)
     ensure_managed_bash_profile
 fi
