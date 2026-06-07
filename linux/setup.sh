@@ -339,11 +339,15 @@ if [ "$HARDEN_ONLY" != "true" ] && [ "$DOCKER_MODE" != "true" ]; then
             log "Generating Prisma client (downloads ~50MB of engine binaries on first run)..."
             # Two non-obvious env tweaks for the nested generate process:
             #  - npm_config_min_release_age=0: prisma generate spawns
-            #    `npm install prisma@<pinned>` via nodeenv. If the user has
-            #    `min-release-age` set in ~/.npmrc, npm 11.x misreads the unit
-            #    (treats the minutes-spec value as days) and demands a release
-            #    older than ~28 years. The pinned prisma CLI is a 2024 release
-            #    and well outside any reasonable cooldown, so override here.
+            #    `npm install prisma@<pinned>` via nodeenv. npm's
+            #    `min-release-age` cooldown (npm 11.10.0+) is counted in DAYS,
+            #    unlike pnpm/yarn (minutes) or bun (seconds). A user's ~/.npmrc
+            #    may set it: the supply-chain hardening repo ships
+            #    `min-release-age=7` (7 days), but an older revision shipped a
+            #    stale `10080` (intended as pnpm-style minutes) which npm reads
+            #    as ~27 years and which blocks the pinned 2024 prisma CLI.
+            #    Override to 0 here for a deterministic install regardless of
+            #    whatever cooldown the user has configured.
             #  - PATH prepend: prisma's Node CLI shells out to `prisma-client-py`
             #    (the Python generator binary), which lives in the uv tool
             #    venv. Without the prepend, the nested /bin/sh can't find it.
