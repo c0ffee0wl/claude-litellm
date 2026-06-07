@@ -55,6 +55,40 @@ warn() {
 }
 
 #############################################################################
+# Resilient script installer
+#############################################################################
+
+# Download a remote shell installer to a temp file and run it, with retries.
+# Avoids the `curl | sh` silent-failure trap: in a pipe the exit status is the
+# interpreter's, not curl's, so a transient 403/network blip yields an empty
+# script the shell no-ops over — the tool then silently never installs and a
+# later step fails with a confusing "<tool>: not found". Downloading to a file
+# lets us check curl's real exit + a non-empty body, retry, then run it (stdin
+# closed, non-interactive). Returns 0 if the installer ran (its own non-zero exit
+# is warned, not fatal), 1 if the download failed after all attempts. Callers
+# verify the resulting binary themselves.
+# Usage: download_and_run <url> <label> [interpreter]   (interpreter defaults to bash)
+download_and_run() {
+    local url="$1" label="$2" interp="${3:-bash}"
+    local tmp attempt
+    tmp="$(mktemp)"
+    for attempt in 1 2 3; do
+        if curl_secure -fsSL "$url" -o "$tmp" && [ -s "$tmp" ]; then
+            "$interp" "$tmp" </dev/null || warn "$label installer exited non-zero"
+            rm -f "$tmp"
+            return 0
+        fi
+        if [ "$attempt" -lt 3 ]; then
+            warn "$label installer download failed (attempt ${attempt}/3) — retrying in 5s..."
+            sleep 5
+        fi
+    done
+    warn "Could not download $label installer from $url after 3 attempts"
+    rm -f "$tmp"
+    return 1
+}
+
+#############################################################################
 # Profile Management (bash + zsh)
 #############################################################################
 

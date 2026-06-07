@@ -234,7 +234,7 @@ if command -v bun &>/dev/null; then
     bun upgrade || warn "bun upgrade failed — keeping existing version"
 else
     log "Installing bun..."
-    curl_secure -fsSL https://bun.sh/install | bash
+    download_and_run https://bun.sh/install bun
 fi
 
 if command -v uv &>/dev/null || [ -x "${HOME}/.local/bin/uv" ]; then
@@ -250,7 +250,7 @@ if command -v uv &>/dev/null || [ -x "${HOME}/.local/bin/uv" ]; then
     fi
 else
     log "Installing uv..."
-    curl_secure -fsSL https://astral.sh/uv/install.sh | sh
+    download_and_run https://astral.sh/uv/install.sh uv sh
 fi
 
 # Symlink bun→node so #!/usr/bin/env node shebangs (ACP) resolve to bun.
@@ -370,27 +370,10 @@ if command -v claude &>/dev/null || [ -x "${HOME}/.local/bin/claude" ]; then
     "$claude_bin" update || warn "claude update failed — keeping existing version"
 else
     log "Installing Claude Code..."
-    # Download to a file, then run it — NOT `curl | bash`. A piped curl masks HTTP
-    # errors (the pipeline's exit status is bash's, so a transient 403/network blip
-    # from the CDN yields an empty script, bash no-ops, and `claude` is never
-    # installed — downstream consumers then fail with a confusing "claude: not found").
-    # Retry the download, run it, then verify the binary actually landed.
-    cc_installer="$(mktemp)"
-    for cc_attempt in 1 2 3; do
-        if curl_secure -fsSL https://claude.ai/install.sh -o "$cc_installer" && [ -s "$cc_installer" ]; then
-            break
-        fi
-        if [ "$cc_attempt" -lt 3 ]; then
-            warn "Claude Code installer download failed (attempt ${cc_attempt}/3) — retrying in 5s..."
-            sleep 5
-        fi
-    done
-    if [ -s "$cc_installer" ]; then
-        bash "$cc_installer" </dev/null || warn "Claude Code installer exited non-zero"
-    else
-        warn "Could not download Claude Code installer from https://claude.ai/install.sh after 3 attempts"
-    fi
-    rm -f "$cc_installer"
+    # download_and_run (not `curl | bash`): a piped curl masks HTTP errors, so a
+    # transient 403/network blip would silently leave `claude` uninstalled and a
+    # downstream step would fail with a confusing "claude: not found". Verify after.
+    download_and_run https://claude.ai/install.sh "Claude Code"
     command -v claude &>/dev/null || [ -x "${HOME}/.local/bin/claude" ] \
         || warn "Claude Code is NOT installed — 'claude' unavailable; dependent steps (e.g. MCP registration) will be skipped"
     # Re-establish bash_profile shim (the installer can drop its own)
