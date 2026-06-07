@@ -33,9 +33,14 @@ PROFILE_FILES=("${HOME}/.profile")
 #############################################################################
 
 # Hardened curl for external HTTPS requests — enforces TLS 1.2+ and HTTPS-only.
+# -q (must come first) makes curl ignore the user's curlrc. REMnux ships ~/.curlrc with
+# an ancient/malformed IE11 User-Agent (a doubled "User-Agent: User-Agent: ..." for
+# malware-analysis browser spoofing) plus custom Accept/Connection headers; that config
+# is read by EVERY curl on the box and trips Cloudflare's bot challenge (HTTP 403,
+# cf-mitigated: challenge) on hosts like claude.ai. -q isolates our downloads from it.
 # Do NOT use for localhost/health checks (plain HTTP).
 curl_secure() {
-    curl --proto '=https' --tlsv1.2 "$@"
+    curl -q --proto '=https' --tlsv1.2 "$@"
 }
 
 #############################################################################
@@ -71,9 +76,13 @@ warn() {
 download_and_run() {
     local url="$1" label="$2" interp="${3:-bash}"
     local tmp attempt
+    # Present a modern browser User-Agent: installer CDNs (e.g. claude.ai behind
+    # Cloudflare) return 403 for non-browser/odd UAs. -A also overrides any curlrc UA
+    # on the command line (curl_secure already passes -q; this is belt-and-suspenders).
+    local ua="Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0"
     tmp="$(mktemp)"
     for attempt in 1 2 3; do
-        if curl_secure -fsSL "$url" -o "$tmp" && [ -s "$tmp" ]; then
+        if curl_secure -fsSL -A "$ua" "$url" -o "$tmp" && [ -s "$tmp" ]; then
             "$interp" "$tmp" </dev/null || warn "$label installer exited non-zero"
             rm -f "$tmp"
             return 0
