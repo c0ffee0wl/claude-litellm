@@ -10,10 +10,11 @@
 # of two things holds — (a) Claude Code itself runs inside an OUTER sandbox
 # (bubblewrap via blaude, Landlock via nono, or a container; detected from the
 # kernel / an env marker — see below),
-# or (b) CC's per-command sandbox is effectively enabled across the settings
-# precedence chain AND bwrap is present. "Off", "can't determine", and "enabled
-# but bwrap missing" (CC's silent fallback) all warn — a detection gap over-warns
-# rather than falsely reassuring.
+# or (b) CC's per-command sandbox is effectively enabled across the full settings
+# precedence chain (managed > project-local > project > user-local > user) AND
+# bwrap is present (found on PATH or at /usr/bin|/bin/bwrap). "Off", "can't
+# determine", and "enabled but bwrap missing" (CC's silent fallback) all warn —
+# a detection gap over-warns rather than falsely reassuring.
 #
 # Mode is detected via ANTHROPIC_BASE_URL:
 #   DIRECT  — empty or non-local: show 5h/7d rate-limit budgets (Claude.ai
@@ -98,7 +99,11 @@ SANDBOXED=""
 # (all fork-free; the statusline shares CC's namespaces, so /proc/self is its own
 # accurate view):
 #   1. CLAUDE_SANDBOX / $container env marker — set by the wrapper. Deterministic
-#      and mechanism-agnostic; blaude/nono can export it (recommended).
+#      and mechanism-agnostic; blaude/nono can export it (recommended). Also
+#      treat CC's own runtime-activation markers (SANDBOX_RUNTIME, the HTTP/SOCKS
+#      host-proxy ports it injects when its sandbox is live) as positive: these
+#      MAY not reach the statusline's parent (anthropics/claude-code#30772), so
+#      checking them only ever ADDS confirmation — never suppresses falsely.
 #   2. container runtime marker files (docker/podman).
 #   3. user namespace — bubblewrap (blaude) and rootless containers remap uids.
 #      The initial (host) userns is ALWAYS exactly "0 0 4294967295" for every user
@@ -112,6 +117,9 @@ SANDBOXED=""
 #      and refuses self-reads). Set CLAUDE_SANDBOX to make detection exact.
 outer_sandbox=""
 if [ -n "${CLAUDE_SANDBOX:-}" ] || [ -n "${container:-}" ] \
+   || [ -n "${SANDBOX_RUNTIME:-}" ] \
+   || [ -n "${CLAUDE_CODE_HOST_HTTP_PROXY_PORT:-}" ] \
+   || [ -n "${CLAUDE_CODE_HOST_SOCKS_PROXY_PORT:-}" ] \
    || [ -e /.dockerenv ] || [ -e /run/.containerenv ]; then
     outer_sandbox=1
 elif [ -r /proc/self/uid_map ] \
@@ -137,12 +145,16 @@ else
     # `true`. try/catch emits exactly one token, mapping an absent/malformed
     # block to "unset" (keep looking). Project-level files come from project_dir
     # (the /sandbox toggle location), NOT current_dir which drifts on `cd`.
+    # $HOME/.claude/settings.local.json is a file CC reads (a common /sandbox
+    # target — anthropics/claude-code#47624, #51704) and was previously OMITTED,
+    # so enabling the sandbox at user-local scope went undetected and over-warned.
     # Requires bwrap present too, else CC silently runs unsandboxed.
     SANDBOX_ON=""
     sb_root="$proj_dir"
     for sb_file in /etc/claude-code/managed-settings.json \
                    "$sb_root/.claude/settings.local.json" \
                    "$sb_root/.claude/settings.json" \
+                   "$HOME/.claude/settings.local.json" \
                    "$HOME/.claude/settings.json"; do
         [ -r "$sb_file" ] || continue
         sb_val=$(jq -r 'try (.sandbox.enabled) catch null | if .==true then "true" elif .==false then "false" else "unset" end' "$sb_file" 2>/dev/null)
@@ -151,7 +163,16 @@ else
             false) SANDBOX_ON=""; break ;;
         esac
     done
-    [ -n "$SANDBOX_ON" ] && command -v bwrap >/dev/null 2>&1 && SANDBOXED=1
+    # bwrap presence: prefer a PATH lookup, but fall back to the canonical apt
+    # install locations. CC may invoke the statusline with a PATH lacking
+    # /usr/bin, which would make `command -v bwrap` false-negative even though
+    # bwrap is installed (apt ships it at /usr/bin/bwrap) — showing the warning
+    # on a fully-sandboxed box. The -x checks close that gap (execute bit
+    # required, so a non-exec stub can't falsely confirm).
+    if [ -n "$SANDBOX_ON" ] \
+       && { command -v bwrap >/dev/null 2>&1 || [ -x /usr/bin/bwrap ] || [ -x /bin/bwrap ]; }; then
+        SANDBOXED=1
+    fi
 fi
 
 # Mode detection
