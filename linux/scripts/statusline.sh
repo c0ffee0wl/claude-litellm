@@ -99,11 +99,11 @@ SANDBOXED=""
 # (all fork-free; the statusline shares CC's namespaces, so /proc/self is its own
 # accurate view):
 #   1. CLAUDE_SANDBOX / $container env marker — set by the wrapper. Deterministic
-#      and mechanism-agnostic; blaude/nono can export it (recommended). Also
-#      treat CC's own runtime-activation markers (SANDBOX_RUNTIME, the HTTP/SOCKS
-#      host-proxy ports it injects when its sandbox is live) as positive: these
-#      MAY not reach the statusline's parent (anthropics/claude-code#30772), so
-#      checking them only ever ADDS confirmation — never suppresses falsely.
+#      and mechanism-agnostic; blaude/nono can export it (recommended). NB: CC's
+#      OWN built-in-sandbox runtime markers (SANDBOX_RUNTIME, the HTTP/SOCKS
+#      host-proxy ports) are deliberately NOT checked — they exist only inside the
+#      sandboxed bash *child*, never the statusline's host *parent* process
+#      (anthropics/claude-code#30772), so reading them here is dead code.
 #   2. container runtime marker files (docker/podman).
 #   3. user namespace — bubblewrap (blaude) and rootless containers remap uids.
 #      The initial (host) userns is ALWAYS exactly "0 0 4294967295" for every user
@@ -117,9 +117,6 @@ SANDBOXED=""
 #      and refuses self-reads). Set CLAUDE_SANDBOX to make detection exact.
 outer_sandbox=""
 if [ -n "${CLAUDE_SANDBOX:-}" ] || [ -n "${container:-}" ] \
-   || [ -n "${SANDBOX_RUNTIME:-}" ] \
-   || [ -n "${CLAUDE_CODE_HOST_HTTP_PROXY_PORT:-}" ] \
-   || [ -n "${CLAUDE_CODE_HOST_SOCKS_PROXY_PORT:-}" ] \
    || [ -e /.dockerenv ] || [ -e /run/.containerenv ]; then
     outer_sandbox=1
 elif [ -r /proc/self/uid_map ] \
@@ -143,12 +140,17 @@ else
     # the settings precedence chain (highest first), taking the first file that
     # *defines* the key — an explicit higher-layer `false` wins over a lower
     # `true`. try/catch emits exactly one token, mapping an absent/malformed
-    # block to "unset" (keep looking). Project-level files come from project_dir
-    # (the /sandbox toggle location), NOT current_dir which drifts on `cd`.
-    # $HOME/.claude/settings.local.json is a file CC reads (a common /sandbox
-    # target — anthropics/claude-code#47624, #51704) and was previously OMITTED,
-    # so enabling the sandbox at user-local scope went undetected and over-warned.
-    # Requires bwrap present too, else CC silently runs unsandboxed.
+    # block to "unset" (keep looking). Project-level files come from project_dir,
+    # NOT current_dir which drifts on `cd`. $HOME/.claude/settings.local.json is
+    # also read (a user-local override CC honours — anthropics/claude-code#47624,
+    # #51704). Requires bwrap present too, else CC silently runs unsandboxed.
+    # LIMITATION: this only detects sandbox enablement PERSISTED to a settings
+    # file (the repo default: sandbox.enabled:true in ~/.claude/settings.json).
+    # A sandbox toggled ON purely via the /sandbox picker is runtime-only — CC
+    # frequently writes nothing to disk for it (#47624) and exposes no parent-
+    # visible signal (#30772), so it is undetectable here and (correctly, given
+    # the fail-safe contract) still warns. Enable via settings to get a reliable
+    # indicator.
     SANDBOX_ON=""
     sb_root="$proj_dir"
     for sb_file in /etc/claude-code/managed-settings.json \
