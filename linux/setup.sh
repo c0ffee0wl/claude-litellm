@@ -491,8 +491,14 @@ update_profile_export "SCARF_ANALYTICS"               "false"
 
 # Subprocess env scrubbing: kept in ~/.profile (not managed-settings) so users
 # can `unset CLAUDE_CODE_SUBPROCESS_ENV_SCRUB` before `claude --dangerously-skip-permissions`
-# when they need provider env vars to reach spawned subprocesses.
-update_profile_export "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB" "1"
+# when they need provider env vars to reach spawned subprocesses. Skipped under
+# --router-only (a dev box where Bash/MCP/hooks should keep the full env, incl. the
+# gateway token); removed there too so a box flipped from full mode is cleaned up.
+if [ "$ROUTER_ONLY" = "true" ]; then
+    remove_profile_export "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"
+else
+    update_profile_export "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB" "1"
+fi
 
 # Claude Code feature/privacy toggles. Also duplicated in managed-settings'
 # env: block for full/harden modes; written here as well so they apply under
@@ -823,20 +829,37 @@ chmod 755 /tmp/claude
 # re-run of setup must not clobber it.
 if [ ! -f "${HOME}/.claude/settings.json" ]; then
     if [ "$ROUTER_ONLY" = "true" ]; then
-        # router-only ships the sandbox OFF by default: strip the block so we don't
-        # deploy an enabled sandbox in a mode meant to be minimal. The bwrap runtime
-        # is still installed (Phase 2), so the user can `/sandbox` on whenever they
-        # want (writes settings.local.json) — only the default config is absent.
+        # router-only ships the sandbox OFF, but KEEP the full block and just set
+        # enabled:false (don't strip it). The floor (denyRead/denyWrite/network) stays
+        # pre-configured, so flipping enabled:true later activates the hardened sandbox
+        # with no re-config, and the statusline reflects whatever the user sets. bwrap
+        # is installed in all modes (Phase 2).
         # Capture jq's output first: a bare `jq | write_if_changed` pipeline has no
         # pipefail (set -o pipefail isn't set), so a jq failure would be masked and
         # write_if_changed would write an empty settings.json and return 0. The
         # `VAR=$(jq …)` form aborts the script under `set -e` if jq fails.
-        SANDBOX_STRIPPED_SETTINGS=$(jq 'del(.sandbox)' "$SCRIPT_DIR/configs/claude-settings.json")
-        printf '%s\n' "$SANDBOX_STRIPPED_SETTINGS" \
+        ROUTER_SETTINGS=$(jq '.sandbox.enabled = false' "$SCRIPT_DIR/configs/claude-settings.json")
+        printf '%s\n' "$ROUTER_SETTINGS" \
             | write_if_changed "${HOME}/.claude/settings.json" 644 "${USER}:${USER}"
     else
         deploy_config "$SCRIPT_DIR/configs/claude-settings.json" "${HOME}/.claude/settings.json"
     fi
+elif ! jq -e 'has("sandbox")' "${HOME}/.claude/settings.json" >/dev/null 2>&1; then
+    # Existing CC-owned file with NO sandbox block: never auto-modify it, but without a
+    # persisted block the statusline can't detect the sandbox (a /sandbox-picker toggle
+    # is runtime-only — anthropics/claude-code#47624 — and undetectable). Print a
+    # one-time, idempotent (`//=`, add-if-missing) helper that keeps every other key;
+    # router-only seeds it disabled.
+    if [ "$ROUTER_ONLY" = "true" ]; then
+        sb_mod=' | .enabled = false'
+        router_note="(router-only seeds it disabled — set sandbox.enabled:true to turn it on)"
+    else
+        sb_mod=''; router_note=''
+    fi
+    warn "~/.claude/settings.json has no sandbox block — the statusline can't detect the sandbox."
+    warn "Add it (keeps your other keys), then restart Claude Code:"
+    echo "  f=\"\$HOME/.claude/settings.json\"; t=\$(mktemp); jq -s '(.[1].sandbox$sb_mod) as \$s | .[0] | .sandbox //= \$s' \"\$f\" '$SCRIPT_DIR/configs/claude-settings.json' > \"\$t\" && cat \"\$t\" > \"\$f\" && rm -f \"\$t\""
+    [ -n "$router_note" ] && warn "$router_note"
 fi
 
 # 8d. Statusline script
