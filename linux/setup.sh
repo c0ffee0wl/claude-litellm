@@ -338,7 +338,7 @@ if [ "$HARDEN_ONLY" != "true" ] && [ "$DOCKER_MODE" != "true" ]; then
             fi
             log "Generating Prisma client (downloads ~50MB of engine binaries on first run)..."
             # Two non-obvious env tweaks for the nested generate process:
-            #  - npm_config_min_release_age=0: prisma generate spawns
+            #  - npm_config_min_release_age=7: prisma generate spawns
             #    `npm install prisma@<pinned>` via nodeenv. npm's
             #    `min-release-age` cooldown (npm 11.10.0+) is counted in DAYS,
             #    unlike pnpm/yarn (minutes) or bun (seconds). A user's ~/.npmrc
@@ -346,14 +346,16 @@ if [ "$HARDEN_ONLY" != "true" ] && [ "$DOCKER_MODE" != "true" ]; then
             #    `min-release-age=7` (7 days), but an older revision shipped a
             #    stale `10080` (intended as pnpm-style minutes) which npm reads
             #    as ~27 years and which blocks the pinned 2024 prisma CLI.
-            #    Override to 0 here for a deterministic install regardless of
-            #    whatever cooldown the user has configured.
+            #    Pin 7 days here so the install is deterministic regardless of
+            #    the user's config (env overrides ~/.npmrc, incl. the stale
+            #    10080) while keeping the hardening repo's intended cooldown:
+            #    the pinned 2024 prisma CLI clears 7 days trivially.
             #  - PATH prepend: prisma's Node CLI shells out to `prisma-client-py`
             #    (the Python generator binary), which lives in the uv tool
             #    venv. Without the prepend, the nested /bin/sh can't find it.
             PATH="${UV_LITELLM_VENV}/bin:$PATH" \
             PRISMA_BINARY_CACHE_DIR="$PRISMA_BINARY_CACHE_DIR" \
-            npm_config_min_release_age=0 \
+            npm_config_min_release_age=7 \
                 "${UV_LITELLM_VENV}/bin/prisma" generate --schema="$LITELLM_SCHEMA"
         fi
     fi
