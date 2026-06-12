@@ -206,6 +206,23 @@ resolve_token() {
     fi
 }
 
+# Refresh cache file $1 from LiteLLM endpoint $3 if it's missing or older than $2
+# minutes. Writes atomically (tmp + mv) and falls through silently on any error —
+# the statusline must never block or surface failures.
+fetch_litellm_cache() {
+    local cache_file="$1" max_age_min="$2" endpoint="$3" tmp
+    [ -s "$cache_file" ] && [ -n "$(find "$cache_file" -mmin "-$max_age_min" 2>/dev/null)" ] && return
+    resolve_token
+    [ -n "$TOKEN" ] || return
+    tmp="${cache_file}.$$.tmp"
+    curl -sf --max-time 1 \
+        -H "Authorization: Bearer $TOKEN" \
+        "${ANTHROPIC_BASE_URL%/}/$endpoint" \
+        -o "$tmp" 2>/dev/null \
+        && mv "$tmp" "$cache_file" 2>/dev/null
+    rm -f "$tmp" 2>/dev/null
+}
+
 # LiteLLM lookups (cached). Falls through silently on any error — statusline
 # must never block or error.
 UPSTREAM_MODEL=""
@@ -216,18 +233,7 @@ if [ "$MODE" = "LITELLM" ]; then
     # Resolve upstream model via /model/info (cached 5min).
     if [ -n "$MODEL_ID" ]; then
         CACHE_FILE="${CACHE_DIR}/claude-litellm-modelinfo-${EUID}.json"
-        if [ ! -s "$CACHE_FILE" ] || [ -z "$(find "$CACHE_FILE" -mmin -5 2>/dev/null)" ]; then
-            resolve_token
-            if [ -n "$TOKEN" ]; then
-                TMP_FILE="${CACHE_FILE}.$$.tmp"
-                curl -sf --max-time 1 \
-                    -H "Authorization: Bearer $TOKEN" \
-                    "${ANTHROPIC_BASE_URL%/}/model/info" \
-                    -o "$TMP_FILE" 2>/dev/null \
-                    && mv "$TMP_FILE" "$CACHE_FILE" 2>/dev/null
-                rm -f "$TMP_FILE" 2>/dev/null
-            fi
-        fi
+        fetch_litellm_cache "$CACHE_FILE" 5 "model/info"
         if [ -s "$CACHE_FILE" ]; then
             # Match against model_name (public alias) OR model_info.id (internal
             # uuid); Claude Code's .model.id is usually the alias but be defensive.
@@ -244,18 +250,7 @@ if [ "$MODE" = "LITELLM" ]; then
     # "startTime >= CURRENT_DATE - INTERVAL '30 days'" — a rolling 30-day window,
     # not calendar month-to-date. Labelled "/30d" below to match.
     SPEND_CACHE="${CACHE_DIR}/claude-litellm-spend-${EUID}.json"
-    if [ ! -s "$SPEND_CACHE" ] || [ -z "$(find "$SPEND_CACHE" -mmin -1 2>/dev/null)" ]; then
-        resolve_token
-        if [ -n "$TOKEN" ]; then
-            TMP_FILE="${SPEND_CACHE}.$$.tmp"
-            curl -sf --max-time 1 \
-                -H "Authorization: Bearer $TOKEN" \
-                "${ANTHROPIC_BASE_URL%/}/global/spend" \
-                -o "$TMP_FILE" 2>/dev/null \
-                && mv "$TMP_FILE" "$SPEND_CACHE" 2>/dev/null
-            rm -f "$TMP_FILE" 2>/dev/null
-        fi
-    fi
+    fetch_litellm_cache "$SPEND_CACHE" 1 "global/spend"
     [ -s "$SPEND_CACHE" ] && SPEND=$(jq -r '.spend // empty' "$SPEND_CACHE" 2>/dev/null)
 fi
 
@@ -279,7 +274,7 @@ GREEN='\033[32m'; YELLOW='\033[33m'; RED='\033[31m'; RESET='\033[0m'
 fmt_reset() {
     local at="$1" now diff d h m
     [[ "$at" =~ ^[0-9]+$ ]] || return
-    now=$(date +%s); diff=$((at - now)); (( diff <= 0 )) && { printf 'now'; return; }
+    printf -v now '%(%s)T' -1; diff=$((at - now)); (( diff <= 0 )) && { printf 'now'; return; }
     d=$((diff/86400)); h=$(((diff%86400)/3600)); m=$(((diff%3600)/60))
     if   (( d > 0 )); then printf '%dd%dh' "$d" "$h"
     elif (( h > 0 )); then printf '%dh%dm' "$h" "$m"

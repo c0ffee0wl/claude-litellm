@@ -536,15 +536,22 @@ remove_profile_export "IS_DEMO"
 # pinned model supports. Claude Code's built-in detection only matches
 # claude-*/anthropic-* ids, so with upstream-prefixed ids like azure/gpt-5.4 it
 # would otherwise leave extended thinking + effort DISABLED (and never send a
-# thinking block). Values are tuned for Azure GPT-5.4: `effort` is capped at
-# low/medium/high (xhigh_effort/max_effort omitted — gpt-5.4 rejects those and
-# LiteLLM passes them through unclamped → Azure 400); `adaptive_thinking` routes
+# thinking block). Values are tuned for Azure GPT-5.4: `xhigh_effort` is
+# included for the gpt-5.4 tiers (GPT-5.4 accepts reasoning_effort=xhigh —
+# Azure v1 API ref; surfacing it needs CC ≥2.1.111) and is safe at this repo's
+# LiteLLM floor: ≥1.84.0 clamps effort levels the model map doesn't declare
+# support for (max→xhigh→high, BerriAI/litellm#26111), so while the map's
+# azure/ flags lag, xhigh silently runs as high — never an Azure 400.
+# `max_effort` stays excluded: `max` is Anthropic-only, so it would *always*
+# clamp — a permanently misleading picker entry. The haiku tier (gpt-5.4-mini)
+# also omits `xhigh_effort` (its azure/ map flag is explicitly false, and
+# xhigh on the fast tier defeats its purpose). `adaptive_thinking` routes
 # effort via output_config.effort and avoids the manual-budget→"minimal" path
-# that gpt-5.4 also rejects. See CLAUDE.md > "Model naming".
+# that gpt-5.4 rejects. See CLAUDE.md > "Model naming".
 NEEDS_MODEL_CONFIG=0
 if [ -n "${AZURE_OPENAI_API_KEY:-}" ] && [ -n "${AZURE_RESOURCE_ENDPOINT:-}" ]; then
-    update_profile_export "ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES"   "thinking,adaptive_thinking,interleaved_thinking,effort"
-    update_profile_export "ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES" "thinking,adaptive_thinking,interleaved_thinking,effort"
+    update_profile_export "ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES"   "thinking,adaptive_thinking,interleaved_thinking,effort,xhigh_effort"
+    update_profile_export "ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES" "thinking,adaptive_thinking,interleaved_thinking,effort,xhigh_effort"
     update_profile_export "ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES"  "thinking,adaptive_thinking,effort"
     update_profile_export "ANTHROPIC_DEFAULT_HAIKU_MODEL"  "azure/gpt-5.4-mini"
     update_profile_export "ANTHROPIC_DEFAULT_SONNET_MODEL" "azure/gpt-5.4"
@@ -827,6 +834,7 @@ chmod 755 /tmp/claude
 # 8c. User settings. Deploy only on a fresh install — once Claude Code is
 # running it owns this file (theme, plugins, accepted-bypass state); a
 # re-run of setup must not clobber it.
+NEEDS_SANDBOX_BLOCK=0
 if [ ! -f "${HOME}/.claude/settings.json" ]; then
     if [ "$ROUTER_ONLY" = "true" ]; then
         # router-only ships the sandbox OFF, but KEEP the full block and just set
@@ -847,19 +855,13 @@ if [ ! -f "${HOME}/.claude/settings.json" ]; then
 elif ! jq -e 'has("sandbox")' "${HOME}/.claude/settings.json" >/dev/null 2>&1; then
     # Existing CC-owned file with NO sandbox block: never auto-modify it, but without a
     # persisted block the statusline can't detect the sandbox (a /sandbox-picker toggle
-    # is runtime-only — anthropics/claude-code#47624 — and undetectable). Print a
-    # one-time, idempotent (`//=`, add-if-missing) helper that keeps every other key;
-    # router-only seeds it disabled.
-    if [ "$ROUTER_ONLY" = "true" ]; then
-        sb_mod=' | .enabled = false'
-        router_note="(router-only seeds it disabled — set sandbox.enabled:true to turn it on)"
-    else
-        sb_mod=''; router_note=''
-    fi
-    warn "~/.claude/settings.json has no sandbox block — the statusline can't detect the sandbox."
-    warn "Add it (keeps your other keys), then restart Claude Code:"
-    echo "  f=\"\$HOME/.claude/settings.json\"; t=\$(mktemp); jq -s '(.[1].sandbox$sb_mod) as \$s | .[0] | .sandbox //= \$s' \"\$f\" '$SCRIPT_DIR/configs/claude-settings.json' > \"\$t\" && cat \"\$t\" > \"\$f\" && rm -f \"\$t\""
-    [ -n "$router_note" ] && warn "$router_note"
+    # is runtime-only — anthropics/claude-code#47624 — and undetectable). The fix-it
+    # command (scripts/add-sandbox-block.sh — idempotent `//=` add-if-missing merge,
+    # run by the user, keeps every other key) is surfaced in the end-of-script banner
+    # via the NEEDS_MODEL_CONFIG pattern — printed inline here it would scroll off
+    # behind Phases 9–11. The warn keeps non-tty runs (no banner) actionable.
+    NEEDS_SANDBOX_BLOCK=1
+    warn "~/.claude/settings.json has no sandbox block — run linux/scripts/add-sandbox-block.sh (details in the end-of-setup banner)."
 fi
 
 # 8d. Statusline script
@@ -1222,6 +1224,24 @@ if [ "${NEEDS_MODEL_CONFIG:-0}" = "1" ] && [ -t 1 ]; then
     echo -e "       capabilities or Claude Code leaves thinking + effort OFF:"
     echo -e "         ${GREEN}export ANTHROPIC_DEFAULT_{HAIKU,SONNET,OPUS}_MODEL_SUPPORTED_CAPABILITIES=\"thinking,adaptive_thinking,interleaved_thinking,effort\"${NC}"
     echo -e "    4. ${GREEN}source ~/.profile${NC} (or log out and back in) before \`claude\`."
+    echo -e "${YELLOW}${rule}${NC}"
+    echo ""
+fi
+
+if [ "${NEEDS_SANDBOX_BLOCK:-0}" = "1" ] && [ -t 1 ]; then
+    rule="━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo -e "${YELLOW}${rule}${NC}"
+    echo -e "${YELLOW}  ~/.claude/settings.json has no sandbox block — the statusline can't"
+    echo -e "  detect the sandbox. Add it (keeps your other keys), then restart"
+    echo -e "  Claude Code:${NC}"
+    echo ""
+    if [ "$ROUTER_ONLY" = "true" ]; then
+        echo -e "    ${GREEN}${SCRIPT_DIR}/scripts/add-sandbox-block.sh --disabled${NC}"
+        echo ""
+        echo -e "${YELLOW}  (router-only seeds it disabled — set sandbox.enabled:true to turn it on)${NC}"
+    else
+        echo -e "    ${GREEN}${SCRIPT_DIR}/scripts/add-sandbox-block.sh${NC}"
+    fi
     echo -e "${YELLOW}${rule}${NC}"
     echo ""
 fi
