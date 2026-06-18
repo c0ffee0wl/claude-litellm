@@ -5,6 +5,11 @@
   },
   "theme": "auto",
 
+  "attribution": {
+    "commit": "",
+    "pr": ""
+  },
+
   "sandbox": {
     "enabled": true,
     "autoAllowBashIfSandboxed": true,
