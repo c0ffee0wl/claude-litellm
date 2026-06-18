@@ -33,7 +33,9 @@ Now run `claude`. Traffic goes to `http://127.0.0.1:4000` (LiteLLM's unified Ant
 | `./linux/setup.sh` | Full setup: LiteLLM + Claude Code + managed-settings hardening + `nah` plugin + claude-devtools |
 | `./linux/setup.sh --router-only` | LiteLLM + Claude Code + claude-devtools. Skips managed-settings hardening and the `nah` plugin; on a **fresh install** ships the sandbox **off** by default (the `sandbox` block is stripped from user settings, but bwrap is still installed so `/sandbox` can enable it; an existing `~/.claude/settings.json` is left untouched). Dev-box mode |
 | `./linux/setup.sh --harden-only` | Claude Code + managed-settings + `nah` plugin only. Skips LiteLLM and claude-devtools. Use when LiteLLM runs on another host |
+| `./linux/setup.sh --install-only` | Claude Code + claude-devtools + the hardening/telemetry env vars only. Skips LiteLLM, Postgres, managed-settings, the `nah` plugin, **and all gateway wiring** (no localhost `ANTHROPIC_BASE_URL`, no `sk-` auth token, no `azure/gpt-5.4` default-model vars) — Claude Code talks to the real Anthropic API until you point it at a router yourself. Sandbox shipped off by default (block kept, `enabled:false`). Mutually exclusive with `--router-only`/`--harden-only`; incompatible with `--docker` |
 | `./linux/setup.sh --install-obsidian` | Also installs the ACP adapter + the latest Obsidian (`.deb`). Additive; combine with any mode |
+| `./linux/setup.sh --docker` | Runs LiteLLM as a rootless Docker Compose service instead of the native `uv` install (Postgres stays on the host; `/ui` data persists across the switch). Additive; combine with any mode except `--harden-only`/`--install-only` (no LiteLLM) |
 | `./linux/setup.sh --yes` | Non-interactive (combine with any of the above) |
 
 ## Architecture

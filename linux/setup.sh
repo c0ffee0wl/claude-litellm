@@ -9,14 +9,16 @@
 #   ./linux/setup.sh                  # Full setup: LiteLLM + Claude Code + managed settings
 #   ./linux/setup.sh --router-only    # LiteLLM gateway + Claude Code, no managed-settings hardening
 #   ./linux/setup.sh --harden-only    # Only Claude Code + managed settings (no LiteLLM; remote router)
+#   ./linux/setup.sh --install-only   # Claude Code + hardening env vars only — no LiteLLM/Postgres, no gateway wiring, no managed-settings
 #   ./linux/setup.sh --install-obsidian  # Also install the ACP adapter + latest Obsidian (.deb); combinable with any mode
 #   ./linux/setup.sh --docker         # Run LiteLLM via rootless Docker Compose (Postgres stays on the host); additive
 #   ./linux/setup.sh --yes            # Non-interactive (skip prompts)
 #
-# --router-only and --harden-only are mutually exclusive. --install-obsidian and
-# --docker are additive (combinable with any mode except --docker + --harden-only,
-# which has no LiteLLM). Flags are NOT persisted — each invocation is fresh;
-# rerunning without a flag falls through to full mode.
+# --router-only, --harden-only, and --install-only are mutually exclusive.
+# --install-obsidian and --docker are additive (combinable with any mode except
+# --docker + --harden-only / --install-only, which have no LiteLLM). Flags are NOT
+# persisted — each invocation is fresh; rerunning without a flag falls through to
+# full mode.
 
 set -e
 
@@ -31,6 +33,7 @@ source "$SCRIPT_DIR/common.sh"
 
 ROUTER_ONLY=false
 HARDEN_ONLY=false
+INSTALL_ONLY=false
 INSTALL_OBSIDIAN=false
 DOCKER_MODE=false
 ORIGINAL_ARGS=("$@")
@@ -43,6 +46,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --harden-only)
             HARDEN_ONLY=true
+            shift
+            ;;
+        --install-only)
+            INSTALL_ONLY=true
             shift
             ;;
         --install-obsidian)
@@ -73,9 +80,23 @@ if [ "$ROUTER_ONLY" = "true" ] && [ "$HARDEN_ONLY" = "true" ]; then
     exit 1
 fi
 
-# --docker dockerizes LiteLLM; --harden-only installs no LiteLLM at all.
+# --install-only is a third standalone mode — exclusive with the other two.
+if [ "$INSTALL_ONLY" = "true" ] && [ "$ROUTER_ONLY" = "true" ]; then
+    error "--install-only and --router-only are mutually exclusive"
+    exit 1
+fi
+if [ "$INSTALL_ONLY" = "true" ] && [ "$HARDEN_ONLY" = "true" ]; then
+    error "--install-only and --harden-only are mutually exclusive"
+    exit 1
+fi
+
+# --docker dockerizes LiteLLM; --harden-only / --install-only install no LiteLLM at all.
 if [ "$DOCKER_MODE" = "true" ] && [ "$HARDEN_ONLY" = "true" ]; then
     error "--docker and --harden-only are incompatible (--harden-only installs no LiteLLM)"
+    exit 1
+fi
+if [ "$DOCKER_MODE" = "true" ] && [ "$INSTALL_ONLY" = "true" ]; then
+    error "--docker and --install-only are incompatible (--install-only installs no LiteLLM)"
     exit 1
 fi
 
@@ -88,6 +109,8 @@ if [ "$HARDEN_ONLY" = "true" ]; then
     log "claude-litellm setup starting (--harden-only mode)"
 elif [ "$ROUTER_ONLY" = "true" ]; then
     log "claude-litellm setup starting (--router-only mode)"
+elif [ "$INSTALL_ONLY" = "true" ]; then
+    log "claude-litellm setup starting (--install-only mode)"
 else
     log "claude-litellm setup starting (full mode)"
 fi
@@ -292,8 +315,9 @@ LITELLM_BIN="${HOME}/.local/bin/litellm"
 
 # Skipped under --docker: the ghcr.io/berriai/litellm image already bundles
 # LiteLLM + a generated Prisma client, so neither the uv tool install nor the
-# `prisma generate` step below is needed.
-if [ "$HARDEN_ONLY" != "true" ] && [ "$DOCKER_MODE" != "true" ]; then
+# `prisma generate` step below is needed. Skipped under --install-only too (that
+# mode installs no local LiteLLM).
+if [ "$HARDEN_ONLY" != "true" ] && [ "$DOCKER_MODE" != "true" ] && [ "$INSTALL_ONLY" != "true" ]; then
     if [ -x "$LITELLM_BIN" ]; then
         # Upgrade-in-place (not skip): re-asserts the >=1.84.0 floor so an existing
         # install is lifted off a compromised 1.82.7/1.82.8 and picks up newer
@@ -469,12 +493,16 @@ fi
 #   1. ANTHROPIC_AUTH_TOKEN from .env (user-managed)
 #   2. existing value in ~/.profile (preserved across reruns)
 #   3. auto-generated sk-<48 hex chars> on first run
-if [ -z "${ANTHROPIC_AUTH_TOKEN:-}" ]; then
-    ANTHROPIC_AUTH_TOKEN="$(read_profile_export ANTHROPIC_AUTH_TOKEN)"
-fi
-if [ -z "$ANTHROPIC_AUTH_TOKEN" ] || [ "$ANTHROPIC_AUTH_TOKEN" = "test" ]; then
-    ANTHROPIC_AUTH_TOKEN="sk-$(openssl rand -hex 24)"
-    log "Generated new LiteLLM master key (persisted to ~/.profile)"
+# Skipped under --install-only: no LiteLLM gateway is wired up, so there is no
+# master key to mint or carry — the gateway connection vars below are skipped too.
+if [ "$INSTALL_ONLY" != "true" ]; then
+    if [ -z "${ANTHROPIC_AUTH_TOKEN:-}" ]; then
+        ANTHROPIC_AUTH_TOKEN="$(read_profile_export ANTHROPIC_AUTH_TOKEN)"
+    fi
+    if [ -z "$ANTHROPIC_AUTH_TOKEN" ] || [ "$ANTHROPIC_AUTH_TOKEN" = "test" ]; then
+        ANTHROPIC_AUTH_TOKEN="sk-$(openssl rand -hex 24)"
+        log "Generated new LiteLLM master key (persisted to ~/.profile)"
+    fi
 fi
 
 log "Writing gateway + telemetry env vars to ~/.profile..."
@@ -495,8 +523,9 @@ update_profile_export "SCARF_ANALYTICS"               "false"
 # can `unset CLAUDE_CODE_SUBPROCESS_ENV_SCRUB` before `claude --dangerously-skip-permissions`
 # when they need provider env vars to reach spawned subprocesses. Skipped under
 # --router-only (a dev box where Bash/MCP/hooks should keep the full env, incl. the
-# gateway token); removed there too so a box flipped from full mode is cleaned up.
-if [ "$ROUTER_ONLY" = "true" ]; then
+# gateway token) and --install-only (no gateway token to protect); removed there
+# too so a box flipped from full mode is cleaned up.
+if [ "$ROUTER_ONLY" = "true" ] || [ "$INSTALL_ONLY" = "true" ]; then
     remove_profile_export "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"
 else
     update_profile_export "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB" "1"
@@ -551,46 +580,57 @@ remove_profile_export "IS_DEMO"
 # effort via output_config.effort and avoids the manual-budget→"minimal" path
 # that gpt-5.4 rejects. See CLAUDE.md > "Model naming".
 NEEDS_MODEL_CONFIG=0
-if [ -n "${AZURE_OPENAI_API_KEY:-}" ] && [ -n "${AZURE_RESOURCE_ENDPOINT:-}" ]; then
-    update_profile_export "ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES"   "thinking,adaptive_thinking,interleaved_thinking,effort,xhigh_effort"
-    update_profile_export "ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES" "thinking,adaptive_thinking,interleaved_thinking,effort,xhigh_effort"
-    update_profile_export "ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES"  "thinking,adaptive_thinking,effort"
-    update_profile_export "ANTHROPIC_DEFAULT_HAIKU_MODEL"  "azure/gpt-5.4-mini"
-    update_profile_export "ANTHROPIC_DEFAULT_SONNET_MODEL" "azure/gpt-5.4"
-    update_profile_export "ANTHROPIC_DEFAULT_OPUS_MODEL"   "azure/gpt-5.4"
-else
-    # Capability declarations track the model ids; clear them when no model is
-    # pinned (preserving any manual value). Kept out of the NEEDS_MODEL_CONFIG
-    # loop above — capabilities aren't themselves a reason to nag for a model id.
-    for var in ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES \
-               ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES \
-               ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES; do
-        if [ -z "$(read_profile_export "$var")" ]; then
-            update_profile_export "$var" ""
-        fi
-    done
-    for var in ANTHROPIC_DEFAULT_HAIKU_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL; do
-        existing="$(read_profile_export "$var")"
-        if [ -z "$existing" ]; then
-            update_profile_export "$var" ""
-            NEEDS_MODEL_CONFIG=1
-        fi
-    done
+# Skipped entirely under --install-only: the default-model selectors point at the
+# upstream provider ids that only resolve through the LiteLLM gateway, and gateway
+# model discovery is moot with no gateway. NEEDS_MODEL_CONFIG stays 0 so its
+# end-of-script banner never fires in that mode.
+if [ "$INSTALL_ONLY" != "true" ]; then
+    if [ -n "${AZURE_OPENAI_API_KEY:-}" ] && [ -n "${AZURE_RESOURCE_ENDPOINT:-}" ]; then
+        update_profile_export "ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES"   "thinking,adaptive_thinking,interleaved_thinking,effort,xhigh_effort"
+        update_profile_export "ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES" "thinking,adaptive_thinking,interleaved_thinking,effort,xhigh_effort"
+        update_profile_export "ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES"  "thinking,adaptive_thinking,effort"
+        update_profile_export "ANTHROPIC_DEFAULT_HAIKU_MODEL"  "azure/gpt-5.4-mini"
+        update_profile_export "ANTHROPIC_DEFAULT_SONNET_MODEL" "azure/gpt-5.4"
+        update_profile_export "ANTHROPIC_DEFAULT_OPUS_MODEL"   "azure/gpt-5.4"
+    else
+        # Capability declarations track the model ids; clear them when no model is
+        # pinned (preserving any manual value). Kept out of the NEEDS_MODEL_CONFIG
+        # loop above — capabilities aren't themselves a reason to nag for a model id.
+        for var in ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES \
+                   ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES \
+                   ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES; do
+            if [ -z "$(read_profile_export "$var")" ]; then
+                update_profile_export "$var" ""
+            fi
+        done
+        for var in ANTHROPIC_DEFAULT_HAIKU_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL; do
+            existing="$(read_profile_export "$var")"
+            if [ -z "$existing" ]; then
+                update_profile_export "$var" ""
+                NEEDS_MODEL_CONFIG=1
+            fi
+        done
+    fi
+    update_profile_export "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY" "1"
 fi
-update_profile_export "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY" "1"
 
 update_profile_export "NO_PROXY"             "127.0.0.1"
 update_profile_export "API_TIMEOUT_MS"       "600000"
 
-update_profile_export "LITELLM_API_KEY"      "$ANTHROPIC_AUTH_TOKEN"
+# Gateway connection vars — skipped under --install-only (the whole point of that
+# mode: a hardened Claude Code install with no proxy wiring). Without these,
+# Claude Code talks to the real Anthropic API until the user points it elsewhere.
+if [ "$INSTALL_ONLY" != "true" ]; then
+    update_profile_export "LITELLM_API_KEY"      "$ANTHROPIC_AUTH_TOKEN"
 
-update_profile_export "ANTHROPIC_BASE_URL"   "$ANTHROPIC_GATEWAY_URL"
-update_profile_export "ANTHROPIC_AUTH_TOKEN" "$ANTHROPIC_AUTH_TOKEN"
+    update_profile_export "ANTHROPIC_BASE_URL"   "$ANTHROPIC_GATEWAY_URL"
+    update_profile_export "ANTHROPIC_AUTH_TOKEN" "$ANTHROPIC_AUTH_TOKEN"
+fi
 
 # 5b. Provider secrets → in-memory env content. Auto-discovers every
 # LiteLLM-relevant provider env var from current shell + ~/.profile + .env
-# (sourced above). Skipped in harden-only since LiteLLM runs on another host.
-if [ "$HARDEN_ONLY" != "true" ]; then
+# (sourced above). Skipped in harden-only / install-only (no local LiteLLM).
+if [ "$HARDEN_ONLY" != "true" ] && [ "$INSTALL_ONLY" != "true" ]; then
     LITELLM_ENV_CONTENT="LITELLM_MASTER_KEY=${ANTHROPIC_AUTH_TOKEN}"$'\n'
     LITELLM_ENV_CONTENT+="$(collect_litellm_provider_vars)"$'\n'
 fi
@@ -600,10 +640,10 @@ fi
 #############################################################################
 
 # LiteLLM needs Postgres + STORE_MODEL_IN_DB=True to let users add models via
-# /ui. Skipped in harden-only (no local LiteLLM). If DATABASE_URL was supplied
-# in .env (now in current env), we trust the user's external Postgres and only
-# skip the local apt install + role/db creation.
-if [ "$HARDEN_ONLY" != "true" ]; then
+# /ui. Skipped in harden-only / install-only (no local LiteLLM). If DATABASE_URL
+# was supplied in .env (now in current env), we trust the user's external Postgres
+# and only skip the local apt install + role/db creation.
+if [ "$HARDEN_ONLY" != "true" ] && [ "$INSTALL_ONLY" != "true" ]; then
     log "=== Phase 6: Postgres ==="
 
     if [ -n "${DATABASE_URL:-}" ] && [[ "${DATABASE_URL}" != postgresql://litellm:*@127.0.0.1:* ]]; then
@@ -717,8 +757,8 @@ fi
 #############################################################################
 
 # (systemd --user lingering is enabled earlier, before Phase 2b.)
-
-if [ "$HARDEN_ONLY" != "true" ]; then
+# Skipped in harden-only / install-only (no local LiteLLM service).
+if [ "$HARDEN_ONLY" != "true" ] && [ "$INSTALL_ONLY" != "true" ]; then
     log "=== Phase 7: LiteLLM ==="
 
     LITELLM_APP_DIR="${HOME}/.config/litellm"
@@ -809,9 +849,9 @@ fi
 
 log "=== Phase 8: Claude Code Settings ==="
 
-# 8a: system-level hardening (managed-settings). Skipped in --router-only —
-# that mode opts out of system-wide policy enforcement.
-if [ "$ROUTER_ONLY" != "true" ]; then
+# 8a: system-level hardening (managed-settings). Skipped in --router-only and
+# --install-only — both opt out of system-wide policy enforcement.
+if [ "$ROUTER_ONLY" != "true" ] && [ "$INSTALL_ONLY" != "true" ]; then
     # 8a. Managed settings (system-level, root-owned). Token-substitute __REPO_DIR__ in hooks paths.
     sudo install -d -m 755 /etc/claude-code
 
@@ -838,12 +878,12 @@ chmod 755 /tmp/claude
 # re-run of setup must not clobber it.
 NEEDS_SANDBOX_BLOCK=0
 if [ ! -f "${HOME}/.claude/settings.json" ]; then
-    if [ "$ROUTER_ONLY" = "true" ]; then
-        # router-only ships the sandbox OFF, but KEEP the full block and just set
-        # enabled:false (don't strip it). The floor (denyRead/denyWrite/network) stays
-        # pre-configured, so flipping enabled:true later activates the hardened sandbox
-        # with no re-config, and the statusline reflects whatever the user sets. bwrap
-        # is installed in all modes (Phase 2).
+    if [ "$ROUTER_ONLY" = "true" ] || [ "$INSTALL_ONLY" = "true" ]; then
+        # router-only / install-only ship the sandbox OFF, but KEEP the full block and
+        # just set enabled:false (don't strip it). The floor (denyRead/denyWrite/network)
+        # stays pre-configured, so flipping enabled:true later activates the hardened
+        # sandbox with no re-config, and the statusline reflects whatever the user sets.
+        # bwrap is installed in all modes (Phase 2).
         # Capture jq's output first: a bare `jq | write_if_changed` pipeline has no
         # pipefail (set -o pipefail isn't set), so a jq failure would be masked and
         # write_if_changed would write an empty settings.json and return 0. The
@@ -874,8 +914,8 @@ install -m 755 "$SCRIPT_DIR/scripts/statusline.sh" "${HOME}/.claude/statusline.s
 # (sh -c, python -c, xargs rm, find -delete, git push -f short-form, …) by
 # classifying commands into action types (filesystem_delete, lang_exec,
 # git_history_rewrite, …) and resolving allow/ask/block with sensitive-path
-# + content-scan context. Skipped under --router-only (no policy enforcement
-# in that mode). PreToolUse hooks still fire under --dangerously-skip-permissions
+# + content-scan context. Skipped under --router-only and --install-only (no
+# policy enforcement in those modes). PreToolUse hooks still fire under --dangerously-skip-permissions
 # per Anthropic docs — the flag skips the deny/ask/allow rule chain and the
 # user prompt, but hooks run *before* the prompt and remain active, so nah
 # is the only active policy layer in that mode (and `permissions.deny[]` is
@@ -883,7 +923,7 @@ install -m 755 "$SCRIPT_DIR/scripts/statusline.sh" "${HOME}/.claude/statusline.s
 # marketplace.json lives) and is otherwise unpinned — same install-if-missing-
 # then-latest convention as Claude Code (4b) and ACP (4c); user runs
 # `claude plugin update nah --scope user` to upgrade.
-if [ "$ROUTER_ONLY" != "true" ] && { command -v claude &>/dev/null || [ -x "${HOME}/.local/bin/claude" ]; }; then
+if [ "$ROUTER_ONLY" != "true" ] && [ "$INSTALL_ONLY" != "true" ] && { command -v claude &>/dev/null || [ -x "${HOME}/.local/bin/claude" ]; }; then
     # Marketplace add: schema (verified via `claude plugin marketplace list
     # --json`) is bare array of { name, source, repo, installLocation } —
     # .source is the source TYPE ("github"), .repo holds "owner/repo". Match
@@ -1181,11 +1221,14 @@ sudo apt-get autoremove -y
 ensure_managed_bash_profile
 
 log "claude-litellm setup complete!"
-if [ "$HARDEN_ONLY" != "true" ]; then
+# LiteLLM UI only exists when a local LiteLLM was installed (not harden-only /
+# install-only). DevTools is installed in install-only too, so print it whenever
+# it deployed, regardless of mode.
+if [ "$HARDEN_ONLY" != "true" ] && [ "$INSTALL_ONLY" != "true" ]; then
     log "  LiteLLM UI:  http://127.0.0.1:${LITELLM_PORT}/ui/"
-    if [ "$CLAUDE_DEVTOOLS_DEPLOYED" = "1" ]; then
-        log "  DevTools UI: http://127.0.0.1:${CLAUDE_DEVTOOLS_PORT}"
-    fi
+fi
+if [ "$CLAUDE_DEVTOOLS_DEPLOYED" = "1" ]; then
+    log "  DevTools UI: http://127.0.0.1:${CLAUDE_DEVTOOLS_PORT}"
 fi
 log ""
 log "Log out and back in (or run 'source ~/.profile') to load the env vars — a plain new terminal won't read ~/.profile."
@@ -1193,10 +1236,16 @@ if [ "$HARDEN_ONLY" = "true" ]; then
     log "ANTHROPIC_BASE_URL in ~/.profile is currently: ${ANTHROPIC_GATEWAY_URL}"
     log "Edit ~/.profile (or set ANTHROPIC_GATEWAY_URL in .env and re-run) to point at your remote LiteLLM."
 fi
-log "Then run 'claude' to start Claude Code via the LiteLLM gateway."
+if [ "$INSTALL_ONLY" = "true" ]; then
+    log "No gateway configured (--install-only) — Claude Code will use the real Anthropic API."
+    log "To route through a LiteLLM proxy, set ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN in ~/.profile."
+    log "Then run 'claude' to start Claude Code."
+else
+    log "Then run 'claude' to start Claude Code via the LiteLLM gateway."
+fi
 
-# Skip on systemd / piped runs
-if [ "$HARDEN_ONLY" != "true" ] && [ -t 1 ]; then
+# Skip on systemd / piped runs. No LiteLLM UI/master key under install-only.
+if [ "$HARDEN_ONLY" != "true" ] && [ "$INSTALL_ONLY" != "true" ] && [ -t 1 ]; then
     rule="━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo ""
     echo -e "${YELLOW}${rule}${NC}"
@@ -1237,10 +1286,10 @@ if [ "${NEEDS_SANDBOX_BLOCK:-0}" = "1" ] && [ -t 1 ]; then
     echo -e "  detect the sandbox. Add it (keeps your other keys), then restart"
     echo -e "  Claude Code:${NC}"
     echo ""
-    if [ "$ROUTER_ONLY" = "true" ]; then
+    if [ "$ROUTER_ONLY" = "true" ] || [ "$INSTALL_ONLY" = "true" ]; then
         echo -e "    ${GREEN}${SCRIPT_DIR}/scripts/add-sandbox-block.sh --disabled${NC}"
         echo ""
-        echo -e "${YELLOW}  (router-only seeds it disabled — set sandbox.enabled:true to turn it on)${NC}"
+        echo -e "${YELLOW}  (router-only / install-only seed it disabled — set sandbox.enabled:true to turn it on)${NC}"
     else
         echo -e "    ${GREEN}${SCRIPT_DIR}/scripts/add-sandbox-block.sh${NC}"
     fi
