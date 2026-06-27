@@ -451,6 +451,37 @@ if [ "$INSTALL_OBSIDIAN" = "true" ]; then
     fi
 fi
 
+# 4e. blaude — bubblewrap sandbox wrapper for Claude Code (c0ffee0wl/blaude).
+# Runs in ALL modes: its only deps are bwrap (Phase 2) and claude (Phase 4b),
+# both installed in every mode. blaude is a rolling single-file script with no
+# release tags and no self-update (`blaude update` passes through to claude), so
+# we re-fetch main on every run to keep it current — same upgrade-in-place spirit
+# as bun / LiteLLM / `claude update`. The osc52-clipboard companion is
+# deliberately NOT installed, and no `claude` alias is set (drop-in stays opt-in).
+BLAUDE_URL="https://raw.githubusercontent.com/c0ffee0wl/blaude/main/blaude"
+BLAUDE_BIN="${HOME}/.local/bin/blaude"
+log "Installing/updating blaude (sandbox wrapper)..."
+mkdir -p "${HOME}/.local/bin"
+if ! BLAUDE_TMP="$(mktemp)"; then
+    warn "Could not create temp file for blaude download — skipping"
+elif curl_secure -fsSL -o "$BLAUDE_TMP" "$BLAUDE_URL" \
+        && [ -s "$BLAUDE_TMP" ] && head -n1 "$BLAUDE_TMP" | grep -q '^#!'; then
+    # Atomic replace: only clobber an existing working blaude once the new copy
+    # is fully downloaded + sanity-checked (non-empty, has a shebang).
+    chmod 0755 "$BLAUDE_TMP"
+    if mv -f "$BLAUDE_TMP" "$BLAUDE_BIN"; then
+        BLAUDE_INSTALLED=1
+        log "blaude installed/updated at $BLAUDE_BIN"
+    else
+        warn "Could not move blaude into $BLAUDE_BIN — keeping existing version"
+    fi
+else
+    warn "blaude download failed or invalid — keeping existing version"
+fi
+# Single cleanup point: drop the temp file unless a successful mv already
+# consumed it. Guarded so the mktemp-failure branch (empty var) is a no-op.
+[ -n "${BLAUDE_TMP:-}" ] && rm -f "$BLAUDE_TMP"
+
 log "Tools phase complete"
 
 #############################################################################
@@ -1229,6 +1260,9 @@ if [ "$HARDEN_ONLY" != "true" ] && [ "$INSTALL_ONLY" != "true" ]; then
 fi
 if [ "$CLAUDE_DEVTOOLS_DEPLOYED" = "1" ]; then
     log "  DevTools UI: http://127.0.0.1:${CLAUDE_DEVTOOLS_PORT}"
+fi
+if [ "${BLAUDE_INSTALLED:-0}" = "1" ]; then
+    log "  blaude:      sandboxed Claude Code — run 'blaude' (github.com/c0ffee0wl/blaude)"
 fi
 log ""
 log "Log out and back in (or run 'source ~/.profile') to load the env vars — a plain new terminal won't read ~/.profile."
