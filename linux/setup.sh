@@ -321,13 +321,30 @@ if [ "$HARDEN_ONLY" != "true" ] && [ "$DOCKER_MODE" != "true" ] && [ "$INSTALL_O
     if [ -x "$LITELLM_BIN" ]; then
         # Upgrade-in-place (not skip): re-asserts the >=1.84.0 floor so an existing
         # install is lifted off a compromised 1.82.7/1.82.8 and picks up newer
-        # aged-in releases. Idempotent no-op when already latest. The litellm.service
-        # (re)start in the systemd step below loads the new version; the Prisma
-        # client is force-regenerated against the (possibly new) schema via
-        # LITELLM_UPGRADED.
-        log "LiteLLM present at $LITELLM_BIN — upgrading (re-asserts >=1.84.0 floor)..."
+        # aged-in releases. "Newest" stays aged-in (not bleeding-edge) because the
+        # user-level ~/.config/uv/uv.toml `exclude-newer` cooldown shipped by the
+        # external hardening repo applies to this resolution too. The litellm.service
+        # (re)start in the systemd step below loads the new version; the Prisma client
+        # is force-regenerated against the (possibly new) schema only when the version
+        # ACTUALLY changed — see LITELLM_UPGRADED below.
+        litellm_ver_before="$(uv tool list 2>/dev/null | awk '$1=="litellm"{print $2; exit}')"
+        log "LiteLLM present at $LITELLM_BIN (${litellm_ver_before:-unknown}) — upgrading (re-asserts >=1.84.0 floor)..."
         if uv tool install --upgrade --with prisma 'litellm[proxy,proxy-runtime]>=1.84.0'; then
-            LITELLM_UPGRADED=1
+            # `uv tool install --upgrade` returns 0 even on a no-op (already at the
+            # newest aged-in release), so gating the Prisma regen on its exit code
+            # alone regenerated the client on EVERY re-run (the "skip" branch below
+            # was dead). Gate on a real version change instead. If either version
+            # read is empty (parse failed / format changed), fall back to
+            # regenerating — the safe choice.
+            litellm_ver_after="$(uv tool list 2>/dev/null | awk '$1=="litellm"{print $2; exit}')"
+            if [ "$litellm_ver_before" != "$litellm_ver_after" ]; then
+                LITELLM_UPGRADED=1
+                log "LiteLLM upgraded ${litellm_ver_before:-?} -> ${litellm_ver_after:-?}"
+            elif [ -z "$litellm_ver_before" ]; then
+                LITELLM_UPGRADED=1   # version unreadable (both empty) → regenerate to be safe
+            else
+                log "LiteLLM already at ${litellm_ver_after} (newest aged-in) — Prisma client regen not needed"
+            fi
         else
             warn "LiteLLM upgrade failed — keeping existing version"
         fi
