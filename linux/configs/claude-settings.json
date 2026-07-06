@@ -4,6 +4,7 @@
     "command": "~/.claude/statusline.sh"
   },
   "theme": "auto",
+  "cleanupPeriodDays": 365,
 
   "attribution": {
     "commit": "",
