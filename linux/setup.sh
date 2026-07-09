@@ -596,6 +596,18 @@ update_profile_export "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"   "1"
 # Non-hardening toggles
 update_profile_export "CLAUDE_CODE_ATTRIBUTION_HEADER"           "0"
 
+# UX/behavior preferences (all modes). Kept in ~/.profile (user-level prefs,
+# not enforced policy → user can `unset`), so they apply regardless of flags.
+#   * AUTOCOMPACT_PCT_OVERRIDE: auto-compact at 75% of the context window
+#     (earlier than the ~83.5% default → more response headroom). Only *lowers*
+#     the threshold; a Math.min clamp ignores values above the default
+#     (anthropics/claude-code#31806). Applies to main + subagents.
+#   * EXPERIMENTAL_AGENT_TEAMS: enable the (experimental) multi-agent teams
+#     feature. Its own gate — independent of CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS
+#     above (that only strips anthropic-beta request headers/tool-schema fields).
+update_profile_export "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"          "75"
+update_profile_export "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"     "1"
+
 # Scrub IS_DEMO=1 from ~/.profile if a prior tool / demo container left it
 # behind. Claude Code treats it as a "demo session" marker that silently
 # suppresses the workspace-trust prompt without granting trust, breaking

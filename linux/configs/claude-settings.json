@@ -5,6 +5,7 @@
   },
   "theme": "auto",
   "cleanupPeriodDays": 365,
+  "agentPushNotifEnabled": true,
 
   "attribution": {
     "commit": "",
