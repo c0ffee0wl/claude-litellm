@@ -3,7 +3,9 @@
 # claude-litellm setup script
 #
 # Sets up LiteLLM gateway + (optionally) Claude Code on Debian/Kali Linux.
-# Runs as the current $USER. Idempotent: install-if-missing, no upgrade-by-default.
+# Runs as the current $USER. Idempotent. Core tools (bun, uv, LiteLLM, Claude
+# Code, blaude) upgrade in place on every run; everything else is
+# install-if-missing (see CLAUDE.md > Key Conventions).
 #
 # Usage:
 #   ./linux/setup.sh                  # Full setup: LiteLLM + Claude Code + managed settings
@@ -12,7 +14,6 @@
 #   ./linux/setup.sh --install-only   # Claude Code + hardening env vars only — no LiteLLM/Postgres, no gateway wiring, no managed-settings
 #   ./linux/setup.sh --install-obsidian  # Also install the ACP adapter + latest Obsidian (.deb); combinable with any mode
 #   ./linux/setup.sh --docker         # Run LiteLLM via rootless Docker Compose (Postgres stays on the host); additive
-#   ./linux/setup.sh --yes            # Non-interactive (skip prompts)
 #
 # --router-only, --harden-only, and --install-only are mutually exclusive.
 # --install-obsidian and --docker are additive (combinable with any mode except
@@ -60,10 +61,6 @@ while [[ $# -gt 0 ]]; do
             DOCKER_MODE=true
             shift
             ;;
-        --yes)
-            YES_MODE=true
-            shift
-            ;;
         -h|--help)
             sed -n '/^# Usage:/,/^$/p' "$0" | sed 's/^# \?//'
             exit 0
@@ -75,30 +72,41 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [ "$ROUTER_ONLY" = "true" ] && [ "$HARDEN_ONLY" = "true" ]; then
-    error "--router-only and --harden-only are mutually exclusive"
-    exit 1
-fi
-
-# --install-only is a third standalone mode — exclusive with the other two.
-if [ "$INSTALL_ONLY" = "true" ] && [ "$ROUTER_ONLY" = "true" ]; then
-    error "--install-only and --router-only are mutually exclusive"
-    exit 1
-fi
-if [ "$INSTALL_ONLY" = "true" ] && [ "$HARDEN_ONLY" = "true" ]; then
-    error "--install-only and --harden-only are mutually exclusive"
+# --router-only / --harden-only / --install-only are standalone modes: at most one.
+standalone_modes=0
+[ "$ROUTER_ONLY" = "true" ] && standalone_modes=$((standalone_modes + 1))
+[ "$HARDEN_ONLY" = "true" ] && standalone_modes=$((standalone_modes + 1))
+[ "$INSTALL_ONLY" = "true" ] && standalone_modes=$((standalone_modes + 1))
+if [ "$standalone_modes" -gt 1 ]; then
+    error "--router-only, --harden-only, and --install-only are mutually exclusive"
     exit 1
 fi
 
 # --docker dockerizes LiteLLM; --harden-only / --install-only install no LiteLLM at all.
-if [ "$DOCKER_MODE" = "true" ] && [ "$HARDEN_ONLY" = "true" ]; then
-    error "--docker and --harden-only are incompatible (--harden-only installs no LiteLLM)"
+if [ "$DOCKER_MODE" = "true" ] && { [ "$HARDEN_ONLY" = "true" ] || [ "$INSTALL_ONLY" = "true" ]; }; then
+    error "--docker is incompatible with --harden-only / --install-only (neither installs LiteLLM)"
     exit 1
 fi
-if [ "$DOCKER_MODE" = "true" ] && [ "$INSTALL_ONLY" = "true" ]; then
-    error "--docker and --install-only are incompatible (--install-only installs no LiteLLM)"
-    exit 1
-fi
+
+# Derived mode capabilities — the per-phase skip matrix in one place (CLAUDE.md >
+# Setup Phases documents the same matrix in prose). Each phase tests exactly one
+# of these instead of re-deriving flag combinations:
+#   WITH_LOCAL_LITELLM  install + run LiteLLM/Postgres on this box (4a, 5b, 6, 7, UI banners)
+#   WITH_POLICY         apply system policy: managed-settings, nah, subprocess scrub (8a, 8e, 5a scrub)
+#   WITH_GATEWAY        wire Claude Code to a gateway: master key, ANTHROPIC_* vars, model selectors (5a)
+#   SANDBOX_DEFAULT_ON  fresh user settings ship sandbox.enabled=true (8c seed + banner). Same
+#                       set as WITH_POLICY today, but named separately: shipping the sandbox on
+#                       is a different decision than enforcing system policy.
+# Phases gated on a single raw flag (Phase 9's HARDEN_ONLY, the DOCKER_MODE
+# branches, mode-specific banner text) stay on that flag — these booleans only
+# replace the flag *combinations*.
+WITH_LOCAL_LITELLM=true
+{ [ "$HARDEN_ONLY" = "true" ] || [ "$INSTALL_ONLY" = "true" ]; } && WITH_LOCAL_LITELLM=false
+WITH_POLICY=true
+{ [ "$ROUTER_ONLY" = "true" ] || [ "$INSTALL_ONLY" = "true" ]; } && WITH_POLICY=false
+WITH_GATEWAY=true
+[ "$INSTALL_ONLY" = "true" ] && WITH_GATEWAY=false
+SANDBOX_DEFAULT_ON=$WITH_POLICY
 
 # We expect to run as a regular user, not root.
 if [ "$EUID" -eq 0 ]; then
@@ -156,7 +164,6 @@ if git rev-parse --git-dir > /dev/null 2>&1; then
         git pull --ff-only
         log "Re-executing updated script..."
         exec "$SCRIPT_DIR/setup.sh" "${ORIGINAL_ARGS[@]}"
-        exit 0
     else
         log "Script is up to date"
     fi
@@ -180,6 +187,24 @@ ANTHROPIC_GATEWAY_URL="http://127.0.0.1:${LITELLM_PORT}"
 # services.
 LITELLM_PATH="${HOME}/.local/share/uv/tools/litellm/bin:${HOME}/.local/bin:${HOME}/.bun/bin:/usr/local/bin:/usr/bin:/bin"
 USER_TOOL_PATH="${HOME}/.local/bin:${HOME}/.bun/bin:/usr/local/bin:/usr/bin:/bin"
+# The uv requirement string for LiteLLM — one definition for the fresh-install
+# and upgrade paths in Phase 4a, so a floor bump can't skew the two.
+LITELLM_SPEC='litellm[proxy,proxy-runtime]>=1.84.0'
+# LiteLLM runtime state directory. config.yaml, the env file, and (under
+# --docker) docker-compose.yml MUST stay siblings here: the docker unit's
+# WorkingDirectory points at this dir and the compose file mounts ./config.yaml
+# and ./env relative to it.
+LITELLM_CONFIG_DIR="${HOME}/.config/litellm"
+LITELLM_ENV_FILE="${LITELLM_CONFIG_DIR}/env"
+LITELLM_CONFIG_FILE="${LITELLM_CONFIG_DIR}/config.yaml"
+# Rootless Docker daemon socket (used by the --docker paths in Phase 7).
+DOCKER_SOCK="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/docker.sock"
+
+# Claude Code presence — the installer usually puts `claude` on PATH, but a
+# fresh install in this same run may only exist at ~/.local/bin yet.
+have_claude() {
+    command -v claude &>/dev/null || [ -x "${HOME}/.local/bin/claude" ]
+}
 
 #############################################################################
 # PHASE 1: shell profile setup (Bash + zsh)
@@ -203,19 +228,33 @@ log "=== Phase 2: System packages ==="
 APT_PACKAGES="git curl jq ca-certificates unzip rsync"
 
 # bubblewrap + socat + ripgrep in every mode. router-only ships the sandbox OFF by
-# default (Phase 8c strips the block), but we still install the runtime so a user can
-# opt in via /sandbox in the UI without re-running apt. The packages are tiny + benign.
-# ripgrep is an undocumented /sandbox dep: the Mode/Overrides toggle tabs only render
-# once every sandbox dependency resolves, and if Claude Code's bundled rg isn't found
-# (it has regressed to a shell-shim before, anthropics/claude-code#31804, #31708) the
-# user gets a deps-only screen with nothing to toggle. A real rg binary keeps it reachable.
+# default (Phase 8c sets enabled:false, block kept), but we still install the runtime
+# so a user can opt in via /sandbox in the UI without re-running apt. The packages are
+# tiny + benign. ripgrep is an undocumented /sandbox dep: the Mode/Overrides toggle
+# tabs only render once every sandbox dependency resolves, and if Claude Code's
+# bundled rg isn't found (it has regressed to a shell-shim before,
+# anthropics/claude-code#31804, #31708) the user gets a deps-only screen with nothing
+# to toggle. A real rg binary keeps it reachable.
 APT_PACKAGES="$APT_PACKAGES bubblewrap socat ripgrep"
 
 export DEBIAN_FRONTEND=noninteractive
-sudo apt-get update
-# shellcheck disable=SC2086
-sudo apt-get install -y $APT_PACKAGES
-log "System packages installed: $APT_PACKAGES"
+# Skip the apt round-trip when every package is already installed — the common
+# case on a re-run. Phases that apt-install later (2b, 4d, 6) run their own
+# `apt-get update` where needed and set APT_CHANGED (initialized in common.sh)
+# so Phase 11's autoremove still fires.
+apt_missing=""
+for pkg in $APT_PACKAGES; do
+    pkg_installed "$pkg" || apt_missing="$apt_missing $pkg"
+done
+if [ -n "$apt_missing" ]; then
+    sudo apt-get update
+    # shellcheck disable=SC2086
+    sudo apt-get install -y $apt_missing
+    APT_CHANGED=1
+    log "System packages installed:$apt_missing"
+else
+    log "System packages already installed: $APT_PACKAGES"
+fi
 
 # AppArmor profile for bwrap — configured in all modes so the sandbox works if a user
 # opts into it via /sandbox (even under --router-only, which ships it off by default).
@@ -247,7 +286,7 @@ if [ "$DOCKER_MODE" = "true" ]; then
 fi
 
 #############################################################################
-# PHASE 3: bun + uv (install-if-missing-only)
+# PHASE 3: bun + uv (install or upgrade in place)
 #############################################################################
 
 log "=== Phase 3: bun + uv ==="
@@ -282,7 +321,9 @@ fi
 # `Script not found`. The wrapper calls `bun x` explicitly. Idempotent.
 if [ -x "${HOME}/.bun/bin/bun" ]; then
     ln -sf "${HOME}/.bun/bin/bun" "${HOME}/.bun/bin/node"
-    install -m 755 /dev/stdin "${HOME}/.bun/bin/npx" << NPX_EOF
+    # `|| true`: write_if_changed returns 1 on unchanged content, which would
+    # abort the script under `set -e` on every re-run.
+    write_if_changed "${HOME}/.bun/bin/npx" 755 << NPX_EOF || true
 #!/bin/sh
 exec "${HOME}/.bun/bin/bun" x "\$@"
 NPX_EOF
@@ -302,7 +343,8 @@ log "bun + uv ready"
 
 log "=== Phase 4: Tools ==="
 
-# 4a. LiteLLM via uv tool install (install-if-missing). uv was installed in
+# 4a. LiteLLM via uv tool install (fresh install, or upgrade in place when
+# already present). uv was installed in
 # Phase 3. Floor at >=1.84.0 (a floor, not a hard pin — fresh installs still get
 # the latest, and a dependency cooldown picks the newest aged-in release). This
 # floor sits above the compromised 1.82.7/1.82.8 PyPI releases (credential-
@@ -317,7 +359,7 @@ LITELLM_BIN="${HOME}/.local/bin/litellm"
 # LiteLLM + a generated Prisma client, so neither the uv tool install nor the
 # `prisma generate` step below is needed. Skipped under --install-only too (that
 # mode installs no local LiteLLM).
-if [ "$HARDEN_ONLY" != "true" ] && [ "$DOCKER_MODE" != "true" ] && [ "$INSTALL_ONLY" != "true" ]; then
+if [ "$WITH_LOCAL_LITELLM" = "true" ] && [ "$DOCKER_MODE" != "true" ]; then
     if [ -x "$LITELLM_BIN" ]; then
         # Upgrade-in-place (not skip): re-asserts the >=1.84.0 floor so an existing
         # install is lifted off a compromised 1.82.7/1.82.8 and picks up newer
@@ -329,7 +371,7 @@ if [ "$HARDEN_ONLY" != "true" ] && [ "$DOCKER_MODE" != "true" ] && [ "$INSTALL_O
         # ACTUALLY changed — see LITELLM_UPGRADED below.
         litellm_ver_before="$(uv tool list 2>/dev/null | awk '$1=="litellm"{print $2; exit}')"
         log "LiteLLM present at $LITELLM_BIN (${litellm_ver_before:-unknown}) — upgrading (re-asserts >=1.84.0 floor)..."
-        if uv tool install --upgrade --with prisma 'litellm[proxy,proxy-runtime]>=1.84.0'; then
+        if uv tool install --upgrade --with prisma "$LITELLM_SPEC"; then
             # `uv tool install --upgrade` returns 0 even on a no-op (already at the
             # newest aged-in release), so gating the Prisma regen on its exit code
             # alone regenerated the client on EVERY re-run (the "skip" branch below
@@ -350,7 +392,7 @@ if [ "$HARDEN_ONLY" != "true" ] && [ "$DOCKER_MODE" != "true" ] && [ "$INSTALL_O
         fi
     else
         log "Installing LiteLLM via uv tool install..."
-        uv tool install --with prisma 'litellm[proxy,proxy-runtime]>=1.84.0'
+        uv tool install --with prisma "$LITELLM_SPEC"
         # To enable optional LiteLLM features, swap the line above for:
         #   uv tool install 'litellm[proxy,proxy-runtime,extra_proxy]>=1.84.0'
         # The extra_proxy extra adds: RedisVL semantic caching, Google Cloud KMS
@@ -402,8 +444,8 @@ if [ "$HARDEN_ONLY" != "true" ] && [ "$DOCKER_MODE" != "true" ] && [ "$INSTALL_O
     fi
 fi
 
-# 4b. Claude Code (install-if-missing via official installer; runs in all modes)
-if command -v claude &>/dev/null || [ -x "${HOME}/.local/bin/claude" ]; then
+# 4b. Claude Code (official installer; upgrade in place when present; all modes)
+if have_claude; then
     # Upgrade-in-place (not skip): `claude update` is a no-op when already latest
     # and still works under DISABLE_AUTOUPDATER=1 (that gates only the background
     # check, not the explicit command; DISABLE_UPDATES is not set). Resolve the
@@ -417,7 +459,7 @@ else
     # transient 403/network blip would silently leave `claude` uninstalled and a
     # downstream step would fail with a confusing "claude: not found". Verify after.
     download_and_run https://claude.ai/install.sh "Claude Code"
-    command -v claude &>/dev/null || [ -x "${HOME}/.local/bin/claude" ] \
+    have_claude \
         || warn "Claude Code is NOT installed — 'claude' unavailable; dependent steps (e.g. MCP registration) will be skipped"
     # Re-establish bash_profile shim (the installer can drop its own)
     ensure_managed_bash_profile
@@ -439,10 +481,7 @@ fi
 # the GitHub releases API and install via apt (apt resolves the .deb's deps).
 # Only with --install-obsidian; failures are non-fatal.
 if [ "$INSTALL_OBSIDIAN" = "true" ]; then
-    # dpkg -s returns 0 even for removed-but-not-purged packages (config-files
-    # state), so match the actual "install ok installed" status — otherwise an
-    # `apt remove`d Obsidian would never get reinstalled here.
-    if dpkg-query -W -f='${Status}' obsidian 2>/dev/null | grep -q 'install ok installed'; then
+    if pkg_installed obsidian; then
         log "Obsidian already installed — skipping (upgrade manually if needed)"
     else
         log "Resolving latest Obsidian amd64 .deb..."
@@ -459,7 +498,15 @@ if [ "$INSTALL_OBSIDIAN" = "true" ]; then
         else
             log "Downloading Obsidian: $OBSIDIAN_DEB_URL"
             if curl_secure -fsSL -o "$OBSIDIAN_DEB" "$OBSIDIAN_DEB_URL"; then
-                sudo apt-get install -y "$OBSIDIAN_DEB" || warn "Obsidian install failed, continuing"
+                # Refresh the index first: Phase 2 skips its apt-get update when
+                # nothing is missing, and installing a .deb still resolves its
+                # dependencies from the (possibly stale) index.
+                sudo apt-get update || true
+                if sudo apt-get install -y "$OBSIDIAN_DEB"; then
+                    APT_CHANGED=1
+                else
+                    warn "Obsidian install failed, continuing"
+                fi
             else
                 warn "Obsidian download failed, continuing"
             fi
@@ -483,14 +530,15 @@ if ! BLAUDE_TMP="$(mktemp)"; then
     warn "Could not create temp file for blaude download — skipping"
 elif curl_secure -fsSL -o "$BLAUDE_TMP" "$BLAUDE_URL" \
         && [ -s "$BLAUDE_TMP" ] && head -n1 "$BLAUDE_TMP" | grep -q '^#!'; then
-    # Atomic replace: only clobber an existing working blaude once the new copy
-    # is fully downloaded + sanity-checked (non-empty, has a shebang).
-    chmod 0755 "$BLAUDE_TMP"
-    if mv -f "$BLAUDE_TMP" "$BLAUDE_BIN"; then
+    # Atomic replace via write_if_changed: an existing working blaude is only
+    # clobbered once the new copy is fully downloaded + sanity-checked
+    # (non-empty, has a shebang), and an unchanged upstream leaves the binary
+    # (and the end-of-run "blaude" banner hint) untouched.
+    if write_if_changed "$BLAUDE_BIN" 0755 < "$BLAUDE_TMP"; then
         BLAUDE_INSTALLED=1
         log "blaude installed/updated at $BLAUDE_BIN"
     else
-        warn "Could not move blaude into $BLAUDE_BIN — keeping existing version"
+        log "blaude already up to date"
     fi
 else
     warn "blaude download failed or invalid — keeping existing version"
@@ -525,15 +573,18 @@ fi
 # 5a. Gateway URL + telemetry → ~/.profile (client-side; runs in every mode).
 # These are the single source of truth for Claude Code's connection to LiteLLM —
 # managed-settings.json no longer carries ANTHROPIC_BASE_URL/AUTH_TOKEN.
-LITELLM_ENV_DIR="${HOME}/.config/litellm"
-LITELLM_ENV_FILE="${LITELLM_ENV_DIR}/env"
 
-# Preserve the auto-generated DB password across reruns. Selective grep
-# rather than `source $LITELLM_ENV_FILE` because the latter would let stale
-# provider secrets in the env file shadow fresh values from .env.
+# Preserve the auto-generated DB password and any manual UI_USERNAME /
+# UI_PASSWORD overrides (.env.example documents setting those by hand) across
+# reruns — Phase 6 regenerates the env file wholesale, and the provider-var
+# collector deliberately excludes UI_*. Selective greps rather than
+# `source $LITELLM_ENV_FILE` because the latter would let stale provider
+# secrets in the env file shadow fresh values from .env.
 PERSISTED_DB_PASSWORD=""
+PERSISTED_UI_LINES=""
 if [ -f "$LITELLM_ENV_FILE" ]; then
     PERSISTED_DB_PASSWORD="$(grep '^LITELLM_DB_PASSWORD=' "$LITELLM_ENV_FILE" 2>/dev/null | cut -d= -f2-)"
+    PERSISTED_UI_LINES="$(grep -E '^UI_(USERNAME|PASSWORD)=' "$LITELLM_ENV_FILE" 2>/dev/null || true)"
 fi
 
 # Master key resolution. LiteLLM requires a master key starting with "sk-" for
@@ -543,7 +594,7 @@ fi
 #   3. auto-generated sk-<48 hex chars> on first run
 # Skipped under --install-only: no LiteLLM gateway is wired up, so there is no
 # master key to mint or carry — the gateway connection vars below are skipped too.
-if [ "$INSTALL_ONLY" != "true" ]; then
+if [ "$WITH_GATEWAY" = "true" ]; then
     if [ -z "${ANTHROPIC_AUTH_TOKEN:-}" ]; then
         ANTHROPIC_AUTH_TOKEN="$(read_profile_export ANTHROPIC_AUTH_TOKEN)"
     fi
@@ -573,10 +624,10 @@ update_profile_export "SCARF_ANALYTICS"               "false"
 # --router-only (a dev box where Bash/MCP/hooks should keep the full env, incl. the
 # gateway token) and --install-only (no gateway token to protect); removed there
 # too so a box flipped from full mode is cleaned up.
-if [ "$ROUTER_ONLY" = "true" ] || [ "$INSTALL_ONLY" = "true" ]; then
-    remove_profile_export "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"
-else
+if [ "$WITH_POLICY" = "true" ]; then
     update_profile_export "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB" "1"
+else
+    remove_profile_export "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"
 fi
 
 # Claude Code feature/privacy toggles. Also duplicated in managed-settings'
@@ -644,7 +695,7 @@ NEEDS_MODEL_CONFIG=0
 # upstream provider ids that only resolve through the LiteLLM gateway, and gateway
 # model discovery is moot with no gateway. NEEDS_MODEL_CONFIG stays 0 so its
 # end-of-script banner never fires in that mode.
-if [ "$INSTALL_ONLY" != "true" ]; then
+if [ "$WITH_GATEWAY" = "true" ]; then
     if [ -n "${AZURE_OPENAI_API_KEY:-}" ] && [ -n "${AZURE_RESOURCE_ENDPOINT:-}" ]; then
         update_profile_export "ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES"   "thinking,adaptive_thinking,interleaved_thinking,effort,xhigh_effort"
         update_profile_export "ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES" "thinking,adaptive_thinking,interleaved_thinking,effort,xhigh_effort"
@@ -680,7 +731,7 @@ update_profile_export "API_TIMEOUT_MS"       "600000"
 # Gateway connection vars — skipped under --install-only (the whole point of that
 # mode: a hardened Claude Code install with no proxy wiring). Without these,
 # Claude Code talks to the real Anthropic API until the user points it elsewhere.
-if [ "$INSTALL_ONLY" != "true" ]; then
+if [ "$WITH_GATEWAY" = "true" ]; then
     update_profile_export "LITELLM_API_KEY"      "$ANTHROPIC_AUTH_TOKEN"
 
     update_profile_export "ANTHROPIC_BASE_URL"   "$ANTHROPIC_GATEWAY_URL"
@@ -690,7 +741,7 @@ fi
 # 5b. Provider secrets → in-memory env content. Auto-discovers every
 # LiteLLM-relevant provider env var from current shell + ~/.profile + .env
 # (sourced above). Skipped in harden-only / install-only (no local LiteLLM).
-if [ "$HARDEN_ONLY" != "true" ] && [ "$INSTALL_ONLY" != "true" ]; then
+if [ "$WITH_LOCAL_LITELLM" = "true" ]; then
     LITELLM_ENV_CONTENT="LITELLM_MASTER_KEY=${ANTHROPIC_AUTH_TOKEN}"$'\n'
     LITELLM_ENV_CONTENT+="$(collect_litellm_provider_vars)"$'\n'
 fi
@@ -703,7 +754,14 @@ fi
 # /ui. Skipped in harden-only / install-only (no local LiteLLM). If DATABASE_URL
 # was supplied in .env (now in current env), we trust the user's external Postgres
 # and only skip the local apt install + role/db creation.
-if [ "$HARDEN_ONLY" != "true" ] && [ "$INSTALL_ONLY" != "true" ]; then
+#
+# LITELLM_CHANGED collects every signal that the running service is stale (env
+# file, config, unit, binary upgrade, runtime switch) — Phase 7 restarts only
+# when one fired, so a no-op re-run doesn't reboot LiteLLM (Prisma reconnect +
+# model-map refetch) and drop in-flight gateway connections for nothing.
+# Seeded from Phase 4a's upgrade signal (a new binary needs a restart too).
+LITELLM_CHANGED="${LITELLM_UPGRADED:-0}"
+if [ "$WITH_LOCAL_LITELLM" = "true" ]; then
     log "=== Phase 6: Postgres ==="
 
     if [ -n "${DATABASE_URL:-}" ] && [[ "${DATABASE_URL}" != postgresql://litellm:*@127.0.0.1:* ]]; then
@@ -712,7 +770,11 @@ if [ "$HARDEN_ONLY" != "true" ] && [ "$INSTALL_ONLY" != "true" ]; then
     else
         if ! command -v psql &>/dev/null; then
             log "Installing postgresql via apt..."
+            # Phase 2 skips its apt-get update when nothing was missing there;
+            # refresh before this one-time install so it doesn't hit a stale index.
+            sudo apt-get update
             sudo apt-get install -y postgresql
+            APT_CHANGED=1
         fi
         # Pick the cluster LiteLLM actually uses. Both the bootstrap below
         # (`sudo -u postgres psql`, via pg_wrapper) and the runtime DATABASE_URL
@@ -788,6 +850,9 @@ if [ "$HARDEN_ONLY" != "true" ] && [ "$INSTALL_ONLY" != "true" ]; then
     LITELLM_ENV_CONTENT+="DATABASE_URL=${LITELLM_DB_URL}"$'\n'
     LITELLM_ENV_CONTENT+="STORE_MODEL_IN_DB=True"$'\n'
     [ -n "${LITELLM_DB_PASSWORD:-}" ] && LITELLM_ENV_CONTENT+="LITELLM_DB_PASSWORD=${LITELLM_DB_PASSWORD}"$'\n'
+    # Manual UI_USERNAME / UI_PASSWORD overrides survive the wholesale rewrite
+    # (grepped from the previous env file in Phase 5a).
+    [ -n "$PERSISTED_UI_LINES" ] && LITELLM_ENV_CONTENT+="${PERSISTED_UI_LINES}"$'\n'
 
     # --docker only: ~/.config/litellm/env is parsed by BOTH systemd
     # EnvironmentFile (native unit) and docker-compose env_file (container). The
@@ -804,9 +869,10 @@ if [ "$HARDEN_ONLY" != "true" ] && [ "$INSTALL_ONLY" != "true" ]; then
         done <<< "$LITELLM_ENV_CONTENT"
     fi
 
-    mkdir -p "$LITELLM_ENV_DIR"
+    mkdir -p "$LITELLM_CONFIG_DIR"
     if printf '%s' "$LITELLM_ENV_CONTENT" | write_if_changed "$LITELLM_ENV_FILE" 600; then
         log "LiteLLM env file updated"
+        LITELLM_CHANGED=1
     else
         log "LiteLLM env file unchanged"
     fi
@@ -818,15 +884,14 @@ fi
 
 # (systemd --user lingering is enabled earlier, before Phase 2b.)
 # Skipped in harden-only / install-only (no local LiteLLM service).
-if [ "$HARDEN_ONLY" != "true" ] && [ "$INSTALL_ONLY" != "true" ]; then
+if [ "$WITH_LOCAL_LITELLM" = "true" ]; then
     log "=== Phase 7: LiteLLM ==="
 
-    LITELLM_APP_DIR="${HOME}/.config/litellm"
-    LITELLM_CONFIG_FILE="${LITELLM_APP_DIR}/config.yaml"
+    if write_if_changed "$LITELLM_CONFIG_FILE" 644 < "$SCRIPT_DIR/configs/litellm-config.yaml"; then
+        LITELLM_CHANGED=1
+    fi
 
-    deploy_config "$SCRIPT_DIR/configs/litellm-config.yaml" "$LITELLM_CONFIG_FILE"
-
-    log "LiteLLM config deployed to $LITELLM_APP_DIR"
+    log "LiteLLM config deployed to $LITELLM_CONFIG_DIR"
 
     # Runtime switch (native<->docker): stop the currently-installed litellm unit
     # BEFORE deploy_user_systemd_service daemon-reloads its definition, so it's
@@ -838,11 +903,14 @@ if [ "$HARDEN_ONLY" != "true" ] && [ "$INSTALL_ONLY" != "true" ]; then
     INSTALLED_LITELLM_UNIT="${HOME}/.config/systemd/user/litellm.service"
     if [ -f "$INSTALLED_LITELLM_UNIT" ]; then
         installed_litellm_variant="native"
-        grep -q 'docker compose' "$INSTALLED_LITELLM_UNIT" && installed_litellm_variant="docker"
+        # Anchor on the ExecStart line, not the whole file: a comment mentioning
+        # "docker compose" in the native template must not fake a runtime switch.
+        grep -q '^ExecStart=.*docker compose' "$INSTALLED_LITELLM_UNIT" && installed_litellm_variant="docker"
         desired_litellm_variant="native"
         [ "$DOCKER_MODE" = "true" ] && desired_litellm_variant="docker"
         if [ "$installed_litellm_variant" != "$desired_litellm_variant" ]; then
             log "Switching LiteLLM runtime ${installed_litellm_variant} -> ${desired_litellm_variant}; stopping current unit first"
+            LITELLM_CHANGED=1
             stop_user_service_if_active litellm
             # systemd may read the unit inactive while the rootless daemon still
             # runs the container (restart: unless-stopped), so the ExecStop above
@@ -850,54 +918,65 @@ if [ "$HARDEN_ONLY" != "true" ] && [ "$INSTALL_ONLY" != "true" ]; then
             # docker->native switch (the native proxy can't bind). Tear the compose
             # project down directly, independent of the unit state. Idempotent; if
             # the daemon/socket is down there's no running container to orphan.
-            if [ "$installed_litellm_variant" = "docker" ] && [ -f "${LITELLM_APP_DIR}/docker-compose.yml" ]; then
-                _litellm_sock="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/docker.sock"
-                DOCKER_HOST="unix://${_litellm_sock}" \
-                    docker compose -f "${LITELLM_APP_DIR}/docker-compose.yml" down --remove-orphans 2>/dev/null || true
+            if [ "$installed_litellm_variant" = "docker" ] && [ -f "${LITELLM_CONFIG_DIR}/docker-compose.yml" ]; then
+                DOCKER_HOST="unix://${DOCKER_SOCK}" \
+                    docker compose -f "${LITELLM_CONFIG_DIR}/docker-compose.yml" down --remove-orphans 2>/dev/null || true
             fi
         fi
     fi
 
     if [ "$DOCKER_MODE" = "true" ]; then
-        # Dockerized LiteLLM: deploy the compose file next to config.yaml + env
-        # (the unit's WorkingDirectory is __APP_DIR__, so `docker compose`
-        # auto-discovers docker-compose.yml and the relative ./config.yaml + ./env
-        # mounts). The systemd --user unit runs `docker compose up` against the
-        # rootless daemon. Postgres + claude-devtools stay native.
-        deploy_config "$SCRIPT_DIR/configs/litellm-docker-compose.yml" "${LITELLM_APP_DIR}/docker-compose.yml"
-        log "LiteLLM docker-compose deployed to ${LITELLM_APP_DIR}/docker-compose.yml"
+        # Dockerized LiteLLM: render the compose template (__PORT__) next to
+        # config.yaml + env (the unit's WorkingDirectory is __APP_DIR__, so
+        # `docker compose` auto-discovers docker-compose.yml and the relative
+        # ./config.yaml + ./env mounts). The systemd --user unit runs
+        # `docker compose up` against the rootless daemon. Postgres +
+        # claude-devtools stay native.
+        if sed -e "s|__PORT__|${LITELLM_PORT}|g" "$SCRIPT_DIR/configs/litellm-docker-compose.yml" \
+            | write_if_changed "${LITELLM_CONFIG_DIR}/docker-compose.yml"; then
+            LITELLM_CHANGED=1
+        fi
+        log "LiteLLM docker-compose deployed to ${LITELLM_CONFIG_DIR}/docker-compose.yml"
 
-        deploy_user_systemd_service litellm "$SCRIPT_DIR/systemd/litellm-docker.service" \
-            -e "s|__APP_DIR__|${LITELLM_APP_DIR}|g" \
-            -e "s|__PATH__|${USER_TOOL_PATH}|g" || true
+        if deploy_user_systemd_service litellm "$SCRIPT_DIR/systemd/litellm-docker.service" \
+            -e "s|__APP_DIR__|${LITELLM_CONFIG_DIR}|g" \
+            -e "s|__PATH__|${USER_TOOL_PATH}|g"; then
+            LITELLM_CHANGED=1
+        fi
 
         # Pre-pull the image in the foreground (visible progress) so the unit
         # start below is fast and wait_for_litellm's 90s window isn't eaten by a
         # ~367MB first-run download — the unit's ExecStartPre would otherwise pull
         # silently while we poll. On re-runs with the image cached this is a quick
         # "up to date" check. Talks to the rootless daemon started in Phase 2b.
-        litellm_docker_sock="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/docker.sock"
         log "Pulling LiteLLM image (first run downloads ~367MB; cached afterwards)..."
-        DOCKER_HOST="unix://${litellm_docker_sock}" \
-            docker compose -f "${LITELLM_APP_DIR}/docker-compose.yml" pull \
+        DOCKER_HOST="unix://${DOCKER_SOCK}" \
+            docker compose -f "${LITELLM_CONFIG_DIR}/docker-compose.yml" pull \
             || warn "docker compose pull failed — the unit will retry via ExecStartPre on start"
     else
-        deploy_user_systemd_service litellm "$SCRIPT_DIR/systemd/litellm.service" \
+        if deploy_user_systemd_service litellm "$SCRIPT_DIR/systemd/litellm.service" \
             -e "s|__LITELLM_BIN__|${LITELLM_BIN}|g" \
-            -e "s|__APP_DIR__|${LITELLM_APP_DIR}|g" \
+            -e "s|__APP_DIR__|${LITELLM_CONFIG_DIR}|g" \
             -e "s|__PORT__|${LITELLM_PORT}|g" \
             -e "s|__ENV_FILE__|${LITELLM_ENV_FILE}|g" \
-            -e "s|__PATH__|${LITELLM_PATH}|g" || true
+            -e "s|__PATH__|${LITELLM_PATH}|g"; then
+            LITELLM_CHANGED=1
+        fi
     fi
 
     systemctl --user enable litellm &>/dev/null || true
 
-    if systemctl --user is-active litellm &>/dev/null; then
+    # Restart only when something the service consumes actually changed (env
+    # file, config, unit, compose render, binary upgrade, runtime switch) —
+    # an unconditional restart made every no-op re-run reboot LiteLLM (Prisma
+    # reconnect + boot-time model-map fetch, 5-25s) and drop in-flight gateway
+    # connections. `restart` also starts an inactive unit, so one branch covers
+    # both the changed and the not-running case.
+    if [ "$LITELLM_CHANGED" = "1" ] || ! systemctl --user is-active litellm &>/dev/null; then
         systemctl --user restart litellm
-        log "LiteLLM service restarted"
+        log "LiteLLM service (re)started"
     else
-        systemctl --user start litellm
-        log "LiteLLM service started"
+        log "LiteLLM unchanged — service left running"
     fi
 
     wait_for_litellm "$LITELLM_PORT" || warn "LiteLLM may not be ready — Claude Code calls could fail until it starts"
@@ -911,8 +990,11 @@ log "=== Phase 8: Claude Code Settings ==="
 
 # 8a: system-level hardening (managed-settings). Skipped in --router-only and
 # --install-only — both opt out of system-wide policy enforcement.
-if [ "$ROUTER_ONLY" != "true" ] && [ "$INSTALL_ONLY" != "true" ]; then
-    # 8a. Managed settings (system-level, root-owned). Token-substitute __REPO_DIR__ in hooks paths.
+if [ "$WITH_POLICY" = "true" ]; then
+    # 8a. Managed settings (system-level, root-owned). Token-substitute __REPO_DIR__
+    # in hooks paths; install only on change so the root-owned policy file keeps
+    # its mtime/inode across no-op re-runs (same idempotency contract as every
+    # other deploy — the installed copy is world-readable, so cmp works unprivileged).
     sudo install -d -m 755 /etc/claude-code
 
     MANAGED_TMP=$(mktemp)
@@ -920,16 +1002,24 @@ if [ "$ROUTER_ONLY" != "true" ] && [ "$INSTALL_ONLY" != "true" ]; then
         -e "s|__REPO_DIR__|${REPO_DIR}|g" \
         "$SCRIPT_DIR/configs/claude-managed-settings.json" > "$MANAGED_TMP"
 
-    sudo install -m 644 -o root -g root "$MANAGED_TMP" /etc/claude-code/managed-settings.json
+    if cmp -s "$MANAGED_TMP" /etc/claude-code/managed-settings.json 2>/dev/null; then
+        log "Managed settings unchanged at /etc/claude-code/managed-settings.json"
+    else
+        sudo install -m 644 -o root -g root "$MANAGED_TMP" /etc/claude-code/managed-settings.json
+        log "Managed settings deployed to /etc/claude-code/managed-settings.json"
+    fi
     rm -f "$MANAGED_TMP"
-    log "Managed settings deployed to /etc/claude-code/managed-settings.json"
 fi
 
 # 8b. /tmp/claude (sandbox prerequisite; bashrc-ct.sh is gone, do it here). Runs in
 # every mode — no sudo needed, and the sandbox runtime now ships in all modes (incl.
 # --router-only, which can /sandbox on), so the prereq dir must exist everywhere.
 mkdir -p /tmp/claude
-chmod 755 /tmp/claude
+# Non-fatal: on a multi-user host the dir may already exist owned by someone
+# else (sticky /tmp lets mkdir -p succeed but chmod EPERM), which must not
+# abort setup under `set -e`.
+chmod 755 /tmp/claude 2>/dev/null \
+    || warn "/tmp/claude exists but is not owned by $USER — the sandbox prereq dir may be unusable"
 
 # 8c + 8d: user-level state — runs in every mode (8a is root-only; 8b ran above).
 
@@ -938,7 +1028,7 @@ chmod 755 /tmp/claude
 # re-run of setup must not clobber it.
 NEEDS_SANDBOX_BLOCK=0
 if [ ! -f "${HOME}/.claude/settings.json" ]; then
-    if [ "$ROUTER_ONLY" = "true" ] || [ "$INSTALL_ONLY" = "true" ]; then
+    if [ "$SANDBOX_DEFAULT_ON" != "true" ]; then
         # router-only / install-only ship the sandbox OFF, but KEEP the full block and
         # just set enabled:false (don't strip it). The floor (denyRead/denyWrite/network)
         # stays pre-configured, so flipping enabled:true later activates the hardened
@@ -966,8 +1056,8 @@ elif ! jq -e 'has("sandbox")' "${HOME}/.claude/settings.json" >/dev/null 2>&1; t
     warn "~/.claude/settings.json has no sandbox block — run linux/scripts/add-sandbox-block.sh (details in the end-of-setup banner)."
 fi
 
-# 8d. Statusline script
-install -m 755 "$SCRIPT_DIR/scripts/statusline.sh" "${HOME}/.claude/statusline.sh"
+# 8d. Statusline script (content-aware copy — no rewrite on no-op re-runs)
+deploy_config "$SCRIPT_DIR/scripts/statusline.sh" "${HOME}/.claude/statusline.sh" 755
 
 # 8e. nah Claude Code plugin — deterministic action-aware guard. Catches
 # wrapper-evasion patterns the Bash(...) deny rules in managed-settings can't
@@ -981,15 +1071,11 @@ install -m 755 "$SCRIPT_DIR/scripts/statusline.sh" "${HOME}/.claude/statusline.s
 # is the only active policy layer in that mode (and `permissions.deny[]` is
 # idle). Marketplace ref uses @claude-marketplace branch (where upstream's
 # marketplace.json lives) and is otherwise unpinned — same install-if-missing-
-# then-latest convention as Claude Code (4b) and ACP (4c); user runs
+# then-latest convention as ACP (4c); user runs
 # `claude plugin update nah --scope user` to upgrade.
-if [ "$ROUTER_ONLY" != "true" ] && [ "$INSTALL_ONLY" != "true" ] && { command -v claude &>/dev/null || [ -x "${HOME}/.local/bin/claude" ]; }; then
-    # Marketplace add: schema (verified via `claude plugin marketplace list
-    # --json`) is bare array of { name, source, repo, installLocation } —
-    # .source is the source TYPE ("github"), .repo holds "owner/repo". Match
-    # on .repo for exact identity (avoids fork/mirror false positives).
-    # Stdin redirected + timeout so a headless/CI invocation can't wedge the
-    # script. Two independent hazards, two guards:
+if [ "$WITH_POLICY" = "true" ] && have_claude; then
+    # Every claude invocation here needs stdin redirected + a timeout so a
+    # headless/CI run can't wedge the script. Two independent hazards, two guards:
     #
     #   1. TTY probing (the real wedger). `claude` is a Node TUI: when its
     #      stdout is an interactive terminal it emits terminal-capability
@@ -1011,36 +1097,25 @@ if [ "$ROUTER_ONLY" != "true" ] && [ "$INSTALL_ONLY" != "true" ] && { command -v
     #      avoid cutting a slow-but-working first clone; -k 15 force-kills 15s
     #      later. State is committed before any lingering, so a force-kill
     #      never corrupts it (re-runs find it "already added"/installed).
-    nah_marketplace_ok=0
-    # `claude plugin marketplace list --json` emits CRLF line endings and a
-    # trailing ANSI escape (\e[?25h) past the closing `]` — strip both before
-    # jq sees the input. Same workaround applied to `claude plugin list --json`
-    # below; see comment there for the empirical evidence.
-    if timeout -k 15 60 claude plugin marketplace list --json </dev/null 2>/dev/null \
-        | tr -d '\r' \
-        | sed -n '/^\[/,/^\]/p' \
-        | jq -e '.[]? | select(.repo == "manuelschipper/nah")' >/dev/null 2>&1; then
-        log "nah marketplace already added — skipping"
-        nah_marketplace_ok=1
-    else
-        log "Adding nah plugin marketplace..."
-        # @claude-marketplace is the git ref where marketplace.json lives in
-        # the upstream repo — the default branch does not contain it, so the
-        # bare `manuelschipper/nah` form fails with "marketplace.json not found".
-        # The .repo field in `claude plugin marketplace list --json` drops the
-        # ref suffix, so the idempotency selector above still matches.
-        # $(... 2>&1) keeps stdout/stderr off the tty (hazard 1 above) so the
-        # add doesn't block on terminal-capability probes; if-condition form is
-        # set -e-safe (substitution failure doesn't abort the script).
-        if nah_add_out=$(timeout -k 15 180 claude plugin marketplace add manuelschipper/nah@claude-marketplace </dev/null 2>&1); then
-            nah_marketplace_ok=1
-        else
-            warn "Failed to add nah marketplace — try 'claude update' (the 'plugin' subcommand may be missing in older Claude Code). Output: ${nah_add_out}"
-        fi
-    fi
+    #
+    # Read-only queries share one sanitizer: `claude plugin … --json` (verified
+    # empirically) writes JSON with CRLF line endings AND appends a trailing
+    # ANSI escape `\e[?25h` (show-cursor) past the closing `]`. Strip CR with
+    # `tr -d '\r'` and extract just the bracketed array with
+    # `sed -n '/^\[/,/^\]/p'` so jq gets clean input. The sed range tolerates a
+    # single-line `[]` (both anchors match the same line, printed once).
+    claude_plugin_json() {
+        timeout -k 15 60 claude "$@" --json </dev/null 2>/dev/null \
+            | tr -d '\r' \
+            | sed -n '/^\[/,/^\]/p'
+    }
 
-    # Only attempt install if the marketplace is registered — otherwise the
-    # install call is guaranteed to fail with a less informative error.
+    # Plugin state first — the steady state (installed + enabled) then costs a
+    # single claude invocation; the marketplace is only checked/added on the
+    # install path, where `claude plugin install` needs it registered. A
+    # marketplace the user removed while keeping the plugin installed is
+    # consequently NOT re-added (it's only needed again for
+    # `claude plugin update nah`).
     #
     # Plugin schema (verified via `claude plugin list --json` on a real install):
     # bare array of { id: "<plugin>@<marketplace>", scope, enabled, version,
@@ -1051,45 +1126,64 @@ if [ "$ROUTER_ONLY" != "true" ] && [ "$INSTALL_ONLY" != "true" ] && { command -v
     # `enabled: false` at detection time means the user *deliberately* disabled
     # it after we installed it (`claude plugin disable`) — Phase 8e respects
     # that and leaves it off (it does NOT re-enable). We distinguish three states.
-    if [ "$nah_marketplace_ok" = "1" ]; then
-        # Note: `// "absent"` won't work as a fallback because jq's // operator
-        # treats both null AND false as missing — so an installed-but-disabled
-        # plugin (enabled: false) would silently look "absent". Use if/else.
-        #
-        # Defensive: stage the raw output so we can distinguish "empty output"
-        # (claude crashed / subcommand missing) from "parse error" (claude
-        # emitted JSON + trailing noise) from "valid output, plugin absent".
-        # An ambiguous state should NOT trigger reinstall (would spam install
-        # attempts on every re-run); warn and skip until the next run.
-        #
-        # `claude plugin list --json` (verified empirically) writes JSON with
-        # CRLF line endings AND appends a trailing ANSI escape `\e[?25h`
-        # (show-cursor) past the closing `]`. Strip CR with `tr -d '\r'` and
-        # extract just the bracketed array with `sed -n '/^\[/,/^\]/p'` so jq
-        # gets clean input. The sed range tolerates a single-line `[]` (both
-        # anchors match the same line, printed once).
-        plugin_list=$(timeout -k 15 60 claude plugin list --json </dev/null 2>/dev/null \
-            | tr -d '\r' \
-            | sed -n '/^\[/,/^\]/p' \
-            || true)
-        if [ -z "$plugin_list" ]; then
-            nah_state="unknown"
-        else
-            nah_state=$(printf '%s' "$plugin_list" \
-                | jq -r '[.[]? | select(.id == "nah@nah" and .scope == "user")] | if length == 0 then "absent" else .[0].enabled end' 2>/dev/null \
-                || echo "parse-error")
-        fi
-        case "$nah_state" in
-            true)
-                log "nah plugin already installed and enabled — skipping"
-                ;;
-            false)
-                # User deliberately disabled it (install enables by default, and
-                # the absent branch re-asserts enable, so a disabled state can only
-                # come from `claude plugin disable`). Respect that — do NOT re-enable.
-                log "nah plugin installed but disabled — leaving disabled (user opted out; run 'claude plugin enable nah@nah --scope user' to re-enable)"
-                ;;
-            absent)
+    #
+    # Note: `// "absent"` won't work as a fallback because jq's // operator
+    # treats both null AND false as missing — so an installed-but-disabled
+    # plugin (enabled: false) would silently look "absent". Use if/else.
+    #
+    # Defensive: stage the raw output so we can distinguish "empty output"
+    # (claude crashed / subcommand missing) from "parse error" (claude
+    # emitted JSON + trailing noise) from "valid output, plugin absent".
+    # An ambiguous state should NOT trigger reinstall (would spam install
+    # attempts on every re-run); warn and skip until the next run.
+    plugin_list=$(claude_plugin_json plugin list || true)
+    if [ -z "$plugin_list" ]; then
+        nah_state="unknown"
+    else
+        nah_state=$(printf '%s' "$plugin_list" \
+            | jq -r '[.[]? | select(.id == "nah@nah" and .scope == "user")] | if length == 0 then "absent" else .[0].enabled end' 2>/dev/null \
+            || echo "parse-error")
+    fi
+    case "$nah_state" in
+        true)
+            log "nah plugin already installed and enabled — skipping"
+            ;;
+        false)
+            # User deliberately disabled it (install enables by default, and
+            # the absent branch re-asserts enable, so a disabled state can only
+            # come from `claude plugin disable`). Respect that — do NOT re-enable.
+            log "nah plugin installed but disabled — leaving disabled (user opted out; run 'claude plugin enable nah@nah --scope user' to re-enable)"
+            ;;
+        absent)
+            # Marketplace registration: schema (verified via `claude plugin
+            # marketplace list --json`) is a bare array of { name, source, repo,
+            # installLocation } — .source is the source TYPE ("github"), .repo
+            # holds "owner/repo". Match on .repo for exact identity (avoids
+            # fork/mirror false positives).
+            nah_marketplace_ok=0
+            if claude_plugin_json plugin marketplace list \
+                | jq -e '.[]? | select(.repo == "manuelschipper/nah")' >/dev/null 2>&1; then
+                nah_marketplace_ok=1
+            else
+                log "Adding nah plugin marketplace..."
+                # @claude-marketplace is the git ref where marketplace.json lives in
+                # the upstream repo — the default branch does not contain it, so the
+                # bare `manuelschipper/nah` form fails with "marketplace.json not found".
+                # The .repo field in `claude plugin marketplace list --json` drops the
+                # ref suffix, so the idempotency selector above still matches.
+                # $(... 2>&1) keeps stdout/stderr off the tty (hazard 1 above) so the
+                # add doesn't block on terminal-capability probes; if-condition form is
+                # set -e-safe (substitution failure doesn't abort the script).
+                if nah_add_out=$(timeout -k 15 180 claude plugin marketplace add manuelschipper/nah@claude-marketplace </dev/null 2>&1); then
+                    nah_marketplace_ok=1
+                else
+                    warn "Failed to add nah marketplace — try 'claude update' (the 'plugin' subcommand may be missing in older Claude Code). Output: ${nah_add_out}"
+                fi
+            fi
+
+            # Only attempt install if the marketplace is registered — otherwise
+            # the install call is guaranteed to fail with a less informative error.
+            if [ "$nah_marketplace_ok" = "1" ]; then
                 log "Installing nah Claude Code plugin..."
                 if nah_install_out=$(timeout -k 15 180 claude plugin install nah@nah --scope user </dev/null 2>&1); then
                     log "nah plugin installed"
@@ -1102,12 +1196,12 @@ if [ "$ROUTER_ONLY" != "true" ] && [ "$INSTALL_ONLY" != "true" ] && { command -v
                 else
                     warn "Failed to install nah plugin — try 'claude plugin marketplace list' to confirm marketplace registration. Output: ${nah_install_out}"
                 fi
-                ;;
-            *)
-                warn "Could not determine nah plugin state ('$nah_state') — skipping mutation; re-run setup.sh to retry"
-                ;;
-        esac
-    fi
+            fi
+            ;;
+        *)
+            warn "Could not determine nah plugin state ('$nah_state') — skipping mutation; re-run setup.sh to retry"
+            ;;
+    esac
 fi
 
 log "Claude Code settings deployed"
@@ -1213,7 +1307,12 @@ if [ "$CLAUDE_DEVTOOLS_RAM_OK" = "1" ]; then
                 elif [ ! -f "$CLAUDE_DEVTOOLS_BUILD" ]; then
                     warn "claude-devtools build finished but $CLAUDE_DEVTOOLS_BUILD missing"
                 else
-                    echo "$CLAUDE_DEVTOOLS_LATEST_TAG" | write_if_changed "$CLAUDE_DEVTOOLS_STAMP"
+                    # `|| true`: write_if_changed returns 1 when the stamp already
+                    # holds this tag (rebuild at an unchanged tag, e.g. after the
+                    # user wiped dist-standalone/) — without it, `set -e` kills
+                    # the whole script here, skipping the service deploy below
+                    # plus Phases 10-11 and every end-of-run banner.
+                    echo "$CLAUDE_DEVTOOLS_LATEST_TAG" | write_if_changed "$CLAUDE_DEVTOOLS_STAMP" || true
                     log "claude-devtools built successfully at $CLAUDE_DEVTOOLS_LATEST_TAG"
                 fi
             fi
@@ -1271,7 +1370,12 @@ fi
 
 log "=== Phase 11: Cleanup ==="
 
-sudo apt-get autoremove -y
+# Only worth a sudo round-trip when some phase actually touched apt state.
+if [ "$APT_CHANGED" = "1" ]; then
+    sudo apt-get autoremove -y
+else
+    log "No apt changes this run — skipping autoremove"
+fi
 
 #############################################################################
 # Done
@@ -1284,7 +1388,7 @@ log "claude-litellm setup complete!"
 # LiteLLM UI only exists when a local LiteLLM was installed (not harden-only /
 # install-only). DevTools is installed in install-only too, so print it whenever
 # it deployed, regardless of mode.
-if [ "$HARDEN_ONLY" != "true" ] && [ "$INSTALL_ONLY" != "true" ]; then
+if [ "$WITH_LOCAL_LITELLM" = "true" ]; then
     log "  LiteLLM UI:  http://127.0.0.1:${LITELLM_PORT}/ui/"
 fi
 if [ "$CLAUDE_DEVTOOLS_DEPLOYED" = "1" ]; then
@@ -1307,9 +1411,10 @@ else
     log "Then run 'claude' to start Claude Code via the LiteLLM gateway."
 fi
 
+rule="━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
 # Skip on systemd / piped runs. No LiteLLM UI/master key under install-only.
-if [ "$HARDEN_ONLY" != "true" ] && [ "$INSTALL_ONLY" != "true" ] && [ -t 1 ]; then
-    rule="━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+if [ "$WITH_LOCAL_LITELLM" = "true" ] && [ -t 1 ]; then
     echo ""
     echo -e "${YELLOW}${rule}${NC}"
     echo -e "${YELLOW}  LiteLLM UI:  ${NC}http://127.0.0.1:${LITELLM_PORT}/ui/"
@@ -1322,7 +1427,6 @@ if [ "$HARDEN_ONLY" != "true" ] && [ "$INSTALL_ONLY" != "true" ] && [ -t 1 ]; th
 fi
 
 if [ "${NEEDS_MODEL_CONFIG:-0}" = "1" ] && [ -t 1 ]; then
-    rule="━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo -e "${YELLOW}${rule}${NC}"
     echo -e "${YELLOW}  No Azure credentials in .env — setup completed, but Claude Code"
     echo -e "  has NO default model configured yet.${NC}"
@@ -1343,13 +1447,12 @@ if [ "${NEEDS_MODEL_CONFIG:-0}" = "1" ] && [ -t 1 ]; then
 fi
 
 if [ "${NEEDS_SANDBOX_BLOCK:-0}" = "1" ] && [ -t 1 ]; then
-    rule="━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo -e "${YELLOW}${rule}${NC}"
     echo -e "${YELLOW}  ~/.claude/settings.json has no sandbox block — the statusline can't"
     echo -e "  detect the sandbox. Add it (keeps your other keys), then restart"
     echo -e "  Claude Code:${NC}"
     echo ""
-    if [ "$ROUTER_ONLY" = "true" ] || [ "$INSTALL_ONLY" = "true" ]; then
+    if [ "$SANDBOX_DEFAULT_ON" != "true" ]; then
         echo -e "    ${GREEN}${SCRIPT_DIR}/scripts/add-sandbox-block.sh --disabled${NC}"
         echo ""
         echo -e "${YELLOW}  (router-only / install-only seed it disabled — set sandbox.enabled:true to turn it on)${NC}"

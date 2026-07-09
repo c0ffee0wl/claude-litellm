@@ -56,8 +56,7 @@ tsv_output=$(printf '%s' "$input" | jq -er '[
     .rate_limits.five_hour.used_percentage // "-",
     .rate_limits.seven_day.used_percentage // "-",
     .rate_limits.five_hour.resets_at // "-",
-    .rate_limits.seven_day.resets_at // "-",
-    .session_id // "-"
+    .rate_limits.seven_day.resets_at // "-"
 ] | @tsv' 2>/dev/null)
 
 # Identity colors (root → red info_color as a warning) are resolved up here so
@@ -79,7 +78,7 @@ if [ -z "$tsv_output" ]; then
     exit 0
 fi
 
-IFS=$'\t' read -r cwd proj_dir DURATION_MS MODEL MODEL_ID PCT CTX_SIZE FIVE_H WEEK FIVE_H_RESET WEEK_RESET SESSION_ID <<<"$tsv_output"
+IFS=$'\t' read -r cwd proj_dir DURATION_MS MODEL MODEL_ID PCT CTX_SIZE FIVE_H WEEK FIVE_H_RESET WEEK_RESET <<<"$tsv_output"
 
 # Sanitize numerics — defend against any surprise output from jq
 [[ "$DURATION_MS" =~ ^[0-9]+$ ]] || DURATION_MS=0
@@ -208,18 +207,32 @@ resolve_token() {
 
 # Refresh cache file $1 from LiteLLM endpoint $3 if it's missing or older than $2
 # minutes. Writes atomically (tmp + mv) and falls through silently on any error —
-# the statusline must never block or surface failures.
+# the statusline must never block or surface failures. A failed fetch leaves a
+# .fail stamp that suppresses retries for one TTL window: without it, an
+# unreachable-but-not-refusing LiteLLM (hung service, filtered port) would make
+# EVERY render pay the full 1s curl timeout. Stale cache content still renders.
+# Fresh = exists (non-empty) and younger than the given TTL in minutes.
+cache_fresh() { [ -s "$1" ] && [ -n "$(find "$1" -mmin "-$2" 2>/dev/null)" ]; }
+
 fetch_litellm_cache() {
     local cache_file="$1" max_age_min="$2" endpoint="$3" tmp
-    [ -s "$cache_file" ] && [ -n "$(find "$cache_file" -mmin "-$max_age_min" 2>/dev/null)" ] && return
+    local fail_stamp="${cache_file}.fail"
+    cache_fresh "$cache_file" "$max_age_min" && return
+    cache_fresh "$fail_stamp" "$max_age_min" && return
     resolve_token
     [ -n "$TOKEN" ] || return
     tmp="${cache_file}.$$.tmp"
-    curl -sf --max-time 1 \
+    if curl -sf --max-time 1 \
         -H "Authorization: Bearer $TOKEN" \
         "${ANTHROPIC_BASE_URL%/}/$endpoint" \
         -o "$tmp" 2>/dev/null \
-        && mv "$tmp" "$cache_file" 2>/dev/null
+        && mv "$tmp" "$cache_file" 2>/dev/null; then
+        [ -e "$fail_stamp" ] && rm -f "$fail_stamp" 2>/dev/null
+    else
+        # Non-empty on purpose: cache_fresh tests -s, and an empty stamp
+        # would never suppress the retry.
+        printf '1' > "$fail_stamp" 2>/dev/null
+    fi
     rm -f "$tmp" 2>/dev/null
 }
 

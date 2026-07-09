@@ -21,12 +21,16 @@ NC='\033[0m' # No Color
 # Configuration
 #############################################################################
 
-YES_MODE=${YES_MODE:-false}
-
 # Shell profile files we mirror env-vars into. ~/.profile is sourced by bash
 # login shells and (via ~/.zprofile chain on most distros) by zsh login shells;
 # non-login shells inherit the env from the parent login shell.
 PROFILE_FILES=("${HOME}/.profile")
+
+# Set to 1 by every code path that installs apt packages (setup.sh Phases
+# 2/4d/6 and install_docker_rootless below); setup.sh Phase 11 runs
+# `apt-get autoremove` only when it fired. Initialized here because a writer
+# lives in this library — the flag must not depend on which phase runs first.
+APT_CHANGED=0
 
 #############################################################################
 # Hardened curl
@@ -41,6 +45,18 @@ PROFILE_FILES=("${HOME}/.profile")
 # Do NOT use for localhost/health checks (plain HTTP).
 curl_secure() {
     curl -q --proto '=https' --tlsv1.2 "$@"
+}
+
+#############################################################################
+# Package state
+#############################################################################
+
+# True when dpkg reports the package fully installed. `dpkg -s` alone is not
+# enough — it also returns 0 for removed-but-not-purged packages (config-files
+# state), which would wrongly skip a needed (re)install.
+# Usage: pkg_installed <package>
+pkg_installed() {
+    dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q 'install ok installed'
 }
 
 #############################################################################
@@ -101,15 +117,28 @@ download_and_run() {
 # Profile Management (bash + zsh)
 #############################################################################
 
-# Idempotently set an export in every file in PROFILE_FILES (or a custom set
-# passed via $3+). Writes "export NAME=\"value\"" with proper escaping.
-# Usage: update_profile_export VAR_NAME "value" [profile_file ...]
+# Reverse the escaping update_profile_export applies to a double-quoted value
+# (inverse order of the forward escapes). Single source of truth for the
+# scheme — read_profile_export and collect_litellm_provider_vars both decode
+# through this, so extending the writer means extending exactly one inverse.
+# Returns via REPLY (not stdout) so callers stay fork-free — the collector
+# decodes every export line in ~/.profile, and a $(...) per line adds ~36
+# subshells per setup run.
+# Usage: _profile_unescape "raw-value-between-quotes"; use "$REPLY"
+_profile_unescape() {
+    REPLY="$1"
+    REPLY="${REPLY//\\\`/\`}"
+    REPLY="${REPLY//\\\$/\$}"
+    REPLY="${REPLY//\\\"/\"}"
+    REPLY="${REPLY//\\\\/\\}"
+}
+
+# Idempotently set an export in every file in PROFILE_FILES.
+# Writes "export NAME=\"value\"" with proper escaping.
+# Usage: update_profile_export VAR_NAME "value"
 update_profile_export() {
     local var_name="$1"
     local var_value="$2"
-    shift 2
-    local files=("$@")
-    [ ${#files[@]} -eq 0 ] && files=("${PROFILE_FILES[@]}")
 
     ensure_managed_bash_profile
 
@@ -120,13 +149,21 @@ update_profile_export() {
     escaped_value="${escaped_value//\$/\\\$}"    # $ -> \$
     escaped_value="${escaped_value//\`/\\\`}"    # ` -> \`
 
-    # For sed replacement, also escape & (special in replacement string)
+    # For sed replacement, also escape & (special in the replacement string)
+    # and | (the s||| delimiter — an unescaped one truncates the expression).
     local sed_value="$escaped_value"
     sed_value="${sed_value//&/\\&}"              # & -> \&
+    sed_value="${sed_value//|/\\|}"              # | -> \|
 
     local profile_file
-    for profile_file in "${files[@]}"; do
+    for profile_file in "${PROFILE_FILES[@]}"; do
         [ ! -f "$profile_file" ] && touch "$profile_file"
+        # Already exactly this line? Skip the sed -i full-file rewrite — with
+        # ~36 calls per setup run this keeps a no-op re-run from rewriting
+        # ~/.profile dozens of times.
+        if grep -qxF "export ${var_name}=\"${escaped_value}\"" "$profile_file" 2>/dev/null; then
+            continue
+        fi
         if grep -q "^export ${var_name}=" "$profile_file" 2>/dev/null; then
             sed -i "s|^export ${var_name}=.*|export ${var_name}=\"${sed_value}\"|" "$profile_file"
         elif grep -q "^#[[:space:]]*export ${var_name}=" "$profile_file" 2>/dev/null; then
@@ -139,42 +176,32 @@ update_profile_export() {
 
 # Read a previously written value from the first file in PROFILE_FILES that
 # contains it. Prints nothing if not present.
-# Usage: read_profile_export VAR_NAME [profile_file ...]
+# Usage: read_profile_export VAR_NAME
 read_profile_export() {
     local var_name="$1"
-    shift
-    local files=("$@")
-    [ ${#files[@]} -eq 0 ] && files=("${PROFILE_FILES[@]}")
 
     local profile_file line
-    for profile_file in "${files[@]}"; do
+    for profile_file in "${PROFILE_FILES[@]}"; do
         [ -f "$profile_file" ] || continue
         line=$(grep "^export ${var_name}=" "$profile_file" 2>/dev/null | head -1) || continue
         [ -z "$line" ] && continue
         local value="${line#export ${var_name}=\"}"
         value="${value%\"}"
-        # Reverse update_profile_export's escapes in inverse order
-        value="${value//\\\`/\`}"
-        value="${value//\\\$/\$}"
-        value="${value//\\\"/\"}"
-        value="${value//\\\\/\\}"
-        printf '%s' "$value"
+        _profile_unescape "$value"
+        printf '%s' "$REPLY"
         return 0
     done
 }
 
-# Delete any `export VAR_NAME=...` line from each file in PROFILE_FILES (or
-# files passed as $2+), and unset the var in the current shell so the rest
-# of setup.sh doesn't inherit a value we just decided to scrub.
-# Usage: remove_profile_export VAR_NAME [profile_file ...]
+# Delete any `export VAR_NAME=...` line from each file in PROFILE_FILES, and
+# unset the var in the current shell so the rest of setup.sh doesn't inherit
+# a value we just decided to scrub.
+# Usage: remove_profile_export VAR_NAME
 remove_profile_export() {
     local var_name="$1"
-    shift
-    local files=("$@")
-    [ ${#files[@]} -eq 0 ] && files=("${PROFILE_FILES[@]}")
 
     local profile_file
-    for profile_file in "${files[@]}"; do
+    for profile_file in "${PROFILE_FILES[@]}"; do
         [ -f "$profile_file" ] || continue
         if grep -q "^export ${var_name}=" "$profile_file" 2>/dev/null; then
             sed -i "/^export ${var_name}=/d" "$profile_file"
@@ -211,18 +238,15 @@ collect_litellm_provider_vars() {
     declare -A seen profile
     local v val line
 
-    # Build ~/.profile export map in a single pass (reverses the same escapes
-    # update_profile_export applies). Used by Passes 2 + 3 below.
+    # Build ~/.profile export map in a single pass (decoded via
+    # _profile_unescape, the shared inverse of update_profile_export's
+    # escaping). Used by Passes 2 + 3 below.
     if [ -f "$HOME/.profile" ]; then
         while IFS= read -r line; do
             [[ "$line" =~ ^export[[:space:]]+([A-Z][A-Z0-9_]*)=\"(.*)\"$ ]] || continue
             v="${BASH_REMATCH[1]}"
-            val="${BASH_REMATCH[2]}"
-            val="${val//\\\`/\`}"
-            val="${val//\\\$/\$}"
-            val="${val//\\\"/\"}"
-            val="${val//\\\\/\\}"
-            profile[$v]="$val"
+            _profile_unescape "${BASH_REMATCH[2]}"
+            profile[$v]="$REPLY"
         done < "$HOME/.profile"
     fi
 
@@ -369,11 +393,13 @@ install_docker_rootless() {
     # the litellm unit's `docker compose up` fails outright (a docker.io host has
     # neither). Ensure them regardless of engine presence.
     for pkg in uidmap slirp4netns dbus-user-session docker-ce-rootless-extras docker-compose-plugin; do
-        dpkg -s "$pkg" &>/dev/null || { need_rootless_deps=true; break; }
+        pkg_installed "$pkg" || { need_rootless_deps=true; break; }
     done
 
     if [ "$need_engine" = true ] || [ "$need_rootless_deps" = true ]; then
         log "Installing Docker CE / rootless deps (official apt repo)..."
+        # Tell setup.sh Phase 11 apt state changed (autoremove gate).
+        APT_CHANGED=1
 
         # Remove conflicting/old packages only when installing the engine fresh
         # (ignore failures — they may be absent); never touch a working engine.
@@ -416,10 +442,16 @@ install_docker_rootless() {
 
         log "Using Docker repository: ${docker_distro}/${docker_codename}"
 
-        # Docker's official GPG key + apt source.
+        # Docker's official GPG key + apt source. Download as the user via
+        # curl_secure (keeps the -q curlrc isolation — a sudo curl would read
+        # root's ~/.curlrc, exactly what the helper exists to bypass), then
+        # install root-owned.
+        local gpg_tmp
+        gpg_tmp=$(mktemp)
+        curl_secure -fsSL "https://download.docker.com/linux/${docker_distro}/gpg" -o "$gpg_tmp"
         sudo install -m 0755 -d /etc/apt/keyrings
-        sudo curl --proto '=https' --tlsv1.2 -fsSL "https://download.docker.com/linux/${docker_distro}/gpg" -o /etc/apt/keyrings/docker.asc
-        sudo chmod a+r /etc/apt/keyrings/docker.asc
+        sudo install -m 0644 "$gpg_tmp" /etc/apt/keyrings/docker.asc
+        rm -f "$gpg_tmp"
         echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/${docker_distro} ${docker_codename} stable" \
             | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
 

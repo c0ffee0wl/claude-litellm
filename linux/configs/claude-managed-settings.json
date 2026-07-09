@@ -144,11 +144,11 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash __REPO_DIR__/linux/hooks/pretooluse-rm-guard.sh"
+            "command": "bash \"__REPO_DIR__/linux/hooks/pretooluse-rm-guard.sh\""
           },
           {
             "type": "command",
-            "command": "bash __REPO_DIR__/linux/hooks/pretooluse-push-guard.sh"
+            "command": "bash \"__REPO_DIR__/linux/hooks/pretooluse-push-guard.sh\""
           }
         ]
       }

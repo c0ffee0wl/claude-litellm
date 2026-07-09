@@ -10,7 +10,9 @@
 # volume). claude-devtools also stays native (Phase 9).
 #
 # Relative paths (./config.yaml, ./env) resolve against this file's directory
-# (~/.config/litellm), so no token substitution is needed.
+# (~/.config/litellm). The only substituted token is the port (setup.sh's
+# LITELLM_PORT, same value the native unit's render gets) — Phase 7 seds it
+# before writing the deployed copy.
 
 services:
   litellm:
@@ -29,7 +31,7 @@ services:
     # (which binds --host 127.0.0.1). The container itself listens on 0.0.0.0
     # (required so the published port reaches it); it is NOT reachable off-host.
     ports:
-      - "127.0.0.1:4000:4000"
+      - "127.0.0.1:__PORT__:__PORT__"
     volumes:
       - ./config.yaml:/app/config.yaml:ro
       # Host Postgres Unix socket — the container connects over this (DATABASE_URL
@@ -49,7 +51,7 @@ services:
       - "--config"
       - "/app/config.yaml"
       - "--port"
-      - "4000"
+      - "__PORT__"
       - "--host"
       - "0.0.0.0"
       - "--num_workers"
@@ -59,7 +61,7 @@ services:
     # The image runs Prisma migrations on startup (against the host DB), so the
     # first boot can take a while — generous start_period before unhealthy.
     healthcheck:
-      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:4000/health/liveliness')\""]
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:__PORT__/health/liveliness')\""]
       interval: 30s
       timeout: 10s
       retries: 3
