@@ -61,6 +61,15 @@ while [[ $# -gt 0 ]]; do
             DOCKER_MODE=true
             shift
             ;;
+        --yes)
+            # Deprecated no-op: setup never prompts, so the flag never did
+            # anything. Still accepted (not an error) because external callers
+            # (e.g. ct-dfir-llm) pass it, and Phase 0's self-update re-execs
+            # with the original arguments — an unknown-arg error here would
+            # brick those invocations mid-update.
+            warn "--yes is deprecated and ignored (setup has no prompts)"
+            shift
+            ;;
         -h|--help)
             sed -n '/^# Usage:/,/^$/p' "$0" | sed 's/^# \?//'
             exit 0
