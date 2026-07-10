@@ -665,8 +665,17 @@ update_profile_export "CLAUDE_CODE_ATTRIBUTION_HEADER"           "0"
 #   * EXPERIMENTAL_AGENT_TEAMS: enable the (experimental) multi-agent teams
 #     feature. Its own gate — independent of CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS
 #     above (that only strips anthropic-beta request headers/tool-schema fields).
+#   * FORK_SUBAGENT: let Claude spawn forked subagents — a subagent that inherits
+#     the full session context (same model/tools/history) instead of a fresh one.
+#     `/fork` works without it (default v2.1.161+); the var additionally lets Claude
+#     auto-spawn forks and routes all subagent spawns to background (already the
+#     v2.1.198 default). Model-agnostic: the fork inherits the session's gateway id
+#     (azure/gpt-5.4) — no hardcoded claude-* id, no 404. Its advertised cost win
+#     (parent prompt-cache reuse) is Anthropic-cache-specific; over LiteLLM→Azure it
+#     degrades to a normal full-context request.
 update_profile_export "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"          "75"
 update_profile_export "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"     "1"
+update_profile_export "CLAUDE_CODE_FORK_SUBAGENT"               "1"
 
 # Scrub IS_DEMO=1 from ~/.profile if a prior tool / demo container left it
 # behind. Claude Code treats it as a "demo session" marker that silently
