@@ -30,13 +30,19 @@
 # Errors must never leak to Claude Code's UI
 exec 2>/dev/null
 
-input=$(cat)
+# read -d '' hits EOF (status 1) after filling $input — builtin, no cat fork.
+IFS= read -rd '' input
 
 # Inside a bubblewrap sandbox the inherited $USER/$HOSTNAME may reflect the
-# outer environment, while `id`/`hostname` return the sandboxed values. Always
-# fork to get the live identity that matches what the user sees in their shell.
+# outer environment, while `id`/`hostname` return the sandboxed values. `id`
+# must fork (NSS); the hostname comes fork-free from /proc, which is the live
+# per-UTS-namespace value (statusline shares CC's namespaces), with the
+# hostname binary as fallback.
 user=$(id -un)
-host=$(hostname -s)
+host=""
+IFS= read -r host < /proc/sys/kernel/hostname
+[ -n "$host" ] || host=$(hostname)
+host=${host%%.*}
 
 # Single jq fork. -e exits non-zero on null/false top-level; invalid JSON also fails.
 # @tsv keeps field boundaries intact even with embedded tabs/newlines.
@@ -45,7 +51,7 @@ host=$(hostname -s)
 # five_hour while seven_day is present) would otherwise shift every later field
 # left. "-" fails the numeric regexes downstream, so it reads as "absent".
 # project_dir falls back to current_dir here (it's the /sandbox toggle location).
-tsv_output=$(printf '%s' "$input" | jq -er '[
+tsv_output=$(jq -er '[
     .workspace.current_dir // "~",
     .workspace.project_dir // .workspace.current_dir // "~",
     .cost.total_duration_ms // 0,
@@ -57,7 +63,7 @@ tsv_output=$(printf '%s' "$input" | jq -er '[
     .rate_limits.seven_day.used_percentage // "-",
     .rate_limits.five_hour.resets_at // "-",
     .rate_limits.seven_day.resets_at // "-"
-] | @tsv' 2>/dev/null)
+] | @tsv' <<<"$input" 2>/dev/null)
 
 # Identity colors (root → red info_color as a warning) are resolved up here so
 # the empty-input fallback below renders root-aware too.
@@ -152,18 +158,29 @@ else
     # indicator.
     SANDBOX_ON=""
     sb_root="$proj_dir"
+    sb_files=()
     for sb_file in /etc/claude-code/managed-settings.json \
                    "$sb_root/.claude/settings.local.json" \
                    "$sb_root/.claude/settings.json" \
                    "$HOME/.claude/settings.local.json" \
                    "$HOME/.claude/settings.json"; do
-        [ -r "$sb_file" ] || continue
-        sb_val=$(jq -r 'try (.sandbox.enabled) catch null | if .==true then "true" elif .==false then "false" else "unset" end' "$sb_file" 2>/dev/null)
-        case "$sb_val" in
-            true) SANDBOX_ON=1; break ;;
-            false) SANDBOX_ON=""; break ;;
-        esac
+        [ -r "$sb_file" ] && sb_files+=("$sb_file")
     done
+    # ONE jq over all readable files (the filter runs once per input document,
+    # in argument order) instead of a fork per file; the first true/false token
+    # is the highest-precedence file that defines the key. A malformed file
+    # aborts jq's remaining output, so files after it read as "unset" — which
+    # warns, per the fail-safe contract. Tokens are fixed words, so unquoted
+    # word-splitting of $sb_vals is safe.
+    if [ ${#sb_files[@]} -gt 0 ]; then
+        sb_vals=$(jq -r 'try (.sandbox.enabled) catch null | if .==true then "true" elif .==false then "false" else "unset" end' "${sb_files[@]}" 2>/dev/null)
+        for sb_val in $sb_vals; do
+            case "$sb_val" in
+                true) SANDBOX_ON=1; break ;;
+                false) SANDBOX_ON=""; break ;;
+            esac
+        done
+    fi
     # bwrap presence: prefer a PATH lookup, but fall back to the canonical apt
     # install locations. CC may invoke the statusline with a PATH lacking
     # /usr/bin, which would make `command -v bwrap` false-negative even though
@@ -205,35 +222,38 @@ resolve_token() {
     fi
 }
 
-# Refresh cache file $1 from LiteLLM endpoint $3 if it's missing or older than $2
-# minutes. Writes atomically (tmp + mv) and falls through silently on any error —
-# the statusline must never block or surface failures. A failed fetch leaves a
-# .fail stamp that suppresses retries for one TTL window: without it, an
-# unreachable-but-not-refusing LiteLLM (hung service, filtered port) would make
-# EVERY render pay the full 1s curl timeout. Stale cache content still renders.
-# Fresh = exists (non-empty) and younger than the given TTL in minutes.
-cache_fresh() { [ -s "$1" ] && [ -n "$(find "$1" -mmin "-$2" 2>/dev/null)" ]; }
-
+# Refresh cache file $1 from LiteLLM endpoint $3 when the last fetch ATTEMPT
+# is older than $2 minutes. Stale-while-revalidate: the fetch runs in a
+# DETACHED background job and the caller renders immediately with whatever
+# cache already exists — a render never blocks on the network; a cold cache
+# just means the data appears on a later render (fail-soft). The .ts stamp
+# records the attempt (written BEFORE fetching), so an unreachable endpoint is
+# retried at most once per window rather than piling up one curl per render,
+# and the freshness check is builtin arithmetic — no find/stat fork. The job's
+# stdio redirects are load-bearing: Claude Code waits for the statusline's
+# stdout to close, so the job must not inherit it. Writes atomically
+# (tmp + mv); concurrent refreshes are benign ($$-suffixed tmp, atomic mv).
+# --max-time 5 bounds only the background job, never a render.
 fetch_litellm_cache() {
-    local cache_file="$1" max_age_min="$2" endpoint="$3" tmp
-    local fail_stamp="${cache_file}.fail"
-    cache_fresh "$cache_file" "$max_age_min" && return
-    cache_fresh "$fail_stamp" "$max_age_min" && return
+    local cache_file="$1" max_age_min="$2" endpoint="$3" tmp stamp ts="" now
+    stamp="${cache_file}.ts"
+    IFS= read -r ts < "$stamp"
+    printf -v now '%(%s)T' -1
+    if [[ "$ts" =~ ^[0-9]+$ ]] && (( now - ts < max_age_min * 60 )); then
+        return
+    fi
     resolve_token
     [ -n "$TOKEN" ] || return
+    printf '%s' "$now" > "$stamp"
     tmp="${cache_file}.$$.tmp"
-    if curl -sf --max-time 1 \
-        -H "Authorization: Bearer $TOKEN" \
-        "${ANTHROPIC_BASE_URL%/}/$endpoint" \
-        -o "$tmp" 2>/dev/null \
-        && mv "$tmp" "$cache_file" 2>/dev/null; then
-        [ -e "$fail_stamp" ] && rm -f "$fail_stamp" 2>/dev/null
-    else
-        # Non-empty on purpose: cache_fresh tests -s, and an empty stamp
-        # would never suppress the retry.
-        printf '1' > "$fail_stamp" 2>/dev/null
-    fi
-    rm -f "$tmp" 2>/dev/null
+    (
+        curl -sf --max-time 5 \
+            -H "Authorization: Bearer $TOKEN" \
+            "${ANTHROPIC_BASE_URL%/}/$endpoint" \
+            -o "$tmp" \
+            && mv "$tmp" "$cache_file"
+        rm -f "$tmp"
+    ) </dev/null >/dev/null 2>&1 &
 }
 
 # LiteLLM lookups (cached). Falls through silently on any error — statusline
