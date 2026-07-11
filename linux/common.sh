@@ -26,11 +26,18 @@ NC='\033[0m' # No Color
 # non-login shells inherit the env from the parent login shell.
 PROFILE_FILES=("${HOME}/.profile")
 
-# Set to 1 by every code path that installs apt packages (setup.sh Phases
-# 2/4d/6 and install_docker_rootless below); setup.sh Phase 11 runs
-# `apt-get autoremove` only when it fired. Initialized here because a writer
-# lives in this library — the flag must not depend on which phase runs first.
+# Set to 1 by every code path that changes apt state (apt_install below, plus
+# install_docker_rootless's conflicting-package removes); setup.sh Phase 11
+# runs `apt-get autoremove` only when it fired. Initialized here because the
+# writers live in this library — the flag must not depend on which phase runs
+# first.
 APT_CHANGED=0
+
+# Set to 1 once `apt-get update` has run this invocation; apt_install refreshes
+# the index at most once per run. install_docker_rootless re-runs the update
+# itself after adding the Docker apt repo (a new source needs a re-index) and
+# then re-marks the index fresh.
+APT_INDEX_FRESH=0
 
 #############################################################################
 # Hardened curl
@@ -59,6 +66,31 @@ pkg_installed() {
     dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q 'install ok installed'
 }
 
+# Refresh the apt index at most once per run (see APT_INDEX_FRESH above).
+apt_update_once() {
+    [ "$APT_INDEX_FRESH" = "1" ] && return 0
+    sudo apt-get update && APT_INDEX_FRESH=1
+}
+
+# apt-get update (once per run) + install; sets APT_CHANGED so setup.sh
+# Phase 11's autoremove gate fires. Fatality follows the call site: called
+# bare, a failed update/install aborts under `set -e` (Phases 2/6); called in
+# a condition (`apt_install pkg || warn …`), failures are the caller's to
+# handle and APT_CHANGED stays unset (the && short-circuit).
+# Usage: apt_install <package|deb-path>...
+apt_install() {
+    apt_update_once
+    sudo apt-get install -y "$@" && APT_CHANGED=1
+}
+
+# True when a bun-installed global binary is present. bun globals are symlinks
+# into the package store; -x follows the link, so a dangling symlink (stale
+# lockfile / pruned store) would read as absent and re-trigger installs — -L
+# keeps detection stable. Usage: bun_global_present <binary-name>
+bun_global_present() {
+    [ -L "${HOME}/.bun/bin/$1" ] || [ -x "${HOME}/.bun/bin/$1" ]
+}
+
 #############################################################################
 # Logging
 #############################################################################
@@ -79,36 +111,52 @@ warn() {
 # Resilient script installer
 #############################################################################
 
-# Download a remote shell installer to a temp file and run it, with retries.
-# Avoids the `curl | sh` silent-failure trap: in a pipe the exit status is the
-# interpreter's, not curl's, so a transient 403/network blip yields an empty
-# script the shell no-ops over — the tool then silently never installs and a
-# later step fails with a confusing "<tool>: not found". Downloading to a file
-# lets us check curl's real exit + a non-empty body, retry, then run it (stdin
-# closed, non-interactive). Returns 0 if the installer ran (its own non-zero exit
-# is warned, not fatal), 1 if the download failed after all attempts. Callers
-# verify the resulting binary themselves.
-# Usage: download_and_run <url> <label> [interpreter]   (interpreter defaults to bash)
-download_and_run() {
-    local url="$1" label="$2" interp="${3:-bash}"
-    local tmp attempt
+# Download <url> to <dest> with retries and a non-empty check. Avoids the
+# silent-failure trap of a bare `curl -o` / `curl | sh`: a transient
+# 403/network blip yields an empty or missing file a later step trips over
+# with a confusing error. Checks curl's real exit + a non-empty body, retries
+# twice. Returns 1 after 3 failed attempts (caller owns <dest> cleanup either
+# way). Warns go to stdout like every other message — do NOT call this inside
+# a $(...) capture.
+# Usage: download_to_file <url> <dest> <label>
+download_to_file() {
+    local url="$1" dest="$2" label="$3" attempt
     # Present a modern browser User-Agent: installer CDNs (e.g. claude.ai behind
     # Cloudflare) return 403 for non-browser/odd UAs. -A also overrides any curlrc UA
     # on the command line (curl_secure already passes -q; this is belt-and-suspenders).
     local ua="Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0"
-    tmp="$(mktemp)"
+    # Bound each attempt: --connect-timeout caps a blackholed connect (without
+    # it, 3 attempts on a firewalled box hang for minutes each); --speed-limit/
+    # --speed-time abort a stalled transfer without capping legitimately slow
+    # but progressing downloads (the Obsidian .deb is ~100MB).
     for attempt in 1 2 3; do
-        if curl_secure -fsSL -A "$ua" "$url" -o "$tmp" && [ -s "$tmp" ]; then
-            "$interp" "$tmp" </dev/null || warn "$label installer exited non-zero"
-            rm -f "$tmp"
+        if curl_secure -fsSL -A "$ua" --connect-timeout 15 --speed-limit 1024 --speed-time 60 \
+                "$url" -o "$dest" && [ -s "$dest" ]; then
             return 0
         fi
         if [ "$attempt" -lt 3 ]; then
-            warn "$label installer download failed (attempt ${attempt}/3) — retrying in 5s..."
+            warn "$label download failed (attempt ${attempt}/3) — retrying in 5s..."
             sleep 5
         fi
     done
-    warn "Could not download $label installer from $url after 3 attempts"
+    warn "Could not download $label from $url after 3 attempts"
+    return 1
+}
+
+# Download a remote shell installer to a temp file and run it (stdin closed,
+# non-interactive). Returns 0 if the installer ran (its own non-zero exit is
+# warned, not fatal), 1 if the download failed after all attempts. Callers
+# verify the resulting binary themselves.
+# Usage: download_and_run <url> <label> [interpreter]   (interpreter defaults to bash)
+download_and_run() {
+    local url="$1" label="$2" interp="${3:-bash}"
+    local tmp
+    tmp="$(mktemp)"
+    if download_to_file "$url" "$tmp" "$label installer"; then
+        "$interp" "$tmp" </dev/null || warn "$label installer exited non-zero"
+        rm -f "$tmp"
+        return 0
+    fi
     rm -f "$tmp"
     return 1
 }
@@ -183,7 +231,7 @@ read_profile_export() {
     local profile_file line
     for profile_file in "${PROFILE_FILES[@]}"; do
         [ -f "$profile_file" ] || continue
-        line=$(grep "^export ${var_name}=" "$profile_file" 2>/dev/null | head -1) || continue
+        line=$(grep "^export ${var_name}=" "$profile_file" 2>/dev/null | head -1)
         [ -z "$line" ] && continue
         local value="${line#export ${var_name}=\"}"
         value="${value%\"}"
@@ -278,14 +326,13 @@ collect_litellm_provider_vars() {
         val="${profile[$v]}"
         [ -z "$val" ] && continue
         printf '%s=%s\n' "$v" "$val"
-        seen[$v]=1
     done
 }
 
-# Ensure a PATH line exists in a file (idempotent append). Defaults to ~/.profile.
+# Ensure a PATH line exists in ~/.profile (idempotent append).
 ensure_path_in_profile() {
     local line="$1"
-    local file="${2:-${HOME}/.profile}"
+    local file="${HOME}/.profile"
 
     ensure_managed_bash_profile
     [ ! -f "$file" ] && touch "$file"
@@ -331,16 +378,28 @@ SHIM
 # AppArmor (for bwrap sandbox used by Claude Code)
 #############################################################################
 
+# True when unprivileged user namespaces are AppArmor-restricted and no bwrap
+# profile exists yet — the state configure_bwrap_apparmor fixes and the
+# rootless-Docker preflight in install_docker_rootless warns about. A missing
+# sysctl file reads as empty (≠ "1"), i.e. not restricted.
+apparmor_userns_restricted() {
+    [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null)" = "1" ] \
+        && [ ! -f /etc/apparmor.d/bwrap ]
+}
+
 # Newer kernels restrict unprivileged user namespaces via AppArmor by default,
 # which breaks bwrap sandboxing. Idempotent: only creates profile if absent.
 configure_bwrap_apparmor() {
-    if command -v apparmor_parser &> /dev/null && \
-       [ -d /sys/module/apparmor ] && \
-       [ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ] && \
-       [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns)" = "1" ] && \
-       [ ! -f /etc/apparmor.d/bwrap ]; then
-        log "Configuring AppArmor profile for bwrap..."
-        if sudo tee /etc/apparmor.d/bwrap > /dev/null <<'APPARMOR'
+    # The extra guards beyond the predicate check we can actually write + load
+    # a profile here (parser present, AppArmor module loaded).
+    if ! command -v apparmor_parser &> /dev/null \
+        || [ ! -d /sys/module/apparmor ] \
+        || ! apparmor_userns_restricted; then
+        log "AppArmor bwrap profile already configured or not needed"
+        return 0
+    fi
+    log "Configuring AppArmor profile for bwrap..."
+    if sudo tee /etc/apparmor.d/bwrap > /dev/null <<'APPARMOR'
 abi <abi/4.0>,
 include <tunables/global>
 
@@ -350,13 +409,10 @@ profile bwrap /usr/bin/bwrap flags=(unconfined) {
   include if exists <local/bwrap>
 }
 APPARMOR
-        then
-            sudo apparmor_parser -r /etc/apparmor.d/bwrap || warn "Failed to load AppArmor bwrap profile"
-        else
-            warn "Failed to write AppArmor bwrap profile"
-        fi
+    then
+        sudo apparmor_parser -r /etc/apparmor.d/bwrap || warn "Failed to load AppArmor bwrap profile"
     else
-        log "AppArmor bwrap profile already configured or not needed"
+        warn "Failed to write AppArmor bwrap profile"
     fi
 }
 
@@ -398,12 +454,14 @@ install_docker_rootless() {
 
     if [ "$need_engine" = true ] || [ "$need_rootless_deps" = true ]; then
         log "Installing Docker CE / rootless deps (official apt repo)..."
-        # Tell setup.sh Phase 11 apt state changed (autoremove gate).
-        APT_CHANGED=1
 
         # Remove conflicting/old packages only when installing the engine fresh
         # (ignore failures — they may be absent); never touch a working engine.
         if [ "$need_engine" = true ]; then
+            # Removes change apt state too (they can strand autoremovable deps)
+            # — flag Phase 11's autoremove gate directly; the installs below
+            # set it via apt_install.
+            APT_CHANGED=1
             for pkg in docker.io docker-doc docker-compose docker-compose-v2 podman-docker containerd runc; do
                 sudo apt-get remove -y "$pkg" 2>/dev/null || true
             done
@@ -448,16 +506,22 @@ install_docker_rootless() {
         # install root-owned.
         local gpg_tmp
         gpg_tmp=$(mktemp)
-        curl_secure -fsSL "https://download.docker.com/linux/${docker_distro}/gpg" -o "$gpg_tmp"
+        # Bare call: a download failure (after retries) aborts under `set -e` —
+        # without the key the repo below is unusable anyway.
+        download_to_file "https://download.docker.com/linux/${docker_distro}/gpg" "$gpg_tmp" "Docker GPG key"
         sudo install -m 0755 -d /etc/apt/keyrings
         sudo install -m 0644 "$gpg_tmp" /etc/apt/keyrings/docker.asc
         rm -f "$gpg_tmp"
         echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/${docker_distro} ${docker_codename} stable" \
             | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
 
+        # Explicit update (not apt_update_once): the Docker repo was just added,
+        # so the index must be refreshed even if another phase already did.
+        # Re-mark it fresh so a later apt_install this run can skip its update.
         sudo apt-get update
+        APT_INDEX_FRESH=1
         if [ "$need_engine" = true ]; then
-            sudo apt-get install -y \
+            apt_install \
                 docker-ce docker-ce-cli containerd.io \
                 docker-buildx-plugin
         fi
@@ -469,7 +533,7 @@ install_docker_rootless() {
         # Always (re)installed — a pre-existing engine may predate them (rootless
         # setuptool's "Missing system requirements … uidmap" abort, or a docker.io
         # host with no `docker compose` at all); apt is a no-op for any present.
-        sudo apt-get install -y \
+        apt_install \
             docker-ce-rootless-extras uidmap slirp4netns dbus-user-session docker-compose-plugin
     else
         log "Docker + rootless deps already installed — skipping apt install"
@@ -485,9 +549,7 @@ install_docker_rootless() {
     # Rootless prerequisite: unprivileged user namespaces (same kernel feature
     # bwrap/`/sandbox` uses). If AppArmor restricts them and the bwrap profile
     # isn't in place, warn — configure_bwrap_apparmor (Phase 2) usually clears it.
-    if [ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ] && \
-       [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null)" = "1" ] && \
-       [ ! -f /etc/apparmor.d/bwrap ]; then
+    if apparmor_userns_restricted; then
         warn "Unprivileged user namespaces are AppArmor-restricted — rootless Docker may fail to start."
         warn "  configure_bwrap_apparmor (Phase 2) usually clears this; otherwise see"
         warn "  https://docs.docker.com/engine/security/rootless/#prerequisites"
@@ -585,8 +647,9 @@ wait_for_litellm() {
 # Config file deployment
 #############################################################################
 
-# Deploy a config file with permissions. Only copies when content differs,
-# so mtime is preserved on no-op runs (mode/owner are always re-applied).
+# Deploy a config file with permissions. Delegates the content-aware (and
+# atomic) write to write_if_changed, so mtime is preserved on no-op runs;
+# mode/owner are always re-applied.
 # Usage: deploy_config source dest [mode] [owner]
 deploy_config() {
     local source="$1"
@@ -594,10 +657,9 @@ deploy_config() {
     local mode="${3:-644}"
     local owner="${4:-${USER}:${USER}}"
 
-    mkdir -p "$(dirname "$dest")"
-    if [ ! -f "$dest" ] || ! cmp -s "$source" "$dest"; then
-        cp "$source" "$dest"
-    fi
+    # || true: write_if_changed returns 1 on unchanged content, which must not
+    # abort the script under `set -e`.
+    write_if_changed "$dest" < "$source" || true
     chmod "$mode" "$dest"
     # chown only works if we're root or we own the file already; ignore failures.
     chown "$owner" "$dest" 2>/dev/null || true

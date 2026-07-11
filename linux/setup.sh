@@ -23,6 +23,12 @@
 
 set -e
 
+# Deterministic tool output for the parsing below (dpkg-query, pg_lsclusters,
+# git, loginctl) on non-English-locale boxes. Script-internal only — never
+# written to ~/.profile, so the user's interactive locale is untouched.
+# C.UTF-8 is built into glibc on Debian/Kali. Mirrors /opt/linux-setup.
+export LC_ALL=C.UTF-8 LANG=C.UTF-8
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(dirname "$SCRIPT_DIR")"
 
@@ -209,6 +215,17 @@ LITELLM_CONFIG_FILE="${LITELLM_CONFIG_DIR}/config.yaml"
 # Rootless Docker daemon socket (used by the --docker paths in Phase 7).
 DOCKER_SOCK="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/docker.sock"
 
+# docker against the rootless daemon — keeps the DOCKER_HOST pinning (rootless
+# socket, not the default CLI context) in one place. Used by the --docker paths
+# in Phase 7.
+rootless_docker() {
+    DOCKER_HOST="unix://${DOCKER_SOCK}" docker "$@"
+}
+# docker compose against the deployed compose file.
+litellm_compose() {
+    rootless_docker compose -f "${LITELLM_CONFIG_DIR}/docker-compose.yml" "$@"
+}
+
 # Claude Code presence — the installer usually puts `claude` on PATH, but a
 # fresh install in this same run may only exist at ~/.local/bin yet.
 have_claude() {
@@ -248,18 +265,17 @@ APT_PACKAGES="$APT_PACKAGES bubblewrap socat ripgrep"
 
 export DEBIAN_FRONTEND=noninteractive
 # Skip the apt round-trip when every package is already installed — the common
-# case on a re-run. Phases that apt-install later (2b, 4d, 6) run their own
-# `apt-get update` where needed and set APT_CHANGED (initialized in common.sh)
-# so Phase 11's autoremove still fires.
+# case on a re-run. Later apt installs (2b, 4d, 6) go through apt_install in
+# common.sh: the index is refreshed at most once per run (2b forces its own
+# re-index after adding the Docker repo) and APT_CHANGED feeds Phase 11's
+# autoremove gate.
 apt_missing=""
 for pkg in $APT_PACKAGES; do
     pkg_installed "$pkg" || apt_missing="$apt_missing $pkg"
 done
 if [ -n "$apt_missing" ]; then
-    sudo apt-get update
     # shellcheck disable=SC2086
-    sudo apt-get install -y $apt_missing
-    APT_CHANGED=1
+    apt_install $apt_missing
     log "System packages installed:$apt_missing"
 else
     log "System packages already installed: $APT_PACKAGES"
@@ -339,7 +355,7 @@ NPX_EOF
 fi
 
 # Ensure PATH entry for bun + uv in profile (idempotent)
-ensure_path_in_profile 'export PATH="$HOME/.bun/bin:$HOME/.local/bin:$PATH"' "${HOME}/.profile"
+ensure_path_in_profile 'export PATH="$HOME/.bun/bin:$HOME/.local/bin:$PATH"'
 
 # Source PATH for the rest of this script
 export PATH="${HOME}/.bun/bin:${HOME}/.local/bin:${PATH}"
@@ -364,6 +380,12 @@ log "=== Phase 4: Tools ==="
 # (1.83.1+).
 LITELLM_BIN="${HOME}/.local/bin/litellm"
 
+# uv tool list's version column for litellm — read before/after the upgrade to
+# gate the Prisma client regen on a real version change.
+litellm_tool_version() {
+    uv tool list 2>/dev/null | awk '$1=="litellm"{print $2; exit}'
+}
+
 # Skipped under --docker: the ghcr.io/berriai/litellm image already bundles
 # LiteLLM + a generated Prisma client, so neither the uv tool install nor the
 # `prisma generate` step below is needed. Skipped under --install-only too (that
@@ -378,7 +400,7 @@ if [ "$WITH_LOCAL_LITELLM" = "true" ] && [ "$DOCKER_MODE" != "true" ]; then
         # (re)start in the systemd step below loads the new version; the Prisma client
         # is force-regenerated against the (possibly new) schema only when the version
         # ACTUALLY changed — see LITELLM_UPGRADED below.
-        litellm_ver_before="$(uv tool list 2>/dev/null | awk '$1=="litellm"{print $2; exit}')"
+        litellm_ver_before="$(litellm_tool_version)"
         log "LiteLLM present at $LITELLM_BIN (${litellm_ver_before:-unknown}) — upgrading (re-asserts >=1.84.0 floor)..."
         if uv tool install --upgrade --with prisma "$LITELLM_SPEC"; then
             # `uv tool install --upgrade` returns 0 even on a no-op (already at the
@@ -387,7 +409,7 @@ if [ "$WITH_LOCAL_LITELLM" = "true" ] && [ "$DOCKER_MODE" != "true" ]; then
             # was dead). Gate on a real version change instead. If either version
             # read is empty (parse failed / format changed), fall back to
             # regenerating — the safe choice.
-            litellm_ver_after="$(uv tool list 2>/dev/null | awk '$1=="litellm"{print $2; exit}')"
+            litellm_ver_after="$(litellm_tool_version)"
             if [ "$litellm_ver_before" != "$litellm_ver_after" ]; then
                 LITELLM_UPGRADED=1
                 log "LiteLLM upgraded ${litellm_ver_before:-?} -> ${litellm_ver_after:-?}"
@@ -478,7 +500,7 @@ fi
 # the ACP bridge exists to drive Claude Code from editors like Obsidian.
 if [ "$INSTALL_OBSIDIAN" = "true" ]; then
     ACP_PACKAGE="@agentclientprotocol/claude-agent-acp"
-    if [ -L "${HOME}/.bun/bin/claude-agent-acp" ] || [ -x "${HOME}/.bun/bin/claude-agent-acp" ]; then
+    if bun_global_present claude-agent-acp; then
         log "ACP adapter already installed — skipping"
     else
         log "Installing ACP adapter (${ACP_PACKAGE})..."
@@ -506,18 +528,11 @@ if [ "$INSTALL_OBSIDIAN" = "true" ]; then
             warn "Could not create temp file for Obsidian download — skipping"
         else
             log "Downloading Obsidian: $OBSIDIAN_DEB_URL"
-            if curl_secure -fsSL -o "$OBSIDIAN_DEB" "$OBSIDIAN_DEB_URL"; then
-                # Refresh the index first: Phase 2 skips its apt-get update when
-                # nothing is missing, and installing a .deb still resolves its
-                # dependencies from the (possibly stale) index.
-                sudo apt-get update || true
-                if sudo apt-get install -y "$OBSIDIAN_DEB"; then
-                    APT_CHANGED=1
-                else
-                    warn "Obsidian install failed, continuing"
-                fi
-            else
-                warn "Obsidian download failed, continuing"
+            # apt_install refreshes the index (once per run) before installing —
+            # a .deb still resolves its dependencies from the apt index. In this
+            # `||` condition failures stay non-fatal, as this block intends.
+            if download_to_file "$OBSIDIAN_DEB_URL" "$OBSIDIAN_DEB" "Obsidian"; then
+                apt_install "$OBSIDIAN_DEB" || warn "Obsidian install failed, continuing"
             fi
             rm -f "$OBSIDIAN_DEB"
         fi
@@ -537,8 +552,8 @@ log "Installing/updating blaude (sandbox wrapper)..."
 mkdir -p "${HOME}/.local/bin"
 if ! BLAUDE_TMP="$(mktemp)"; then
     warn "Could not create temp file for blaude download — skipping"
-elif curl_secure -fsSL -o "$BLAUDE_TMP" "$BLAUDE_URL" \
-        && [ -s "$BLAUDE_TMP" ] && head -n1 "$BLAUDE_TMP" | grep -q '^#!'; then
+elif download_to_file "$BLAUDE_URL" "$BLAUDE_TMP" "blaude" \
+        && head -n1 "$BLAUDE_TMP" | grep -q '^#!'; then
     # Atomic replace via write_if_changed: an existing working blaude is only
     # clobbered once the new copy is fully downloaded + sanity-checked
     # (non-empty, has a shebang), and an unchanged upstream leaves the binary
@@ -552,8 +567,9 @@ elif curl_secure -fsSL -o "$BLAUDE_TMP" "$BLAUDE_URL" \
 else
     warn "blaude download failed or invalid — keeping existing version"
 fi
-# Single cleanup point: drop the temp file unless a successful mv already
-# consumed it. Guarded so the mktemp-failure branch (empty var) is a no-op.
+# Single cleanup point: write_if_changed copies stdin into its own temp file
+# and never consumes this one, so the rm is needed on every path. Guarded so
+# the mktemp-failure branch (empty var) is a no-op.
 [ -n "${BLAUDE_TMP:-}" ] && rm -f "$BLAUDE_TMP"
 
 log "Tools phase complete"
@@ -583,19 +599,6 @@ fi
 # These are the single source of truth for Claude Code's connection to LiteLLM —
 # managed-settings.json no longer carries ANTHROPIC_BASE_URL/AUTH_TOKEN.
 
-# Preserve the auto-generated DB password and any manual UI_USERNAME /
-# UI_PASSWORD overrides (.env.example documents setting those by hand) across
-# reruns — Phase 6 regenerates the env file wholesale, and the provider-var
-# collector deliberately excludes UI_*. Selective greps rather than
-# `source $LITELLM_ENV_FILE` because the latter would let stale provider
-# secrets in the env file shadow fresh values from .env.
-PERSISTED_DB_PASSWORD=""
-PERSISTED_UI_LINES=""
-if [ -f "$LITELLM_ENV_FILE" ]; then
-    PERSISTED_DB_PASSWORD="$(grep '^LITELLM_DB_PASSWORD=' "$LITELLM_ENV_FILE" 2>/dev/null | cut -d= -f2-)"
-    PERSISTED_UI_LINES="$(grep -E '^UI_(USERNAME|PASSWORD)=' "$LITELLM_ENV_FILE" 2>/dev/null || true)"
-fi
-
 # Master key resolution. LiteLLM requires a master key starting with "sk-" for
 # the unified /v1/messages endpoint. Order of precedence:
 #   1. ANTHROPIC_AUTH_TOKEN from .env (user-managed)
@@ -621,6 +624,7 @@ update_profile_export "VSCODE_TELEMETRY_DISABLE" "1"
 update_profile_export "VSCODE_CRASH_REPORTER_DISABLE" "1"
 update_profile_export "DOTNET_CLI_TELEMETRY_OPTOUT"   "1"
 update_profile_export "POWERSHELL_TELEMETRY_OPTOUT"   "1"
+update_profile_export "AZURE_CORE_COLLECT_TELEMETRY"  "0"
 update_profile_export "HF_HUB_DISABLE_TELEMETRY"      "1"
 update_profile_export "PYPI_DISABLE_TELEMETRY"        "1"
 update_profile_export "UV_NO_TELEMETRY"               "1"
@@ -639,19 +643,24 @@ else
     remove_profile_export "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"
 fi
 
-# Claude Code feature/privacy toggles. Also duplicated in managed-settings'
-# env: block for full/harden modes; written here as well so they apply under
-# --router-only (no managed-settings install) and reach subprocesses spawned
-# by Claude Code. Grouped to mirror the managed-settings ordering.
-update_profile_export "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC" "1"
-update_profile_export "DISABLE_TELEMETRY"                        "1"
-update_profile_export "DISABLE_ERROR_REPORTING"                  "1"
-
-update_profile_export "DISABLE_FEEDBACK_COMMAND"                 "1"
-update_profile_export "DISABLE_INSTALL_GITHUB_APP_COMMAND"       "1"
-
-update_profile_export "ENABLE_CLAUDEAI_MCP_SERVERS"              "false"
-update_profile_export "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"   "1"
+# Claude Code feature/privacy toggles — single-sourced from the managed-settings
+# template's env: block (the authoritative policy artifact), so full/harden
+# (managed file) and --router-only (~/.profile only) can't drift apart on adds
+# or value edits. Mirrored into ~/.profile in every mode so they also reach
+# subprocesses spawned by Claude Code. Anything added to that env: block lands
+# here automatically — but the mirror only ACCUMULATES: when retiring a toggle
+# from the env: block, also add a remove_profile_export scrub (the IS_DEMO
+# pattern below) or every deployed ~/.profile keeps exporting it. The
+# `VAR=$(jq …)` form aborts under `set -e` if the template is missing/invalid
+# (repo-owned — fail loudly, not with silently-missing toggles).
+managed_env_toggles="$(jq -r '.env | to_entries[] | "\(.key)=\(.value)"' "$SCRIPT_DIR/configs/claude-managed-settings.json")"
+if [ -z "$managed_env_toggles" ]; then
+    error "No env toggles found in claude-managed-settings.json — refusing to continue with an empty policy env block"
+    exit 1
+fi
+while IFS='=' read -r toggle_var toggle_val; do
+    update_profile_export "$toggle_var" "$toggle_val"
+done <<< "$managed_env_toggles"
 
 # Non-hardening toggles
 update_profile_export "CLAUDE_CODE_ATTRIBUTION_HEADER"           "0"
@@ -782,17 +791,26 @@ LITELLM_CHANGED="${LITELLM_UPGRADED:-0}"
 if [ "$WITH_LOCAL_LITELLM" = "true" ]; then
     log "=== Phase 6: Postgres ==="
 
+    # Preserve the auto-generated DB password and any manual UI_USERNAME /
+    # UI_PASSWORD overrides (.env.example documents setting those by hand)
+    # across reruns — this phase regenerates the env file wholesale below, and
+    # the provider-var collector deliberately excludes UI_*. Selective greps
+    # rather than `source $LITELLM_ENV_FILE` because the latter would let stale
+    # provider secrets in the env file shadow fresh values from .env.
+    PERSISTED_DB_PASSWORD=""
+    PERSISTED_UI_LINES=""
+    if [ -f "$LITELLM_ENV_FILE" ]; then
+        PERSISTED_DB_PASSWORD="$(grep '^LITELLM_DB_PASSWORD=' "$LITELLM_ENV_FILE" 2>/dev/null | cut -d= -f2-)"
+        PERSISTED_UI_LINES="$(grep -E '^UI_(USERNAME|PASSWORD)=' "$LITELLM_ENV_FILE" 2>/dev/null || true)"
+    fi
+
     if [ -n "${DATABASE_URL:-}" ] && [[ "${DATABASE_URL}" != postgresql://litellm:*@127.0.0.1:* ]]; then
         log "DATABASE_URL set externally — skipping local Postgres install"
         LITELLM_DB_URL="$DATABASE_URL"
     else
         if ! command -v psql &>/dev/null; then
             log "Installing postgresql via apt..."
-            # Phase 2 skips its apt-get update when nothing was missing there;
-            # refresh before this one-time install so it doesn't hit a stale index.
-            sudo apt-get update
-            sudo apt-get install -y postgresql
-            APT_CHANGED=1
+            apt_install postgresql
         fi
         # Pick the cluster LiteLLM actually uses. Both the bootstrap below
         # (`sudo -u postgres psql`, via pg_wrapper) and the runtime DATABASE_URL
@@ -869,7 +887,7 @@ if [ "$WITH_LOCAL_LITELLM" = "true" ]; then
     LITELLM_ENV_CONTENT+="STORE_MODEL_IN_DB=True"$'\n'
     [ -n "${LITELLM_DB_PASSWORD:-}" ] && LITELLM_ENV_CONTENT+="LITELLM_DB_PASSWORD=${LITELLM_DB_PASSWORD}"$'\n'
     # Manual UI_USERNAME / UI_PASSWORD overrides survive the wholesale rewrite
-    # (grepped from the previous env file in Phase 5a).
+    # (grepped from the previous env file at the top of this phase).
     [ -n "$PERSISTED_UI_LINES" ] && LITELLM_ENV_CONTENT+="${PERSISTED_UI_LINES}"$'\n'
 
     # --docker only: ~/.config/litellm/env is parsed by BOTH systemd
@@ -937,8 +955,7 @@ if [ "$WITH_LOCAL_LITELLM" = "true" ]; then
             # project down directly, independent of the unit state. Idempotent; if
             # the daemon/socket is down there's no running container to orphan.
             if [ "$installed_litellm_variant" = "docker" ] && [ -f "${LITELLM_CONFIG_DIR}/docker-compose.yml" ]; then
-                DOCKER_HOST="unix://${DOCKER_SOCK}" \
-                    docker compose -f "${LITELLM_CONFIG_DIR}/docker-compose.yml" down --remove-orphans 2>/dev/null || true
+                litellm_compose down --remove-orphans 2>/dev/null || true
             fi
         fi
     fi
@@ -965,12 +982,19 @@ if [ "$WITH_LOCAL_LITELLM" = "true" ]; then
         # Pre-pull the image in the foreground (visible progress) so the unit
         # start below is fast and wait_for_litellm's 90s window isn't eaten by a
         # ~367MB first-run download — the unit's ExecStartPre would otherwise pull
-        # silently while we poll. On re-runs with the image cached this is a quick
-        # "up to date" check. Talks to the rootless daemon started in Phase 2b.
-        log "Pulling LiteLLM image (first run downloads ~367MB; cached afterwards)..."
-        DOCKER_HOST="unix://${DOCKER_SOCK}" \
-            docker compose -f "${LITELLM_CONFIG_DIR}/docker-compose.yml" pull \
-            || warn "docker compose pull failed — the unit will retry via ExecStartPre on start"
+        # silently while we poll. The image tag is pinned, so once cached there is
+        # nothing to fetch — skip the registry round-trip entirely (a tag bump
+        # changes the rendered compose, the inspect misses, and the pull fires).
+        # Talks to the rootless daemon started in Phase 2b.
+        compose_image=$(awk '/^[[:space:]]*image:/{print $2; exit}' "${LITELLM_CONFIG_DIR}/docker-compose.yml")
+        if [ -n "$compose_image" ] \
+            && rootless_docker image inspect "$compose_image" &>/dev/null; then
+            log "LiteLLM image ${compose_image} already cached — skipping pull"
+        else
+            log "Pulling LiteLLM image (first run downloads ~367MB; cached afterwards)..."
+            litellm_compose pull \
+                || warn "docker compose pull failed — the unit will retry via ExecStartPre on start"
+        fi
     else
         if deploy_user_systemd_service litellm "$SCRIPT_DIR/systemd/litellm.service" \
             -e "s|__LITELLM_BIN__|${LITELLM_BIN}|g" \
@@ -1103,9 +1127,9 @@ if [ "$WITH_POLICY" = "true" ] && have_claude; then
     #      forever (it has already printed "Successfully installed", so the
     #      on-disk action is done). The read-only calls dodge this for free by
     #      piping stdout into tr|sed|jq — a pipe is not a tty, so isTTY is
-    #      false and claude stays non-interactive. The mutating calls must do
-    #      the same: wrap in `$(... 2>&1)` so stdout/stderr are pipes, not the
-    #      terminal. Output is captured and surfaced only on failure.
+    #      false and claude stays non-interactive. The mutating calls get the
+    #      same via claude_mutate below ($(... 2>&1) capture makes stdout/stderr
+    #      pipes, not the terminal); output is surfaced only on failure.
     #   2. timeout signal escalation (belt-and-suspenders). Plain `timeout N`
     #      sends only SIGTERM then waits for the child; a Node process that
     #      traps it or keeps a handle open is never killed and timeout waits
@@ -1126,6 +1150,19 @@ if [ "$WITH_POLICY" = "true" ] && have_claude; then
         timeout -k 15 60 claude "$@" --json </dev/null 2>/dev/null \
             | tr -d '\r' \
             | sed -n '/^\[/,/^\]/p'
+    }
+
+    # The mutating plugin calls below share the same hazards; this wrapper bakes
+    # in all three guards (stdin closed, stderr folded into stdout for the
+    # caller's $(...) capture, timeout with SIGKILL escalation) so a call site
+    # can't silently drop one and reintroduce the tty-probe wedge. Scoped to
+    # this WITH_POLICY block like claude_plugin_json — hoist both to the
+    # top-level helper section if another phase ever needs them.
+    # Usage: out=$(claude_mutate <secs> <claude-args…>)
+    claude_mutate() {
+        local secs="$1"
+        shift
+        timeout -k 15 "$secs" claude "$@" </dev/null 2>&1
     }
 
     # Plugin state first — the steady state (installed + enabled) then costs a
@@ -1189,10 +1226,8 @@ if [ "$WITH_POLICY" = "true" ] && have_claude; then
                 # bare `manuelschipper/nah` form fails with "marketplace.json not found".
                 # The .repo field in `claude plugin marketplace list --json` drops the
                 # ref suffix, so the idempotency selector above still matches.
-                # $(... 2>&1) keeps stdout/stderr off the tty (hazard 1 above) so the
-                # add doesn't block on terminal-capability probes; if-condition form is
-                # set -e-safe (substitution failure doesn't abort the script).
-                if nah_add_out=$(timeout -k 15 180 claude plugin marketplace add manuelschipper/nah@claude-marketplace </dev/null 2>&1); then
+                # if-condition form is set -e-safe (a failure doesn't abort the script).
+                if nah_add_out=$(claude_mutate 180 plugin marketplace add manuelschipper/nah@claude-marketplace); then
                     nah_marketplace_ok=1
                 else
                     warn "Failed to add nah marketplace — try 'claude update' (the 'plugin' subcommand may be missing in older Claude Code). Output: ${nah_add_out}"
@@ -1203,14 +1238,14 @@ if [ "$WITH_POLICY" = "true" ] && have_claude; then
             # the install call is guaranteed to fail with a less informative error.
             if [ "$nah_marketplace_ok" = "1" ]; then
                 log "Installing nah Claude Code plugin..."
-                if nah_install_out=$(timeout -k 15 180 claude plugin install nah@nah --scope user </dev/null 2>&1); then
+                if nah_install_out=$(claude_mutate 180 plugin install nah@nah --scope user); then
                     log "nah plugin installed"
                     # install enables by default; assert it on first install so a
                     # fresh box ends up enabled regardless of build behaviour. A
                     # benign "already enabled" error here is expected and ignored.
                     # We do this ONLY on first install — never in the `false`
                     # branch, where a disabled plugin is the user's choice.
-                    timeout -k 15 60 claude plugin enable nah@nah --scope user </dev/null >/dev/null 2>&1 || true
+                    claude_mutate 60 plugin enable nah@nah --scope user >/dev/null || true
                 else
                     warn "Failed to install nah plugin — try 'claude plugin marketplace list' to confirm marketplace registration. Output: ${nah_install_out}"
                 fi
@@ -1230,6 +1265,9 @@ log "Claude Code settings deployed"
 
 CLAUDE_DEVTOOLS_DEPLOYED=0
 CLAUDE_DEVTOOLS_RAM_OK=0
+# Set when the build or the unit file actually changed — gates the service
+# restart below (mirrors LITELLM_CHANGED in Phase 7).
+CLAUDE_DEVTOOLS_CHANGED=0
 if [ "$HARDEN_ONLY" != "true" ]; then
     # RAM gate: vite's renderer build (mermaid + react + dnd-kit, 4333 modules)
     # peaks at ~3-4 GB RSS and gets OOM-killed on smaller boxes. Floor is 3.5 GB
@@ -1261,7 +1299,7 @@ if [ "$CLAUDE_DEVTOOLS_RAM_OK" = "1" ]; then
     # package.json's `packageManager` field, ships a pnpm-lock.yaml, and is a
     # pnpm workspace. Bun mis-handles all three. Bun stays as the *runtime*
     # (systemd service still does `bun run dist-standalone/index.cjs`).
-    if [ -L "$CLAUDE_DEVTOOLS_PNPM" ] || [ -x "$CLAUDE_DEVTOOLS_PNPM" ]; then
+    if bun_global_present pnpm; then
         log "pnpm already installed — skipping"
     else
         log "Installing pnpm (build-time dep of claude-devtools)..."
@@ -1331,6 +1369,7 @@ if [ "$CLAUDE_DEVTOOLS_RAM_OK" = "1" ]; then
                     # the whole script here, skipping the service deploy below
                     # plus Phases 10-11 and every end-of-run banner.
                     echo "$CLAUDE_DEVTOOLS_LATEST_TAG" | write_if_changed "$CLAUDE_DEVTOOLS_STAMP" || true
+                    CLAUDE_DEVTOOLS_CHANGED=1
                     log "claude-devtools built successfully at $CLAUDE_DEVTOOLS_LATEST_TAG"
                 fi
             fi
@@ -1338,18 +1377,30 @@ if [ "$CLAUDE_DEVTOOLS_RAM_OK" = "1" ]; then
     fi
 
     if [ -f "$CLAUDE_DEVTOOLS_BUILD" ]; then
-        deploy_user_systemd_service claude-devtools "$SCRIPT_DIR/systemd/claude-devtools.service" \
+        if deploy_user_systemd_service claude-devtools "$SCRIPT_DIR/systemd/claude-devtools.service" \
             -e "s|__CLAUDE_DEVTOOLS_DIR__|${CLAUDE_DEVTOOLS_DIR}|g" \
             -e "s|__CLAUDE_DEVTOOLS_PORT__|${CLAUDE_DEVTOOLS_PORT}|g" \
             -e "s|__BUN_BIN__|${CLAUDE_DEVTOOLS_BUN}|g" \
             -e "s|__HOME__|${HOME}|g" \
-            -e "s|__PATH__|${USER_TOOL_PATH}|g" || true
+            -e "s|__PATH__|${USER_TOOL_PATH}|g"; then
+            CLAUDE_DEVTOOLS_CHANGED=1
+        fi
 
         systemctl --user enable claude-devtools &>/dev/null || true
-        if systemctl --user restart claude-devtools; then
-            CLAUDE_DEVTOOLS_DEPLOYED=1
+        # Restart only when the build or unit actually changed — mirrors the
+        # litellm gate in Phase 7 (a no-op re-run must not bounce the service
+        # and drop open DevTools UI sessions). `restart` also starts an
+        # inactive unit, so one branch covers both the changed and the
+        # not-running case.
+        if [ "$CLAUDE_DEVTOOLS_CHANGED" = "1" ] || ! systemctl --user is-active claude-devtools &>/dev/null; then
+            if systemctl --user restart claude-devtools; then
+                CLAUDE_DEVTOOLS_DEPLOYED=1
+            else
+                warn "Failed to start claude-devtools"
+            fi
         else
-            warn "Failed to start claude-devtools"
+            log "claude-devtools unchanged — service left running"
+            CLAUDE_DEVTOOLS_DEPLOYED=1
         fi
     else
         warn "claude-devtools build output missing — service deployment skipped"
@@ -1366,7 +1417,7 @@ fi
 # / full install on this host may have deployed them).
 LEGACY_HISTORY_SERVICE="${HOME}/.config/systemd/user/claude-history.service"
 LEGACY_CLAUDE_RUN_BIN="${HOME}/.bun/bin/claude-run"
-if [ -f "$LEGACY_HISTORY_SERVICE" ] || [ -L "$LEGACY_CLAUDE_RUN_BIN" ] || [ -x "$LEGACY_CLAUDE_RUN_BIN" ]; then
+if [ -f "$LEGACY_HISTORY_SERVICE" ] || bun_global_present claude-run; then
     log "=== Phase 10: removing legacy claude-run + claude-history service ==="
     if [ -f "$LEGACY_HISTORY_SERVICE" ]; then
         systemctl --user disable --now claude-history &>/dev/null || true
@@ -1374,7 +1425,7 @@ if [ -f "$LEGACY_HISTORY_SERVICE" ] || [ -L "$LEGACY_CLAUDE_RUN_BIN" ] || [ -x "
         systemctl --user daemon-reload &>/dev/null || true
         log "Removed claude-history.service"
     fi
-    if [ -L "$LEGACY_CLAUDE_RUN_BIN" ] || [ -x "$LEGACY_CLAUDE_RUN_BIN" ]; then
+    if bun_global_present claude-run; then
         log "Uninstalling claude-run (bun remove -g)..."
         bun remove -g claude-run &>/dev/null || true
         # Belt-and-braces: if bun left the symlink behind (stale lockfile), drop it.
@@ -1444,7 +1495,7 @@ if [ "$WITH_LOCAL_LITELLM" = "true" ] && [ -t 1 ]; then
     echo ""
 fi
 
-if [ "${NEEDS_MODEL_CONFIG:-0}" = "1" ] && [ -t 1 ]; then
+if [ "$NEEDS_MODEL_CONFIG" = "1" ] && [ -t 1 ]; then
     echo -e "${YELLOW}${rule}${NC}"
     echo -e "${YELLOW}  No Azure credentials in .env — setup completed, but Claude Code"
     echo -e "  has NO default model configured yet.${NC}"
@@ -1464,7 +1515,7 @@ if [ "${NEEDS_MODEL_CONFIG:-0}" = "1" ] && [ -t 1 ]; then
     echo ""
 fi
 
-if [ "${NEEDS_SANDBOX_BLOCK:-0}" = "1" ] && [ -t 1 ]; then
+if [ "$NEEDS_SANDBOX_BLOCK" = "1" ] && [ -t 1 ]; then
     echo -e "${YELLOW}${rule}${NC}"
     echo -e "${YELLOW}  ~/.claude/settings.json has no sandbox block — the statusline can't"
     echo -e "  detect the sandbox. Add it (keeps your other keys), then restart"
