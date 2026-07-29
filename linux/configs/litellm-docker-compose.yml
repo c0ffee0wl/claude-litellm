@@ -20,13 +20,23 @@ services:
     # (CLAUDE.md > "install-if-missing"). This uses LiteLLM's plain per-release
     # tag (vX.Y.Z), NOT the `-stable` channel: `-stable` tags are promoted later
     # and LAG (newest is v1.83.14-stable), so they can't match the native uv
-    # `>=1.84.0` floor. v1.86.3 satisfies that floor, clears the compromised
+    # `>=1.84.0` floor. v1.93.0 satisfies that floor, clears the compromised
     # 1.82.7/1.82.8, and carries the Responses-adapter support this setup relies
     # on for GPT-5.6 (the Anthropic /v1/messages -> Responses adapter honours
     # output_config.effort; the `openai/` route in litellm-config.yaml takes that
-    # adapter). Bump intentionally; verify the exact tag exists on ghcr.io first
+    # adapter). It is also what the native uv install resolves to under a 1-week
+    # dependency cooldown, so both runtimes track the same version.
+    #
+    # Bump intentionally, and prefer a tag that is (a) aged in past the cooldown,
+    # (b) git-tagged upstream, and (c) present on ghcr.io — the three can diverge.
+    # Counter-example seen at the v1.93.0 bump: 1.93.1 was on PyPI and ghcr.io but
+    # had NO upstream git tag (unauditable source) and shipped same-day, and it
+    # post-dates 1.94.0 (a backport lane, not mainline). Verify with:
+    #   T=$(curl -s "https://ghcr.io/token?scope=repository:berriai/litellm:pull" | jq -r .token)
+    #   curl -sI -H "Authorization: Bearer $T" \
+    #     https://ghcr.io/v2/berriai/litellm/manifests/vX.Y.Z
     # (a given version's `-stable` may not exist). ExecStartPre re-pulls on start.
-    image: ghcr.io/berriai/litellm:v1.86.3
+    image: ghcr.io/berriai/litellm:v1.93.0
     restart: unless-stopped
     # Publish to loopback only — same localhost-only exposure as the native unit
     # (which binds --host 127.0.0.1). The container itself listens on 0.0.0.0
