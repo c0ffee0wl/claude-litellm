@@ -375,9 +375,11 @@ log "=== Phase 4: Tools ==="
 # floor sits above the compromised 1.82.7/1.82.8 PyPI releases (credential-
 # stealing malware; see Anthropic's Claude Code LLM-gateway docs), so the old
 # explicit `!=` excludes are no longer needed. It also guarantees the reasoning
-# fixes this setup relies on for Azure GPT-5.4 thinking: the chat→Responses
-# auto-route (1.83.0+) and the output_config.effort→reasoning_effort mapping
-# (1.83.1+).
+# support this setup relies on for Azure GPT-5.6 thinking: the Anthropic
+# /v1/messages -> Responses adapter honours output_config.effort (verified present
+# at the 1.84.0 tag). The chat->Responses auto-route (1.83.0+) is no longer the
+# mechanism — the `openai/` route in litellm-config.yaml takes the dedicated
+# adapter instead. See CLAUDE.md > "Model naming" > "Why the openai/ route".
 LITELLM_BIN="${HOME}/.local/bin/litellm"
 
 # uv tool list's version column for litellm — read before/after the upgrade to
@@ -690,7 +692,7 @@ update_profile_export "CLAUDE_CODE_ATTRIBUTION_HEADER"           "0"
 #     `/fork` works without it (default v2.1.161+); the var additionally lets Claude
 #     auto-spawn forks and routes all subagent spawns to background (already the
 #     v2.1.198 default). Model-agnostic: the fork inherits the session's gateway id
-#     (azure/gpt-5.4) — no hardcoded claude-* id, no 404. Its advertised cost win
+#     (azure/gpt-5.6-terra) — no hardcoded claude-* id, no 404. Its advertised cost win
 #     (parent prompt-cache reuse) is Anthropic-cache-specific; over LiteLLM→Azure it
 #     degrades to a normal full-context request.
 update_profile_export "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"          "75"
@@ -713,20 +715,22 @@ remove_profile_export "IS_DEMO"
 #
 # The *_SUPPORTED_CAPABILITIES companions tell Claude Code which features the
 # pinned model supports. Claude Code's built-in detection only matches
-# claude-*/anthropic-* ids, so with upstream-prefixed ids like azure/gpt-5.4 it
-# would otherwise leave extended thinking + effort DISABLED (and never send a
-# thinking block). Values are tuned for Azure GPT-5.4: `xhigh_effort` is
-# included for the gpt-5.4 tiers (GPT-5.4 accepts reasoning_effort=xhigh —
-# Azure v1 API ref; surfacing it needs CC ≥2.1.111) and is safe at this repo's
-# LiteLLM floor: ≥1.84.0 clamps effort levels the model map doesn't declare
-# support for (max→xhigh→high, BerriAI/litellm#26111), so while the map's
-# azure/ flags lag, xhigh silently runs as high — never an Azure 400.
-# `max_effort` stays excluded: `max` is Anthropic-only, so it would *always*
-# clamp — a permanently misleading picker entry. The haiku tier (gpt-5.4-mini)
-# also omits `xhigh_effort` (its azure/ map flag is explicitly false, and
-# xhigh on the fast tier defeats its purpose). `adaptive_thinking` routes
-# effort via output_config.effort and avoids the manual-budget→"minimal" path
-# that gpt-5.4 rejects. See CLAUDE.md > "Model naming".
+# claude-*/anthropic-* ids, so with upstream-prefixed ids like azure/gpt-5.6-terra
+# it would otherwise leave extended thinking + effort DISABLED (and never send a
+# thinking block). Values are tuned for Azure GPT-5.6: `xhigh_effort` is included
+# for the terra/sol tiers and is genuinely active, not merely tolerated — LiteLLM's
+# model map declares `supports_xhigh_reasoning_effort: true` for gpt-5.6-{sol,terra,luna},
+# so it runs as real xhigh rather than silently clamping to high (the pre-5.6
+# rationale). `max_effort` stays excluded, but NOT because `max` is Anthropic-only —
+# Azure GPT-5.6 does accept reasoning_effort=max on the Responses API. It is excluded
+# because LiteLLM's map carries no `supports_max_reasoning_effort` for these ids, so
+# it still clamps max->xhigh (BerriAI/litellm#26111) — a misleading picker entry.
+# Revisit if that map flag ever lands. The haiku tier (gpt-5.6-luna) omits
+# `xhigh_effort` by CHOICE, not constraint: luna declares the flag true (the
+# previous fast tier declared it false), but xhigh on the fast tier defeats its
+# purpose.
+# `adaptive_thinking` routes effort via output_config.effort, which LiteLLM's
+# Anthropic->Responses adapter reads directly. See CLAUDE.md > "Model naming".
 NEEDS_MODEL_CONFIG=0
 # Skipped entirely under --install-only: the default-model selectors point at the
 # upstream provider ids that only resolve through the LiteLLM gateway, and gateway
@@ -737,9 +741,9 @@ if [ "$WITH_GATEWAY" = "true" ]; then
         update_profile_export "ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES"   "thinking,adaptive_thinking,interleaved_thinking,effort,xhigh_effort"
         update_profile_export "ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES" "thinking,adaptive_thinking,interleaved_thinking,effort,xhigh_effort"
         update_profile_export "ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES"  "thinking,adaptive_thinking,effort"
-        update_profile_export "ANTHROPIC_DEFAULT_HAIKU_MODEL"  "azure/gpt-5.4-mini"
-        update_profile_export "ANTHROPIC_DEFAULT_SONNET_MODEL" "azure/gpt-5.4"
-        update_profile_export "ANTHROPIC_DEFAULT_OPUS_MODEL"   "azure/gpt-5.4"
+        update_profile_export "ANTHROPIC_DEFAULT_HAIKU_MODEL"  "azure/gpt-5.6-luna"
+        update_profile_export "ANTHROPIC_DEFAULT_SONNET_MODEL" "azure/gpt-5.6-terra"
+        update_profile_export "ANTHROPIC_DEFAULT_OPUS_MODEL"   "azure/gpt-5.6-terra"
     else
         # Capability declarations track the model ids; clear them when no model is
         # pinned (preserving any manual value). Kept out of the NEEDS_MODEL_CONFIG
