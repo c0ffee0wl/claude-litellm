@@ -20,7 +20,7 @@
 #   DIRECT  — empty or non-local: show 5h/7d rate-limit budgets (Claude.ai
 #            Pro/Max), each with a reset countdown from rate_limits.*.resets_at
 #   LITELLM — 127.0.0.1:4000: show progress bar + model + ctx %, with the
-#            upstream model (e.g. gpt-5.4) appended after an arrow when
+#            upstream model (e.g. gpt-5.6-terra) appended after an arrow when
 #            available via LiteLLM's /model/info endpoint, plus trailing
 #            30-day gateway spend (labelled "/30d") from LiteLLM's
 #            /global/spend (the MonthlyGlobalSpend view is a rolling
@@ -338,7 +338,7 @@ fi
 
 MODEL_LABEL="$MODEL"
 # Skip the arrow when upstream is just the model_id with its provider prefix
-# stripped (e.g. MODEL_ID=azure/gpt-5.4, UPSTREAM_MODEL=gpt-5.4) — that's the
+# stripped (e.g. MODEL_ID=azure/gpt-5.6-terra, UPSTREAM_MODEL=gpt-5.6-terra) — that's the
 # alias-free config where Public Name == LiteLLM model, so the arrow is noise.
 [ -n "$UPSTREAM_MODEL" ] && [ "$UPSTREAM_MODEL" != "$MODEL_ID" ] && [ "$UPSTREAM_MODEL" != "${MODEL_ID#*/}" ] && MODEL_LABEL="${MODEL} → ${UPSTREAM_MODEL}"
 LINE2="${GREEN}[${MODEL_LABEL}] ${BAR_COLOR}${BAR}${GREEN} ${PCT}% (${CTX_LABEL})"
