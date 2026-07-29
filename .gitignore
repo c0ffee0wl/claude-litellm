@@ -203,6 +203,7 @@ cython_debug/
 
 # Claude
 .claude
+docs/superpowers/
 
 __marimo__/
 # Marimo
