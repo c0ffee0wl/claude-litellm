@@ -4,18 +4,37 @@
 # See CLAUDE.md > "Model naming" for the discovery / feature-gate trade-offs.
 
 model_list:
-  - model_name: azure/gpt-5.4
+  # The `azure/` prefix on model_name is a LABEL (which cloud this lands on),
+  # NOT the LiteLLM provider route. The route is `openai/` deliberately: LiteLLM's
+  # /v1/messages handler only takes the purpose-built Responses adapter when
+  # custom_llm_provider == "openai" (_RESPONSES_API_PROVIDERS is frozenset({"openai"})).
+  # Under `azure/`, Claude Code's traffic falls back to chat completions and only
+  # reaches /responses when reasoning_effort AND tools are both present.
+  # See CLAUDE.md > "Model naming" > "Why the openai/ route".
+  #
+  # api_base is the Azure v1 surface (…/openai/v1), canonicalized by
+  # normalize_azure_v1_endpoint in setup.sh. No api_version: the v1 GA API does
+  # not take one, and a query string would corrupt the `{api_base}/responses` URL.
+  - model_name: azure/gpt-5.6-terra
     litellm_params:
-      model: azure/gpt-5.4
+      model: openai/gpt-5.6-terra
       api_base: os.environ/AZURE_RESOURCE_ENDPOINT
-      api_version: "2025-04-01-preview"
       api_key: os.environ/AZURE_OPENAI_API_KEY
 
-  - model_name: azure/gpt-5.4-mini
+  - model_name: azure/gpt-5.6-luna
     litellm_params:
-      model: azure/gpt-5.4-mini
+      model: openai/gpt-5.6-luna
       api_base: os.environ/AZURE_RESOURCE_ENDPOINT
-      api_version: "2025-04-01-preview"
+      api_key: os.environ/AZURE_OPENAI_API_KEY
+
+  # Flagship tier — served but NOT wired into Claude Code (no ANTHROPIC_DEFAULT_*
+  # var points here). Reach it with `/model azure/gpt-5.6-sol` or via /ui.
+  # Requires a `gpt-5.6-sol` deployment; without one it 404s at call time
+  # (LiteLLM does not validate deployments at boot).
+  - model_name: azure/gpt-5.6-sol
+    litellm_params:
+      model: openai/gpt-5.6-sol
+      api_base: os.environ/AZURE_RESOURCE_ENDPOINT
       api_key: os.environ/AZURE_OPENAI_API_KEY
 
 litellm_settings:
