@@ -259,6 +259,31 @@ remove_profile_export() {
     unset -- "$var_name"
 }
 
+# Canonicalize an Azure endpoint to the v1 API surface the `openai/` LiteLLM
+# route requires: `https://<host>/openai/v1`.
+#
+# The `openai/` provider builds its URL as `{api_base}/responses`, so api_base
+# must carry no trailing slash and no query string — `…/openai/v1?api-version=preview`
+# would otherwise yield `…/openai/v1?api-version=preview/responses` (404).
+#
+# Accepts any form a user is likely to paste; all three Azure hostnames
+# (services.ai / openai / cognitiveservices) expose the same /openai/v1 path:
+#   https://X.services.ai.azure.com            -> https://X.services.ai.azure.com/openai/v1
+#   https://X.services.ai.azure.com/openai     -> https://X.services.ai.azure.com/openai/v1
+#   https://X.services.ai.azure.com/openai/v1/ -> https://X.services.ai.azure.com/openai/v1
+#   <empty>                                    -> <empty>
+normalize_azure_v1_endpoint() {
+    local url="${1:-}"
+    [ -n "$url" ] || return 0
+    url="${url%%\?*}"                                        # drop query string
+    url="${url%%#*}"                                         # drop fragment
+    while [ "${url%/}" != "$url" ]; do url="${url%/}"; done  # drop trailing slashes
+    url="${url%/openai/v1}"                                  # drop an existing v1 suffix
+    url="${url%/openai}"                                     # ...or a bare /openai suffix
+    while [ "${url%/}" != "$url" ]; do url="${url%/}"; done
+    printf '%s' "${url}/openai/v1"
+}
+
 # Emit `KEY=VALUE` lines for every LiteLLM-relevant provider env var found in
 # the current shell environment or ~/.profile. Output is intended to be
 # concatenated into the LiteLLM systemd EnvironmentFile.

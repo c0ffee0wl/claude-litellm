@@ -595,6 +595,20 @@ else
     warn "To configure providers up front, copy .env.example to .env and fill it in."
 fi
 
+# Canonicalize the Azure endpoint to the v1 API surface (…/openai/v1) that the
+# `openai/` route in litellm-config.yaml requires. Users paste either the bare
+# resource host or the full v1 URL the Foundry portal shows; both work.
+# Resolved from the environment first (current shell / .env), falling back to
+# ~/.profile, then re-exported so ONE canonical value feeds both the Phase 5a
+# gate below and collect_litellm_provider_vars in 5b (which writes it into
+# ~/.config/litellm/env).
+_azure_endpoint_raw="${AZURE_RESOURCE_ENDPOINT:-$(read_profile_export "AZURE_RESOURCE_ENDPOINT")}"
+if [ -n "$_azure_endpoint_raw" ]; then
+    AZURE_RESOURCE_ENDPOINT="$(normalize_azure_v1_endpoint "$_azure_endpoint_raw")"
+    export AZURE_RESOURCE_ENDPOINT
+fi
+unset _azure_endpoint_raw
+
 # 5a. Gateway URL + telemetry → ~/.profile (client-side; runs in every mode).
 # These are the single source of truth for Claude Code's connection to LiteLLM —
 # managed-settings.json no longer carries ANTHROPIC_BASE_URL/AUTH_TOKEN.
