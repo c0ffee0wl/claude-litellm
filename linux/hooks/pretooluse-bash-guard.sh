@@ -28,7 +28,12 @@
 #
 # rm check: blocks only DIRECT recursive-force `rm` (-rf / -Rf /
 # --recursive --force, any flag order/case) at a command position; both flags
-# must appear in the same segment. The command word and the flags are matched
+# must appear in the same segment. The long options are matched as anchored
+# `--r`/`--f` prefixes because GNU getopt_long accepts any unambiguous
+# abbreviation (`--recu --forc`, minimally `--r --f`, deletes just like
+# `--recursive --force`); rm has no other --r…/--f… option, and a non-option
+# arg that merely starts with `--r`/`--f` over-blocks on the safe side.
+# The command word and the flags are matched
 # with shell quoting/escaping stripped and the command word reduced to its
 # basename, so the shell-equivalent spellings `\rm`, `"rm"`, `r\m`, `/bin/rm`,
 # `./rm` and `rm "-rf"` all count as rm -rf (rm's damage is irreversible, so
@@ -47,18 +52,23 @@
 #      matched — an accepted residual (plain `git` is what Claude runs; nah's
 #      action classification covers the path form).
 #   2. Token walk after `push`: block when a token names main/master exactly —
-#      bare branch, refs/heads path, or refspec destination (`x:main`, incl.
-#      the `:main` deletion form). Tokens are compared with quotes/backslashes
-#      stripped and one leading `+` removed, so the force-refspec forms
-#      (`+main`, `+refs/heads/master`) and `ma\in` block too.
+#      bare branch, the `heads/…` dwim shorthand (git resolves an unqualified
+#      refspec against refs/heads/ etc., so `push origin heads/main` pushes
+#      main), the full refs/heads path, or any of those as a refspec
+#      destination (`x:main`, incl. the `:main` deletion form). Tokens are
+#      compared with quotes/backslashes stripped and one leading `+` removed,
+#      so the force-refspec forms (`+main`, `+heads/main`,
+#      `+refs/heads/master`) and `ma\in` block too.
 #   3. Bare push (no explicit refspec = fewer than 2 non-flag tokens) and an
 #      explicit `HEAD` refspec both push the CURRENT branch, so resolve it
 #      from the hook's cwd (honouring a -C value) and block on main/master.
 #      Outside a git repo the resolution fails -> allow.
 # Further accepted residuals: quoted content (`echo "git push main"`) still
-# blocks, ANSI-C quoting (`$'rm'`) isn't decoded, and a bare push from a
+# blocks, ANSI-C quoting (`$'rm'`) isn't decoded, a bare push from a
 # branch whose push.default=upstream tracks a differently-named remote main
-# isn't resolved.
+# isn't resolved, and `git push --all`/`--mirror` plus wildcard refspecs
+# (`refs/heads/*:refs/heads/*`) — which also reach main — are not matched
+# (rare in agent traffic; nah's action classification covers them).
 
 set -f
 # read -rd '' (not $(</dev/stdin)): fork-free on every bash version — the
@@ -120,8 +130,8 @@ while IFS= read -r seg; do
     done
     w=${cw%%[[:space:]]*}
     if [ "${w##*/}" = rm ]; then
-        if [[ "$useg" =~ (^|[[:space:]])-[a-zA-Z]*[rR]|--recursive ]] \
-            && [[ "$useg" =~ (^|[[:space:]])-[a-zA-Z]*[fF]|--force ]]; then
+        if [[ "$useg" =~ (^|[[:space:]])(-[a-zA-Z]*[rR]|--r) ]] \
+            && [[ "$useg" =~ (^|[[:space:]])(-[a-zA-Z]*[fF]|--f) ]]; then
             block 'recursive force delete is not allowed'
         fi
         continue
@@ -146,7 +156,7 @@ while IFS= read -r seg; do
         tok="${tok#+}"  # a force refspec (+main) still targets main
         case "$tok" in
             -*|'') ;;
-            main|master|refs/heads/main|refs/heads/master|*:main|*:master|*:refs/heads/main|*:refs/heads/master)
+            main|master|heads/main|heads/master|refs/heads/main|refs/heads/master|*:main|*:master|*:heads/main|*:heads/master|*:refs/heads/main|*:refs/heads/master)
                 block "Use feature branches, not direct push to ${tok##*:}" ;;
             HEAD) head_push=1 ;;
             *) nonflag=$((nonflag + 1)) ;;

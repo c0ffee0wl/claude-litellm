@@ -51,6 +51,10 @@ check 2 "$F" 'VAR=1 rm -rf x'                      'rm: env assignment prefix (B
 check 2 "$F" 'PATH=/usr/bin rm -rf x'              'rm: env assignment w/ path (BYPASS)'
 check 2 "$F" 'time rm -rf x'                       'rm: time modifier (BYPASS)'
 check 2 "$F" '! rm -rf x'                          'rm: ! modifier (BYPASS)'
+check 2 "$F" 'rm --recu --forc /tmp/x'             'rm: long-option abbreviation (BYPASS)'
+check 2 "$F" 'rm --forc --recu x'                  'rm: abbreviation flag order (BYPASS)'
+check 2 "$F" 'rm --r --f x'                        'rm: minimal abbreviation (BYPASS)'
+check 2 "$F" 'VAR=1 rm --recu --forc x'            'rm: env prefix + abbreviation (BYPASS)'
 
 ### rm guard — must ALLOW (exit 0)
 check 0 "$F" 'rm file.txt && cp -rf a b'    'rm: -rf belongs to cp (regression)'
@@ -60,6 +64,9 @@ check 0 "$F" 'rm -r x'                      'rm: recursive only (regression)'
 check 0 "$F" 'firm -rf x'                   'rm: word boundary FP guard (regression)'
 check 0 "$F" 'sudo rm -rf /tmp/x'           'rm: sudo wrapper = documented residual (regression)'
 check 0 "$F" 'echo rm -rf'                  'rm: not at command position (regression)'
+check 0 "$F" 'rm --force x'                 'rm: long force only (regression)'
+check 0 "$F" 'rm --recursive x'             'rm: long recursive only (regression)'
+check 0 "$F" 'rm -f --preserve-root x'      'rm: other long option no FP (regression)'
 
 ### push guard — must BLOCK (exit 2)
 check 2 "$F" 'git push origin main'             'push: plain main (regression)'
@@ -83,6 +90,10 @@ check 2 "$M" 'git push -u origin HEAD'          'push: -u HEAD on main (BYPASS)'
 check 2 "$F" '"git" push origin main'           'push: quoted git (BYPASS)'
 check 2 "$F" 'git "push" origin main'           'push: quoted push (BYPASS)'
 check 2 "$F" 'git push origin ma\in'            'push: in-word backslash (BYPASS)'
+check 2 "$F" 'git push origin heads/main'       'push: heads/ shorthand (BYPASS)'
+check 2 "$F" 'git push origin heads/master'     'push: heads/ shorthand master (BYPASS)'
+check 2 "$F" 'git push origin dev:heads/main'   'push: heads/ refspec dest (BYPASS)'
+check 2 "$F" 'git push -f origin +heads/main'   'push: force heads/ shorthand (BYPASS)'
 
 ### push guard — must ALLOW (exit 0)
 check 0 "$F" 'git push origin domain-fix'       'push: main substring in branch (regression)'
@@ -96,6 +107,8 @@ check 0 "$M" "git -C $F push"                   'push: bare with -C to feature r
 check 0 "$F" 'git stash push'                   'push: git stash push (regression)'
 check 0 "$T" 'git push'                         'push: bare outside a repo (regression)'
 check 0 "$F" 'echo push main'                   'push: no git (regression)'
+check 0 "$F" 'git push origin heads/feature-x'  'push: heads/ feature branch'
+check 0 "$F" 'git commit -m "push heads/main"'  'push: quoted commit msg heads form'
 
 ### fast path — must ALLOW
 check 0 "$F" 'ls -la'                           'fastpath: benign command'
