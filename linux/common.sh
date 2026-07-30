@@ -85,12 +85,18 @@ apt_install() {
     sudo apt-get install -y "$@" && APT_CHANGED=1
 }
 
-# True when a bun-installed global binary is present. bun globals are symlinks
-# into the package store; -x follows the link, so a dangling symlink (stale
-# lockfile / pruned store) would read as absent and re-trigger installs — -L
-# keeps detection stable. Usage: bun_global_present <binary-name>
+# True when a bun-installed global binary is present AND usable. bun globals
+# are symlinks into the package store; -x follows the link, so a dangling
+# symlink (stale lockfile / pruned store) reads as absent — which is correct
+# for the install-if-missing callers: a dangling link IS the broken state, and
+# re-running `bun add -g` is exactly the repair. (An `-L` test here would
+# report the broken link as "already installed" and strand the box: e.g. a
+# dangling pnpm makes every later claude-devtools build fail with no code path
+# that fixes it.) Callers that want "any link, working or not" — the legacy
+# claude-run cleanup — test -L themselves.
+# Usage: bun_global_present <binary-name>
 bun_global_present() {
-    [ -L "${HOME}/.bun/bin/$1" ] || [ -x "${HOME}/.bun/bin/$1" ]
+    [ -x "${HOME}/.bun/bin/$1" ]
 }
 
 #############################################################################
@@ -231,10 +237,20 @@ read_profile_export() {
     [ -f "$PROFILE_FILE" ] || return 0
     line=$(grep "^export ${var_name}=" "$PROFILE_FILE" 2>/dev/null | head -1)
     [ -z "$line" ] && return 0
-    local value="${line#export ${var_name}=\"}"
-    value="${value%\"}"
-    _profile_unescape "$value"
-    printf '%s' "$REPLY"
+    local raw="${line#export ${var_name}=}"
+    local value
+    # update_profile_export always writes the double-quoted form, but a user
+    # may hand-edit an unquoted (or single-quoted) line. Strip the quoting we
+    # actually find instead of assuming double quotes: a blind
+    # `${line#export VAR=\"}` no-ops on an unquoted line and would return the
+    # WHOLE line as the value — which callers then re-persist (e.g. the master
+    # key), destroying the user's real value.
+    case "$raw" in
+        '"'*'"') value="${raw%\"}"; value="${value#\"}"; _profile_unescape "$value"; value="$REPLY" ;;
+        "'"*"'") value="${raw%\'}"; value="${value#\'}" ;;
+        *)       value="$raw" ;;
+    esac
+    printf '%s' "$value"
 }
 
 # Delete any `export VAR_NAME=...` line from PROFILE_FILE, and unset the var
@@ -729,8 +745,23 @@ deploy_user_systemd_service() {
     local dest="${service_dir}/${name}.service"
     mkdir -p "$service_dir"
 
+    # Render first, then write — piping sed straight into write_if_changed
+    # would mask a sed failure (no `set -o pipefail` here): the pipeline's
+    # status is write_if_changed's, so a missing/unreadable template or a bad
+    # -e expression installs a 0-BYTE unit over a working one and reports
+    # "changed", after which the caller daemon-reloads and restarts against it.
+    local rendered
+    rendered=$(sed "$@" "$template") || {
+        error "Failed to render ${template} for ${name}.service — keeping the existing unit"
+        return 1
+    }
+    if [ -z "$rendered" ]; then
+        error "Rendered ${name}.service is empty (template: ${template}) — refusing to install it"
+        return 1
+    fi
+
     local changed=0
-    sed "$@" "$template" | write_if_changed "$dest" && changed=1
+    printf '%s\n' "$rendered" | write_if_changed "$dest" && changed=1
 
     if [ "$changed" -eq 1 ]; then
         systemctl --user daemon-reload

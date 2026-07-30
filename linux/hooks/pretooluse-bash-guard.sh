@@ -32,7 +32,11 @@
 # with shell quoting/escaping stripped and the command word reduced to its
 # basename, so the shell-equivalent spellings `\rm`, `"rm"`, `r\m`, `/bin/rm`,
 # `./rm` and `rm "-rf"` all count as rm -rf (rm's damage is irreversible, so
-# unlike git below the path form is NOT an accepted residual).
+# unlike git below the path form is NOT an accepted residual). Leading shell
+# keywords (`do`/`then`/`{`/`time`/`!`) and env-assignment prefixes are skipped
+# before the command word is read, so the loop/conditional/group/assignment
+# spellings (`for … do rm -rf x; done`, `{ rm -rf x; }`, `VAR=1 rm -rf x`)
+# are command positions too and block.
 #
 # push check, three stages per push segment:
 #   1. The segment must be a git push invocation. Global options (-C <path>,
@@ -97,9 +101,24 @@ while IFS= read -r seg; do
 
     # --- recursive force delete ---
     # Command word = first word of the unquoted segment, reduced to its
-    # basename (so /bin/rm and ./rm count).
-    w=${useg#"${useg%%[![:space:]]*}"}
-    w=${w%%[[:space:]]*}
+    # basename (so /bin/rm and ./rm count) — but first skip the shell words
+    # that legally sit in front of a command word without being one:
+    # compound-statement keywords (`do`, `then`, `{`, ...), the `time`/`!`
+    # modifiers, and env-assignment prefixes. Without this skip,
+    # `for d in a b; do rm -rf "$d"; done`, `if x; then rm -rf y; fi`,
+    # `{ rm -rf x; }` and `VAR=1 rm -rf x` all read their command word as the
+    # keyword/assignment and the rm check never fires.
+    cw=${useg#"${useg%%[![:space:]]*}"}
+    while [ -n "$cw" ]; do
+        w=${cw%%[[:space:]]*}
+        case "$w" in
+            do|then|else|elif|if|while|until|time|!|'{'|'}'|*=*) ;;
+            *) break ;;
+        esac
+        cw=${cw#"$w"}
+        cw=${cw#"${cw%%[![:space:]]*}"}
+    done
+    w=${cw%%[[:space:]]*}
     if [ "${w##*/}" = rm ]; then
         if [[ "$useg" =~ (^|[[:space:]])-[a-zA-Z]*[rR]|--recursive ]] \
             && [[ "$useg" =~ (^|[[:space:]])-[a-zA-Z]*[fF]|--force ]]; then

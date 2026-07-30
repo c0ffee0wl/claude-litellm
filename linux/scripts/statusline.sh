@@ -104,8 +104,24 @@ IFS=$'\t' read -r cwd proj_dir DURATION_MS MODEL MODEL_ID PCT CTX_SIZE FIVE_H WE
 [ "$MODEL_ID" = "-" ] && MODEL_ID=""
 
 # Per-user cache dir — shared by the sandbox-verdict memo below and the
-# LiteLLM endpoint caches further down.
-CACHE_DIR="${XDG_RUNTIME_DIR:-/tmp}"
+# LiteLLM endpoint caches further down. XDG_RUNTIME_DIR is already a
+# 0700 per-user dir; when it is unset (ssh/cron sessions without pam_systemd,
+# some sandbox launches) fall back to ~/.cache, NOT /tmp: cache names are
+# predictable, and in world-writable /tmp another local user can pre-create
+# them with a far-future mtime, which pins the `-nt` staleness checks below
+# forever — spoofing the sandbox verdict (fail-safe "(unsandboxed)" warning
+# suppressed) and feeding attacker-controlled text into the rendered line.
+# The victim also can't recover: `mv` over another user's file in a sticky
+# dir is EPERM, and `exec 2>/dev/null` hides it. $HOME is not world-writable,
+# so pre-creation there is not possible.
+if [ -n "${XDG_RUNTIME_DIR:-}" ]; then
+    CACHE_DIR="$XDG_RUNTIME_DIR"
+else
+    CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/claude-litellm"
+    # `-m` with `-p` only applies to the deepest dir, so set the mode
+    # explicitly (runs once, on first use — not on the render hot path).
+    [ -d "$CACHE_DIR" ] || { mkdir -p "$CACHE_DIR" && chmod 700 "$CACHE_DIR"; }
+fi
 
 # Atomically persist one line per argument to file $1 ($$-suffixed tmp + mv,
 # so concurrent renders can't interleave). Fork-free. One writer for every
@@ -354,6 +370,12 @@ if [ "$MODE" = "LITELLM" ]; then
             persist "$MODELINFO_DERIVED" "$UPSTREAM_MODEL"
         fi
         UPSTREAM_MODEL="${UPSTREAM_MODEL#*/}"
+        # This value is rendered through `echo -e`, which interprets \e/\033:
+        # keep it to a conservative model-id charset so neither a hostile
+        # gateway response nor a tampered cache file can inject terminal
+        # escape sequences into the user's statusline. (SPEND is already
+        # regex-gated below; this is the only free-text field.)
+        UPSTREAM_MODEL="${UPSTREAM_MODEL//[!A-Za-z0-9._:\/-]/}"
     fi
 
     # Trailing-30-day gateway spend via /global/spend (cached 1min, digested

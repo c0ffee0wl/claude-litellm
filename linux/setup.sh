@@ -447,7 +447,11 @@ if [ "$WITH_LOCAL_LITELLM" = "true" ] && [ "$DOCKER_MODE" != "true" ]; then
         if [ "${LITELLM_UPGRADED:-0}" != "1" ] && compgen -G "${UV_LITELLM_VENV}/lib/python*/site-packages/prisma/client.py" >/dev/null; then
             log "Prisma client already generated — skipping"
         else
-            LITELLM_SCHEMA="$("${UV_LITELLM_VENV}/bin/python" -c 'import os, litellm.proxy as p; print(os.path.join(os.path.dirname(p.__file__), "schema.prisma"))' 2>/dev/null)"
+            # `|| true`: a bare assignment inherits the substitution's exit
+            # status, so a broken venv / import error would abort the whole
+            # script here under `set -e` — silently, since stderr is dropped —
+            # making the diagnostic below dead code for exactly that case.
+            LITELLM_SCHEMA="$("${UV_LITELLM_VENV}/bin/python" -c 'import os, litellm.proxy as p; print(os.path.join(os.path.dirname(p.__file__), "schema.prisma"))' 2>/dev/null || true)"
             if [ -z "$LITELLM_SCHEMA" ] || [ ! -f "$LITELLM_SCHEMA" ]; then
                 error "Could not locate litellm's schema.prisma; proxy will crash on first DB connect."
                 exit 1
@@ -612,6 +616,22 @@ if [ -n "$_azure_endpoint_raw" ]; then
 fi
 unset _azure_endpoint_raw
 
+# Same ~/.profile fallback for the key half of the pair. Without it the two
+# halves resolve from different sources: with Azure creds exported only in
+# ~/.profile (a supported discovery location — Phase 5b's collector reads it)
+# and setup run from a shell that never sourced it, the endpoint resolves and
+# the key doesn't, so the gateway gets working credentials while the Phase 5a
+# gate below writes all four model selectors EMPTY and fires the misleading
+# "no Azure credentials" banner.
+if [ -z "${AZURE_OPENAI_API_KEY:-}" ]; then
+    _azure_key_raw="$(read_profile_export "AZURE_OPENAI_API_KEY")"
+    if [ -n "$_azure_key_raw" ]; then
+        AZURE_OPENAI_API_KEY="$_azure_key_raw"
+        export AZURE_OPENAI_API_KEY
+    fi
+    unset _azure_key_raw
+fi
+
 # 5a. Gateway URL + telemetry → ~/.profile (client-side; runs in every mode).
 # These are the single source of truth for Claude Code's connection to LiteLLM —
 # managed-settings.json no longer carries ANTHROPIC_BASE_URL/AUTH_TOKEN.
@@ -773,6 +793,15 @@ if [ "$WITH_GATEWAY" = "true" ]; then
                 NEEDS_MODEL_CONFIG=1
             fi
         done
+        # Box flipped Azure -> no-Azure (creds removed, /ui model instead):
+        # drop the 1M belief written by the branch above, or CC keeps assuming
+        # a 1.05M window for a possibly-200K /ui model -> API 400s before
+        # auto-compact fires. Value-scoped so a manual window (CLAUDE.md tells
+        # no-Azure users to set their model's real limit) is preserved.
+        if [ "$(read_profile_export "CLAUDE_CODE_MAX_CONTEXT_TOKENS")" = "1000000" ]; then
+            remove_profile_export "CLAUDE_CODE_MAX_CONTEXT_TOKENS"
+            remove_profile_export "CLAUDE_CODE_DISABLE_1M_CONTEXT"
+        fi
     fi
     # Discovery: populate /model from the gateway's /v1/models (CC >=2.1.129;
     # claude-*/anthropic-* ids only; also needs LiteLLM >=1.95.0 — the
@@ -815,10 +844,17 @@ fi
 # no gateway is wired (--install-only): direct-Anthropic boxes may
 # legitimately export the key. Explicitly blanked exports (="", ='', =) are
 # harmless — CC only honors non-empty values.
+# Covers every startup file a login/interactive shell reads, not just
+# ~/.profile: ~/.bash_profile is read FIRST by bash login shells (this repo
+# installs a shim there, and installers append to it), and zsh reads
+# ~/.zshenv/~/.zprofile before ~/.zshrc — a key exported in any of them wins
+# at runtime. Leading whitespace is tolerated so an indented export is caught.
 WARN_STRAY_ANTHROPIC_KEY=0
 if [ "$WITH_GATEWAY" = "true" ] \
-    && grep -hs '^export ANTHROPIC_API_KEY=' "$PROFILE_FILE" "$HOME/.bashrc" "$HOME/.zshrc" \
-        | grep -qvxE "export ANTHROPIC_API_KEY=(\"\"|''|)"; then
+    && grep -hsE '^[[:space:]]*export[[:space:]]+ANTHROPIC_API_KEY=' \
+        "$PROFILE_FILE" "$HOME/.bash_profile" "$HOME/.bash_login" "$HOME/.bashrc" \
+        "$HOME/.zshenv" "$HOME/.zprofile" "$HOME/.zshrc" \
+        | grep -qvxE "[[:space:]]*export[[:space:]]+ANTHROPIC_API_KEY=(\"\"|''|)"; then
     WARN_STRAY_ANTHROPIC_KEY=1
     warn "ANTHROPIC_API_KEY is exported in a shell profile — Claude Code will prefer it over the gateway token (details in the end-of-setup banner)"
 fi
@@ -862,7 +898,12 @@ if [ "$WITH_LOCAL_LITELLM" = "true" ]; then
         PERSISTED_UI_LINES="$(grep -E '^UI_(USERNAME|PASSWORD)=' "$LITELLM_ENV_FILE" 2>/dev/null || true)"
     fi
 
-    if [ -n "${DATABASE_URL:-}" ] && [[ "${DATABASE_URL}" != postgresql://litellm:*@127.0.0.1:* ]]; then
+    # The exclusion glob must match ONLY the URL this phase generates below
+    # (host+port+dbname all pinned), not any loopback URL with the `litellm`
+    # role: a user-supplied `…@127.0.0.1:5433/mydb` (pgbouncer / SSH tunnel to
+    # a remote Postgres) is external, and a port-agnostic glob would silently
+    # discard it and provision a local DB instead.
+    if [ -n "${DATABASE_URL:-}" ] && [[ "${DATABASE_URL}" != postgresql://litellm:*@127.0.0.1:5432/litellm ]]; then
         log "DATABASE_URL set externally — skipping local Postgres install"
         LITELLM_DB_URL="$DATABASE_URL"
     else
@@ -1367,9 +1408,15 @@ if [ "$CLAUDE_DEVTOOLS_RAM_OK" = "1" ]; then
     CLAUDE_DEVTOOLS_LATEST_TAG=""
     if [ -d "${CLAUDE_DEVTOOLS_DIR}/.git" ]; then
         # ls-remote queries the server directly — works on shallow/--no-tags clones.
-        CLAUDE_DEVTOOLS_LATEST_TAG=$(cd "$CLAUDE_DEVTOOLS_DIR" && git ls-remote --refs --tags --sort=-v:refname origin 'v*' 2>/dev/null | head -1 | awk -F'refs/tags/' '{print $2}' || true)
+        # The grep drops pre-release tags (a version-shaped name containing a
+        # `-`, i.e. v2.0.0-rc1 / 1.9.0-beta): git's versionsort ranks a
+        # suffixed tag ABOVE its release (v2.0.0-rc1 > v2.0.0) unless
+        # versionsort.suffix is configured, and even with it a newer version's
+        # rc with no final yet still sorts first — so an upstream rc/beta push
+        # would otherwise silently become the pinned "latest release tag".
+        CLAUDE_DEVTOOLS_LATEST_TAG=$(cd "$CLAUDE_DEVTOOLS_DIR" && git ls-remote --refs --tags --sort=-v:refname origin 'v*' 2>/dev/null | grep -vE 'refs/tags/v?[0-9][^/]*-' | head -1 | awk -F'refs/tags/' '{print $2}' || true)
         if [ -z "$CLAUDE_DEVTOOLS_LATEST_TAG" ]; then
-            CLAUDE_DEVTOOLS_LATEST_TAG=$(cd "$CLAUDE_DEVTOOLS_DIR" && git ls-remote --refs --tags --sort=-v:refname origin 2>/dev/null | head -1 | awk -F'refs/tags/' '{print $2}' || true)
+            CLAUDE_DEVTOOLS_LATEST_TAG=$(cd "$CLAUDE_DEVTOOLS_DIR" && git ls-remote --refs --tags --sort=-v:refname origin 2>/dev/null | grep -vE 'refs/tags/v?[0-9][^/]*-' | head -1 | awk -F'refs/tags/' '{print $2}' || true)
         fi
 
         # Defense in depth: a hostile upstream could push a tag with shell
@@ -1465,7 +1512,10 @@ fi
 # / full install on this host may have deployed them).
 LEGACY_HISTORY_SERVICE="${HOME}/.config/systemd/user/claude-history.service"
 LEGACY_CLAUDE_RUN_BIN="${HOME}/.bun/bin/claude-run"
-if [ -f "$LEGACY_HISTORY_SERVICE" ] || bun_global_present claude-run; then
+# -L, not bun_global_present: a DANGLING claude-run symlink still needs the
+# `bun remove -g` + link cleanup below (the helper deliberately reports a
+# dangling link as absent, which is right for install-if-missing, wrong here).
+if [ -f "$LEGACY_HISTORY_SERVICE" ] || [ -L "$LEGACY_CLAUDE_RUN_BIN" ] || bun_global_present claude-run; then
     log "=== Phase 10: removing legacy claude-run + claude-history service ==="
     if [ -f "$LEGACY_HISTORY_SERVICE" ]; then
         systemctl --user disable --now claude-history &>/dev/null || true
@@ -1473,7 +1523,7 @@ if [ -f "$LEGACY_HISTORY_SERVICE" ] || bun_global_present claude-run; then
         systemctl --user daemon-reload &>/dev/null || true
         log "Removed claude-history.service"
     fi
-    if bun_global_present claude-run; then
+    if [ -L "$LEGACY_CLAUDE_RUN_BIN" ] || bun_global_present claude-run; then
         log "Uninstalling claude-run (bun remove -g)..."
         bun remove -g claude-run &>/dev/null || true
         # Belt-and-braces: if bun left the symlink behind (stale lockfile), drop it.
