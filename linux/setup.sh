@@ -755,6 +755,16 @@ if [ "$WITH_GATEWAY" = "true" ]; then
         update_profile_export "ANTHROPIC_DEFAULT_OPUS_MODEL"   "azure/gpt-5.6-terra"
         # fable -> sol; 404s without a gpt-5.6-sol deployment (CLAUDE.md > "Model naming")
         update_profile_export "ANTHROPIC_DEFAULT_FABLE_MODEL"  "azure/gpt-5.6-sol"
+        # Believed context window: CC assumes 200K for unrecognized gateway
+        # ids and no documented knob raises it (anthropics/claude-code#68522).
+        # This undocumented pair does (issue-thread workaround, deploy-verified
+        # 2026-07-30; third-party gateway docs use the same mechanism).
+        # Session-global, so written only on this Azure path where every
+        # served tier takes 1.05M input; a /ui-added smaller-window model
+        # would be over-believed -> API 400s before compaction fires. See
+        # CLAUDE.md > "Model naming".
+        update_profile_export "CLAUDE_CODE_MAX_CONTEXT_TOKENS" "1000000"
+        update_profile_export "CLAUDE_CODE_DISABLE_1M_CONTEXT" "0"
     else
         for var in ANTHROPIC_DEFAULT_HAIKU_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_DEFAULT_FABLE_MODEL; do
             existing="$(read_profile_export "$var")"
@@ -776,6 +786,10 @@ else
     # (the SUBPROCESS_ENV_SCRUB pattern above).
     remove_profile_export "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"
     remove_profile_export "CLAUDE_CODE_ALWAYS_ENABLE_EFFORT"
+    # A stale forced 1M belief is dangerous against the real Anthropic API
+    # (Claude windows are known natively; a 200K-plan session would overrun).
+    remove_profile_export "CLAUDE_CODE_MAX_CONTEXT_TOKENS"
+    remove_profile_export "CLAUDE_CODE_DISABLE_1M_CONTEXT"
 fi
 
 update_profile_export "NO_PROXY"             "127.0.0.1"
