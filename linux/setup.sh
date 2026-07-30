@@ -733,13 +733,15 @@ remove_profile_export "ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES"
 remove_profile_export "ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES"
 
 # Default model selectors + gateway discovery + effort. In ~/.profile (not
-# managed-settings) so they apply in --router-only too. Values are the upstream
-# provider-prefixed ids surfaced by litellm-config.yaml when Azure creds are
-# supplied. When the user leaves Azure blank in .env, write empty values
-# (unless a prior re-run / manual edit already set them) and emit a banner at
-# end-of-script telling the user to add a model via /ui and fill these in.
-# No *_SUPPORTED_CAPABILITIES companions (scrubbed above); the full
-# thinking/effort story is in CLAUDE.md > "Model naming".
+# managed-settings) so they apply in --router-only too. Four selectors:
+# haiku/sonnet/opus plus fable, the 4th tier (CC >=2.1.170). Values are the
+# upstream provider-prefixed ids surfaced by litellm-config.yaml when Azure
+# creds are supplied. When the user leaves Azure blank in .env, write empty
+# values (unless a prior re-run / manual edit already set them) and emit a
+# banner at end-of-script telling the user to add a model via /ui and fill
+# these in.
+# No *_SUPPORTED_CAPABILITIES (scrubbed above) or _NAME/_DESCRIPTION
+# companions; the full thinking/effort story is in CLAUDE.md > "Model naming".
 NEEDS_MODEL_CONFIG=0
 # Skipped entirely under --install-only: the default-model selectors point at the
 # upstream provider ids that only resolve through the LiteLLM gateway, and the
@@ -751,8 +753,10 @@ if [ "$WITH_GATEWAY" = "true" ]; then
         update_profile_export "ANTHROPIC_DEFAULT_HAIKU_MODEL"  "azure/gpt-5.6-luna"
         update_profile_export "ANTHROPIC_DEFAULT_SONNET_MODEL" "azure/gpt-5.6-terra"
         update_profile_export "ANTHROPIC_DEFAULT_OPUS_MODEL"   "azure/gpt-5.6-terra"
+        # fable -> sol; 404s without a gpt-5.6-sol deployment (CLAUDE.md > "Model naming")
+        update_profile_export "ANTHROPIC_DEFAULT_FABLE_MODEL"  "azure/gpt-5.6-sol"
     else
-        for var in ANTHROPIC_DEFAULT_HAIKU_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL; do
+        for var in ANTHROPIC_DEFAULT_HAIKU_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_DEFAULT_FABLE_MODEL; do
             existing="$(read_profile_export "$var")"
             if [ -z "$existing" ]; then
                 update_profile_export "$var" ""
@@ -785,6 +789,24 @@ if [ "$WITH_GATEWAY" = "true" ]; then
 
     update_profile_export "ANTHROPIC_BASE_URL"   "$ANTHROPIC_GATEWAY_URL"
     update_profile_export "ANTHROPIC_AUTH_TOKEN" "$ANTHROPIC_AUTH_TOKEN"
+fi
+
+# A shell-exported ANTHROPIC_API_KEY silently outranks ANTHROPIC_AUTH_TOKEN
+# in Claude Code → 401 at the gateway (CLAUDE.md > "Master-key strategy").
+# Warn-only: blanking or scrubbing the export would destroy the user's
+# collector source (~/.profile is a supported key-discovery location for
+# Phase 5b). Checked against the files, not $ANTHROPIC_API_KEY — .env is
+# sourced with set -a above, so an env test would false-positive on the
+# supported .env path (scoped to this script's process only). Skipped when
+# no gateway is wired (--install-only): direct-Anthropic boxes may
+# legitimately export the key. Explicitly blanked exports (="", ='', =) are
+# harmless — CC only honors non-empty values.
+WARN_STRAY_ANTHROPIC_KEY=0
+if [ "$WITH_GATEWAY" = "true" ] \
+    && grep -hs '^export ANTHROPIC_API_KEY=' "$PROFILE_FILE" "$HOME/.bashrc" "$HOME/.zshrc" \
+        | grep -qvxE "export ANTHROPIC_API_KEY=(\"\"|''|)"; then
+    WARN_STRAY_ANTHROPIC_KEY=1
+    warn "ANTHROPIC_API_KEY is exported in a shell profile — Claude Code will prefer it over the gateway token (details in the end-of-setup banner)"
 fi
 
 # 5b. Provider secrets → in-memory env content. Auto-discovers every
@@ -1515,12 +1537,26 @@ if [ "$NEEDS_MODEL_CONFIG" = "1" ] && [ -t 1 ]; then
     echo ""
     echo -e "${YELLOW}  Next steps:${NC}"
     echo -e "    1. Open ${GREEN}http://127.0.0.1:${LITELLM_PORT}/ui${NC} and add at least one model."
-    echo -e "    2. Edit ${GREEN}~/.profile${NC} and set the three default-model vars to the"
-    echo -e "       Public Model Name you added (same name works for all three):"
+    echo -e "    2. Edit ${GREEN}~/.profile${NC} and set the four default-model vars to the"
+    echo -e "       Public Model Name you added (same name works for all four):"
     echo -e "         ${GREEN}export ANTHROPIC_DEFAULT_HAIKU_MODEL=\"<name>\"${NC}"
     echo -e "         ${GREEN}export ANTHROPIC_DEFAULT_SONNET_MODEL=\"<name>\"${NC}"
     echo -e "         ${GREEN}export ANTHROPIC_DEFAULT_OPUS_MODEL=\"<name>\"${NC}"
+    echo -e "         ${GREEN}export ANTHROPIC_DEFAULT_FABLE_MODEL=\"<name>\"${NC}"
     echo -e "    3. ${GREEN}source ~/.profile${NC} (or log out and back in) before \`claude\`."
+    echo -e "${YELLOW}${rule}${NC}"
+    echo ""
+fi
+
+if [ "$WARN_STRAY_ANTHROPIC_KEY" = "1" ] && [ -t 1 ]; then
+    echo -e "${YELLOW}${rule}${NC}"
+    echo -e "${YELLOW}  ANTHROPIC_API_KEY is exported in your shell profile. Claude Code"
+    echo -e "  prefers it over ANTHROPIC_AUTH_TOKEN (sent as x-api-key), so requests"
+    echo -e "  to the LiteLLM gateway will fail with 401.${NC}"
+    echo ""
+    echo -e "${YELLOW}  Fix: move the key into ${GREEN}.env${YELLOW} in the repo root and delete the export"
+    echo -e "  from ~/.profile / ~/.bashrc / ~/.zshrc — setup still delivers it to"
+    echo -e "  LiteLLM (~/.config/litellm/env) for a real-Anthropic upstream.${NC}"
     echo -e "${YELLOW}${rule}${NC}"
     echo ""
 fi
