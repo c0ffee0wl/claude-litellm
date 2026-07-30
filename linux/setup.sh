@@ -648,8 +648,6 @@ update_profile_export "DOTNET_CLI_TELEMETRY_OPTOUT"   "1"
 update_profile_export "POWERSHELL_TELEMETRY_OPTOUT"   "1"
 update_profile_export "AZURE_CORE_COLLECT_TELEMETRY"  "0"
 update_profile_export "HF_HUB_DISABLE_TELEMETRY"      "1"
-update_profile_export "PYPI_DISABLE_TELEMETRY"        "1"
-update_profile_export "UV_NO_TELEMETRY"               "1"
 update_profile_export "DISABLE_GROWTHBOOK"            "1"
 update_profile_export "SCARF_ANALYTICS"               "false"
 
