@@ -28,25 +28,33 @@
 #
 # rm check: blocks only DIRECT recursive-force `rm` (-rf / -Rf /
 # --recursive --force, any flag order/case) at a command position; both flags
-# must appear in the same segment that starts with `rm`.
+# must appear in the same segment. The command word and the flags are matched
+# with shell quoting/escaping stripped and the command word reduced to its
+# basename, so the shell-equivalent spellings `\rm`, `"rm"`, `r\m`, `/bin/rm`,
+# `./rm` and `rm "-rf"` all count as rm -rf (rm's damage is irreversible, so
+# unlike git below the path form is NOT an accepted residual).
 #
 # push check, three stages per push segment:
 #   1. The segment must be a git push invocation. Global options (-C <path>,
 #      -c k=v, --flags) may sit between `git` and `push` — but not arbitrary
-#      words. NB the word boundary excludes `/`, so a path-invoked
-#      `/usr/bin/git push origin main` is NOT matched — an accepted residual
-#      (plain `git` is what Claude runs; nah's action classification covers
-#      the path form).
+#      words. Matched on the quote/backslash-stripped segment, so the
+#      `"git" push` / `git "push"` spellings are caught. NB the word boundary
+#      excludes `/`, so a path-invoked `/usr/bin/git push origin main` is NOT
+#      matched — an accepted residual (plain `git` is what Claude runs; nah's
+#      action classification covers the path form).
 #   2. Token walk after `push`: block when a token names main/master exactly —
 #      bare branch, refs/heads path, or refspec destination (`x:main`, incl.
-#      the `:main` deletion form).
-#   3. Bare push (no explicit refspec = fewer than 2 non-flag tokens): git
-#      pushes the CURRENT branch, so resolve it from the hook's cwd (honouring
-#      a -C value) and block on main/master. Outside a git repo the resolution
-#      fails -> allow.
+#      the `:main` deletion form). Tokens are compared with quotes/backslashes
+#      stripped and one leading `+` removed, so the force-refspec forms
+#      (`+main`, `+refs/heads/master`) and `ma\in` block too.
+#   3. Bare push (no explicit refspec = fewer than 2 non-flag tokens) and an
+#      explicit `HEAD` refspec both push the CURRENT branch, so resolve it
+#      from the hook's cwd (honouring a -C value) and block on main/master.
+#      Outside a git repo the resolution fails -> allow.
 # Further accepted residuals: quoted content (`echo "git push main"`) still
-# blocks, and a push to main via `HEAD` with push.default=upstream tracking a
-# differently-named remote branch isn't resolved.
+# blocks, ANSI-C quoting (`$'rm'`) isn't decoded, and a bare push from a
+# branch whose push.default=upstream tracks a differently-named remote main
+# isn't resolved.
 
 set -f
 # read -rd '' (not $(</dev/stdin)): fork-free on every bash version — the
@@ -54,17 +62,22 @@ set -f
 IFS= read -rd '' input
 
 # Fast path — zero forks for the overwhelming majority of commands: JSON never
-# escapes ASCII letters, so a command containing "rm"/"push" always appears as
-# a raw substring of the JSON. The envelope's ever-present "permission_mode"
-# key itself contains "rm", which would defeat the probe on EVERY call — scrub
-# the constant "ermission" first (also kills the "bypassPermissions" value).
-# The scrub cannot mask a real match: a blockable `rm` token is followed by
-# whitespace/quote/backslash, never the "i" that "ermission" requires, and
-# "ermission" contains no "push". A residual false positive (either substring
-# in cwd/paths) just falls through to the jq parse below.
+# escapes ASCII letters, so a command containing "rm"/"push" always appears in
+# the JSON, though possibly split by escaping (`r\m`, `"rm"` arrive as
+# `r\\m`, `\"rm\"`) — hence quotes/backslashes are deleted before probing;
+# that deletion only joins characters, so it can manufacture a stray false
+# positive but never destroy a match that was really there. The envelope's
+# ever-present "permission_mode" key itself contains "rm", which would defeat
+# the probe on EVERY call — scrub the constant "ermission" first (also kills
+# the "bypassPermissions" value). The scrub cannot mask a real match: a
+# blockable `rm` token is followed by whitespace/quote/backslash, never the
+# "i" that "ermission" requires, and "ermission" contains no "push". A
+# residual false positive (either substring in cwd/paths, or manufactured by
+# the joins) just falls through to the jq parse below.
 # INVARIANT: every check in the segment loop below must have its trigger
 # substring listed here — a check without one silently never fires.
 probe=${input//ermission/}
+probe=${probe//[\"\'\\]/}
 [[ "$probe" == *rm* || "$probe" == *push* ]] || exit 0
 
 CMD=$(jq -r '.tool_input.command // empty' <<<"$input")
@@ -75,10 +88,21 @@ seps=';&|()`'
 # NB when adding a check here: register its trigger substring in the fast-path
 # probe at the top, or the new check never runs on most commands.
 while IFS= read -r seg; do
+    # Unquoted view of the segment: the shell strips quotes/backslashes before
+    # exec, so `\rm`, `"rm"`, `r\m`, `rm "-rf"`, `"git" push` all run the real
+    # thing while dodging a raw-string matcher — match against the same view
+    # the kernel will see. Deleting can only join words, and over-matching is
+    # the safe side here.
+    useg=${seg//[\"\'\\]/}
+
     # --- recursive force delete ---
-    if [[ "$seg" =~ ^[[:space:]]*rm([[:space:]]|$) ]]; then
-        if [[ "$seg" =~ (^|[[:space:]])-[a-zA-Z]*[rR]|--recursive ]] \
-            && [[ "$seg" =~ (^|[[:space:]])-[a-zA-Z]*[fF]|--force ]]; then
+    # Command word = first word of the unquoted segment, reduced to its
+    # basename (so /bin/rm and ./rm count).
+    w=${useg#"${useg%%[![:space:]]*}"}
+    w=${w%%[[:space:]]*}
+    if [ "${w##*/}" = rm ]; then
+        if [[ "$useg" =~ (^|[[:space:]])-[a-zA-Z]*[rR]|--recursive ]] \
+            && [[ "$useg" =~ (^|[[:space:]])-[a-zA-Z]*[fF]|--force ]]; then
             block 'recursive force delete is not allowed'
         fi
         continue
@@ -87,30 +111,33 @@ while IFS= read -r seg; do
     # --- direct push to main/master ---
     # Stage 1: `git`, optional global options (each `-opt`, optionally
     # followed by one value word), then `push`.
-    [[ "$seg" =~ (^|[^[:alnum:]_./-])git([[:space:]]+-[^[:space:]]*([[:space:]]+[^-[:space:]][^[:space:]]*)?)*[[:space:]]+push([[:space:]]|$) ]] || continue
+    [[ "$useg" =~ (^|[^[:alnum:]_./-])git([[:space:]]+-[^[:space:]]*([[:space:]]+[^-[:space:]][^[:space:]]*)?)*[[:space:]]+push([[:space:]]|$) ]] || continue
 
     # Stage 2: segments contain no separators, so a plain word walk suffices.
     # Track a -C value seen before `push` for stage 3.
-    seen_push=0 nonflag=0 c_dir="" prev=""
+    seen_push=0 nonflag=0 head_push=0 c_dir="" prev=""
     for tok in $seg; do
-        tok="${tok//[\"\']/}"
+        tok="${tok//[\"\'\\]/}"
         if [ "$seen_push" = 0 ]; then
             [ "$prev" = "-C" ] && c_dir="$tok"
             prev="$tok"
             [ "$tok" = "push" ] && seen_push=1
             continue
         fi
+        tok="${tok#+}"  # a force refspec (+main) still targets main
         case "$tok" in
             -*|'') ;;
             main|master|refs/heads/main|refs/heads/master|*:main|*:master|*:refs/heads/main|*:refs/heads/master)
                 block "Use feature branches, not direct push to ${tok##*:}" ;;
+            HEAD) head_push=1 ;;
             *) nonflag=$((nonflag + 1)) ;;
         esac
     done
 
-    # Stage 3: bare push (at most a remote named, no refspec) pushes the
-    # current branch — resolve it from the repo the command targets.
-    if [ "$seen_push" = 1 ] && [ "$nonflag" -lt 2 ]; then
+    # Stage 3: bare push (at most a remote named, no refspec) and an explicit
+    # HEAD refspec both push the current branch — resolve it from the repo the
+    # command targets.
+    if [ "$seen_push" = 1 ] && { [ "$nonflag" -lt 2 ] || [ "$head_push" = 1 ]; }; then
         # cwd is only needed here — don't pay the jq fork on the common path.
         cwd=$(jq -r '.cwd // empty' <<<"$input")
         branch=$(git -C "${cwd:-$PWD}" ${c_dir:+-C "$c_dir"} symbolic-ref --quiet --short HEAD 2>/dev/null)
