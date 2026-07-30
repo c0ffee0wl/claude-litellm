@@ -46,7 +46,7 @@ fi
 MERGED=$(jq --argjson enabled "$SANDBOX_ENABLED" --slurpfile tpl "$TEMPLATE" \
     '.sandbox //= ($tpl[0].sandbox | .enabled = $enabled)' "$SETTINGS")
 
-if printf '%s\n' "$MERGED" | write_if_changed "$SETTINGS" 644 "${USER}:${USER}"; then
+if printf '%s\n' "$MERGED" | write_if_changed "$SETTINGS" 644; then
     log "sandbox block added (enabled: $SANDBOX_ENABLED) — restart Claude Code to pick it up."
 else
     log "$SETTINGS unchanged."

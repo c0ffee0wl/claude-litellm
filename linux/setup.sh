@@ -194,14 +194,14 @@ LITELLM_PORT=4000
 # Unified Anthropic /v1/messages endpoint — translates to any provider in
 # model_list. NOT the /anthropic pass-through (that one only proxies to api.anthropic.com).
 ANTHROPIC_GATEWAY_URL="http://127.0.0.1:${LITELLM_PORT}"
+USER_TOOL_PATH="${HOME}/.local/bin:${HOME}/.bun/bin:/usr/local/bin:/usr/bin:/bin"
 # uv tool venv bin first: `prisma` CLI lives there (we install via --with prisma),
 # and LiteLLM shells out to `prisma migrate deploy` on startup. Without this,
 # migrations silently fail and UI-required tables like LiteLLM_UserTable never get created.
 # Kept separate from USER_TOOL_PATH: the venv exposes generic names (httpx,
 # openai, fastapi, nodeenv, mcp, …) that would shadow system tools for unrelated
 # services.
-LITELLM_PATH="${HOME}/.local/share/uv/tools/litellm/bin:${HOME}/.local/bin:${HOME}/.bun/bin:/usr/local/bin:/usr/bin:/bin"
-USER_TOOL_PATH="${HOME}/.local/bin:${HOME}/.bun/bin:/usr/local/bin:/usr/bin:/bin"
+LITELLM_PATH="${HOME}/.local/share/uv/tools/litellm/bin:${USER_TOOL_PATH}"
 # The uv requirement string for LiteLLM — one definition for the fresh-install
 # and upgrade paths in Phase 4a, so a floor bump can't skew the two.
 LITELLM_SPEC='litellm[proxy,proxy-runtime]>=1.84.0'
@@ -494,8 +494,9 @@ else
     download_and_run https://claude.ai/install.sh "Claude Code"
     have_claude \
         || warn "Claude Code is NOT installed — 'claude' unavailable; dependent steps (e.g. MCP registration) will be skipped"
-    # Re-establish bash_profile shim (the installer can drop its own)
-    ensure_managed_bash_profile
+    # Re-establish bash_profile shim (the installer can drop its own).
+    # `force` bypasses the memo in common.sh — the installer just ran.
+    ensure_managed_bash_profile force
 fi
 
 # 4c. ACP adapter (install-if-missing). Only installed with --install-obsidian:
@@ -630,6 +631,11 @@ if [ "$WITH_GATEWAY" = "true" ]; then
         ANTHROPIC_AUTH_TOKEN="sk-$(openssl rand -hex 24)"
         log "Generated new LiteLLM master key (persisted to ~/.profile)"
     fi
+    # A user-supplied key without the sk- prefix is carried as-is, but LiteLLM
+    # requires that prefix for /v1/messages auth (.env.example documents it) —
+    # warn instead of failing so the user can decide.
+    [[ "$ANTHROPIC_AUTH_TOKEN" == sk-* ]] \
+        || warn "ANTHROPIC_AUTH_TOKEN does not start with 'sk-' — LiteLLM rejects such keys on /v1/messages; Claude Code will get 401s until it is fixed in .env / ~/.profile"
 fi
 
 log "Writing gateway + telemetry env vars to ~/.profile..."
@@ -1024,20 +1030,13 @@ if [ "$WITH_LOCAL_LITELLM" = "true" ]; then
         fi
     fi
 
-    systemctl --user enable litellm &>/dev/null || true
-
-    # Restart only when something the service consumes actually changed (env
-    # file, config, unit, compose render, binary upgrade, runtime switch) —
-    # an unconditional restart made every no-op re-run reboot LiteLLM (Prisma
-    # reconnect + boot-time model-map fetch, 5-25s) and drop in-flight gateway
-    # connections. `restart` also starts an inactive unit, so one branch covers
-    # both the changed and the not-running case.
-    if [ "$LITELLM_CHANGED" = "1" ] || ! systemctl --user is-active litellm &>/dev/null; then
-        systemctl --user restart litellm
-        log "LiteLLM service (re)started"
-    else
-        log "LiteLLM unchanged — service left running"
-    fi
+    # Enable + restart only when something the service consumes actually
+    # changed (env file, config, unit, compose render, binary upgrade, runtime
+    # switch) — an unconditional restart made every no-op re-run reboot
+    # LiteLLM (Prisma reconnect + boot-time model-map fetch, 5-25s) and drop
+    # in-flight gateway connections. Called bare: a failed restart aborts
+    # under `set -e`.
+    restart_user_service_if_stale litellm "$LITELLM_CHANGED"
 
     wait_for_litellm "$LITELLM_PORT" || warn "LiteLLM may not be ready — Claude Code calls could fail until it starts"
 fi
@@ -1100,7 +1099,7 @@ if [ ! -f "${HOME}/.claude/settings.json" ]; then
         # `VAR=$(jq …)` form aborts the script under `set -e` if jq fails.
         ROUTER_SETTINGS=$(jq '.sandbox.enabled = false' "$SCRIPT_DIR/configs/claude-settings.json")
         printf '%s\n' "$ROUTER_SETTINGS" \
-            | write_if_changed "${HOME}/.claude/settings.json" 644 "${USER}:${USER}"
+            | write_if_changed "${HOME}/.claude/settings.json" 644
     else
         deploy_config "$SCRIPT_DIR/configs/claude-settings.json" "${HOME}/.claude/settings.json"
     fi
@@ -1356,7 +1355,12 @@ if [ "$CLAUDE_DEVTOOLS_RAM_OK" = "1" ]; then
             log "claude-devtools is up to date at $CLAUDE_DEVTOOLS_INSTALLED_TAG"
         else
             log "claude-devtools: ${CLAUDE_DEVTOOLS_INSTALLED_TAG:-<none>} -> ${CLAUDE_DEVTOOLS_LATEST_TAG}"
-            if ! (cd "$CLAUDE_DEVTOOLS_DIR" && git fetch --depth 1 --no-tags origin tag "$CLAUDE_DEVTOOLS_LATEST_TAG" && git -c advice.detachedHead=false checkout --force "refs/tags/$CLAUDE_DEVTOOLS_LATEST_TAG" && git clean -fdx -e .dt-installed-tag); then
+            # -e dist-standalone: keep the PREVIOUS build output through the
+            # clean — a failed build below then leaves it on disk, so "build
+            # failures are non-fatal, the existing build keeps serving" holds
+            # across service restarts too (the build regenerates the dir
+            # wholesale on success, so nothing stale survives a good build).
+            if ! (cd "$CLAUDE_DEVTOOLS_DIR" && git fetch --depth 1 --no-tags origin tag "$CLAUDE_DEVTOOLS_LATEST_TAG" && git -c advice.detachedHead=false checkout --force "refs/tags/$CLAUDE_DEVTOOLS_LATEST_TAG" && git clean -fdx -e .dt-installed-tag -e dist-standalone); then
                 warn "Failed to check out claude-devtools tag $CLAUDE_DEVTOOLS_LATEST_TAG"
             else
                 log "Building claude-devtools (this may take 2-3 min)..."
@@ -1399,26 +1403,18 @@ if [ "$CLAUDE_DEVTOOLS_RAM_OK" = "1" ]; then
             -e "s|__CLAUDE_DEVTOOLS_DIR__|${CLAUDE_DEVTOOLS_DIR}|g" \
             -e "s|__CLAUDE_DEVTOOLS_PORT__|${CLAUDE_DEVTOOLS_PORT}|g" \
             -e "s|__BUN_BIN__|${CLAUDE_DEVTOOLS_BUN}|g" \
-            -e "s|__HOME__|${HOME}|g" \
             -e "s|__PATH__|${USER_TOOL_PATH}|g"; then
             CLAUDE_DEVTOOLS_CHANGED=1
         fi
 
-        systemctl --user enable claude-devtools &>/dev/null || true
-        # Restart only when the build or unit actually changed — mirrors the
-        # litellm gate in Phase 7 (a no-op re-run must not bounce the service
-        # and drop open DevTools UI sessions). `restart` also starts an
-        # inactive unit, so one branch covers both the changed and the
-        # not-running case.
-        if [ "$CLAUDE_DEVTOOLS_CHANGED" = "1" ] || ! systemctl --user is-active claude-devtools &>/dev/null; then
-            if systemctl --user restart claude-devtools; then
-                CLAUDE_DEVTOOLS_DEPLOYED=1
-            else
-                warn "Failed to start claude-devtools"
-            fi
-        else
-            log "claude-devtools unchanged — service left running"
+        # Enable + restart only when the build or unit actually changed (a
+        # no-op re-run must not bounce the service and drop open DevTools UI
+        # sessions). Unlike the litellm call in Phase 7, a failure here is
+        # non-fatal.
+        if restart_user_service_if_stale claude-devtools "$CLAUDE_DEVTOOLS_CHANGED"; then
             CLAUDE_DEVTOOLS_DEPLOYED=1
+        else
+            warn "Failed to start claude-devtools"
         fi
     else
         warn "claude-devtools build output missing — service deployment skipped"
@@ -1468,8 +1464,9 @@ fi
 # Done
 #############################################################################
 
-# Final safety net for bash_profile shim (curl-pipe installers can clobber it)
-ensure_managed_bash_profile
+# Final safety net for bash_profile shim (curl-pipe installers can clobber it).
+# `force` bypasses the memo — installers may have run since the last check.
+ensure_managed_bash_profile force
 
 log "claude-litellm setup complete!"
 # LiteLLM UI only exists when a local LiteLLM was installed (not harden-only /

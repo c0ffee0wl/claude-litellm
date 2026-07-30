@@ -21,10 +21,12 @@ NC='\033[0m' # No Color
 # Configuration
 #############################################################################
 
-# Shell profile files we mirror env-vars into. ~/.profile is sourced by bash
+# Shell profile file we write env-vars into. ~/.profile is sourced by bash
 # login shells and (via ~/.zprofile chain on most distros) by zsh login shells;
-# non-login shells inherit the env from the parent login shell.
-PROFILE_FILES=("${HOME}/.profile")
+# non-login shells inherit the env from the parent login shell. One constant,
+# used by every reader/writer below — there is deliberately no multi-file
+# machinery (nothing in this repo needs a second profile file).
+PROFILE_FILE="${HOME}/.profile"
 
 # Set to 1 by every code path that changes apt state (apt_install below, plus
 # install_docker_rootless's conflicting-package removes); setup.sh Phase 11
@@ -181,7 +183,7 @@ _profile_unescape() {
     REPLY="${REPLY//\\\\/\\}"
 }
 
-# Idempotently set an export in every file in PROFILE_FILES.
+# Idempotently set an export in PROFILE_FILE.
 # Writes "export NAME=\"value\"" with proper escaping.
 # Usage: update_profile_export VAR_NAME "value"
 update_profile_export() {
@@ -203,58 +205,48 @@ update_profile_export() {
     sed_value="${sed_value//&/\\&}"              # & -> \&
     sed_value="${sed_value//|/\\|}"              # | -> \|
 
-    local profile_file
-    for profile_file in "${PROFILE_FILES[@]}"; do
-        [ ! -f "$profile_file" ] && touch "$profile_file"
-        # Already exactly this line? Skip the sed -i full-file rewrite — with
-        # ~36 calls per setup run this keeps a no-op re-run from rewriting
-        # ~/.profile dozens of times.
-        if grep -qxF "export ${var_name}=\"${escaped_value}\"" "$profile_file" 2>/dev/null; then
-            continue
-        fi
-        if grep -q "^export ${var_name}=" "$profile_file" 2>/dev/null; then
-            sed -i "s|^export ${var_name}=.*|export ${var_name}=\"${sed_value}\"|" "$profile_file"
-        elif grep -q "^#[[:space:]]*export ${var_name}=" "$profile_file" 2>/dev/null; then
-            sed -i "s|^#[[:space:]]*export ${var_name}=.*|export ${var_name}=\"${sed_value}\"|" "$profile_file"
-        else
-            echo "export ${var_name}=\"${escaped_value}\"" >> "$profile_file"
-        fi
-    done
+    [ ! -f "$PROFILE_FILE" ] && touch "$PROFILE_FILE"
+    # Already exactly this line? Skip the sed -i full-file rewrite — with
+    # ~36 calls per setup run this keeps a no-op re-run from rewriting
+    # ~/.profile dozens of times.
+    if grep -qxF "export ${var_name}=\"${escaped_value}\"" "$PROFILE_FILE" 2>/dev/null; then
+        return 0
+    fi
+    if grep -q "^export ${var_name}=" "$PROFILE_FILE" 2>/dev/null; then
+        sed -i "s|^export ${var_name}=.*|export ${var_name}=\"${sed_value}\"|" "$PROFILE_FILE"
+    elif grep -q "^#[[:space:]]*export ${var_name}=" "$PROFILE_FILE" 2>/dev/null; then
+        sed -i "s|^#[[:space:]]*export ${var_name}=.*|export ${var_name}=\"${sed_value}\"|" "$PROFILE_FILE"
+    else
+        echo "export ${var_name}=\"${escaped_value}\"" >> "$PROFILE_FILE"
+    fi
 }
 
-# Read a previously written value from the first file in PROFILE_FILES that
-# contains it. Prints nothing if not present.
+# Read a previously written value from PROFILE_FILE. Prints nothing if not
+# present.
 # Usage: read_profile_export VAR_NAME
 read_profile_export() {
     local var_name="$1"
+    local line
 
-    local profile_file line
-    for profile_file in "${PROFILE_FILES[@]}"; do
-        [ -f "$profile_file" ] || continue
-        line=$(grep "^export ${var_name}=" "$profile_file" 2>/dev/null | head -1)
-        [ -z "$line" ] && continue
-        local value="${line#export ${var_name}=\"}"
-        value="${value%\"}"
-        _profile_unescape "$value"
-        printf '%s' "$REPLY"
-        return 0
-    done
+    [ -f "$PROFILE_FILE" ] || return 0
+    line=$(grep "^export ${var_name}=" "$PROFILE_FILE" 2>/dev/null | head -1)
+    [ -z "$line" ] && return 0
+    local value="${line#export ${var_name}=\"}"
+    value="${value%\"}"
+    _profile_unescape "$value"
+    printf '%s' "$REPLY"
 }
 
-# Delete any `export VAR_NAME=...` line from each file in PROFILE_FILES, and
-# unset the var in the current shell so the rest of setup.sh doesn't inherit
-# a value we just decided to scrub.
+# Delete any `export VAR_NAME=...` line from PROFILE_FILE, and unset the var
+# in the current shell so the rest of setup.sh doesn't inherit a value we
+# just decided to scrub.
 # Usage: remove_profile_export VAR_NAME
 remove_profile_export() {
     local var_name="$1"
 
-    local profile_file
-    for profile_file in "${PROFILE_FILES[@]}"; do
-        [ -f "$profile_file" ] || continue
-        if grep -q "^export ${var_name}=" "$profile_file" 2>/dev/null; then
-            sed -i "/^export ${var_name}=/d" "$profile_file"
-        fi
-    done
+    if [ -f "$PROFILE_FILE" ] && grep -q "^export ${var_name}=" "$PROFILE_FILE" 2>/dev/null; then
+        sed -i "/^export ${var_name}=/d" "$PROFILE_FILE"
+    fi
 
     unset -- "$var_name"
 }
@@ -314,13 +306,13 @@ collect_litellm_provider_vars() {
     # Build ~/.profile export map in a single pass (decoded via
     # _profile_unescape, the shared inverse of update_profile_export's
     # escaping). Used by Passes 2 + 3 below.
-    if [ -f "$HOME/.profile" ]; then
+    if [ -f "$PROFILE_FILE" ]; then
         while IFS= read -r line; do
             [[ "$line" =~ ^export[[:space:]]+([A-Z][A-Z0-9_]*)=\"(.*)\"$ ]] || continue
             v="${BASH_REMATCH[1]}"
             _profile_unescape "${BASH_REMATCH[2]}"
             profile[$v]="$REPLY"
-        done < "$HOME/.profile"
+        done < "$PROFILE_FILE"
     fi
 
     # Pass 1: pattern-match current shell env
@@ -354,30 +346,41 @@ collect_litellm_provider_vars() {
     done
 }
 
-# Ensure a PATH line exists in ~/.profile (idempotent append).
+# Ensure a PATH line exists in PROFILE_FILE (idempotent append).
 ensure_path_in_profile() {
     local line="$1"
-    local file="${HOME}/.profile"
 
     ensure_managed_bash_profile
-    [ ! -f "$file" ] && touch "$file"
-    grep -qF "$line" "$file" 2>/dev/null || echo "$line" >> "$file"
+    [ ! -f "$PROFILE_FILE" ] && touch "$PROFILE_FILE"
+    grep -qF "$line" "$PROFILE_FILE" 2>/dev/null || echo "$line" >> "$PROFILE_FILE"
 }
 
 # Ensure ~/.bash_profile sources ~/.profile so bash login shells pick up our env
 # vars. Per bash(1) startup order, login shells read the first of ~/.bash_profile,
 # ~/.bash_login, ~/.profile that exists and skip the rest. Tools that drop their
 # own ~/.bash_profile (bun, uv, claude installers) would otherwise shadow .profile.
+# A pre-existing ~/.bash_login is left alone: once the shim exists bash never
+# reads it (first-of-three), so it's inert — deleting a user dotfile isn't ours
+# to do.
 #
 # Policy: be a polite co-tenant. If the shim source line is already present,
 # leave the file alone — don't wipe installer blocks appended below us. Only
 # write when the line is missing (fresh file or someone clobbered the shim);
 # preserve any existing content by prepending.
+#
+# Memoised: every update_profile_export call re-invokes this (~35×/run), but
+# the shim can only change when an installer runs. Pass `force` at the
+# re-assert sites after such a run (post-Claude-installer, end-of-run net);
+# everything else hits the flag and returns fork-free.
+# Usage: ensure_managed_bash_profile [force]
 ensure_managed_bash_profile() {
+    if [ "${1:-}" != "force" ] && [ -n "${_SHIM_ENSURED:-}" ]; then
+        return 0
+    fi
+    _SHIM_ENSURED=1
+
     local shim="${HOME}/.bash_profile"
     local source_line='[ -f ~/.profile ] && . ~/.profile'
-
-    rm -f "${HOME}/.bash_login"
 
     if [ -f "$shim" ] && grep -qF "$source_line" "$shim"; then
         return 0
@@ -673,30 +676,28 @@ wait_for_litellm() {
 #############################################################################
 
 # Deploy a config file with permissions. Delegates the content-aware (and
-# atomic) write to write_if_changed, so mtime is preserved on no-op runs;
-# mode/owner are always re-applied.
-# Usage: deploy_config source dest [mode] [owner]
+# atomic) write to write_if_changed, so mtime is preserved on no-op runs.
+# vs write_if_changed: takes a source PATH and re-asserts mode on every run
+# (even no-op ones); use write_if_changed directly when the content comes
+# from a pipe or the caller needs the changed/unchanged return status.
+# Usage: deploy_config source dest [mode]
 deploy_config() {
     local source="$1"
     local dest="$2"
     local mode="${3:-644}"
-    local owner="${4:-${USER}:${USER}}"
 
     # || true: write_if_changed returns 1 on unchanged content, which must not
     # abort the script under `set -e`.
     write_if_changed "$dest" < "$source" || true
     chmod "$mode" "$dest"
-    # chown only works if we're root or we own the file already; ignore failures.
-    chown "$owner" "$dest" 2>/dev/null || true
 }
 
 # Write stdin content to <dest>, leaving mtime untouched if content is unchanged.
 # Returns 0 if written (new or modified), 1 if unchanged.
-# Usage: <producer> | write_if_changed <dest> [mode] [owner]
+# Usage: <producer> | write_if_changed <dest> [mode]
 write_if_changed() {
     local dest="$1"
     local mode="${2:-}"
-    local owner="${3:-}"
     local tmp
     tmp=$(mktemp)
     cat > "$tmp"
@@ -709,7 +710,6 @@ write_if_changed() {
     mkdir -p "$(dirname "$dest")"
     mv "$tmp" "$dest"
     [ -n "$mode" ] && chmod "$mode" "$dest"
-    [ -n "$owner" ] && chown "$owner" "$dest" 2>/dev/null || true
     return 0
 }
 
@@ -745,5 +745,25 @@ stop_user_service_if_active() {
     if systemctl --user is-active "$name" &>/dev/null; then
         systemctl --user stop "$name"
         log "${name} service stopped"
+    fi
+}
+
+# Enable a systemd --user service and restart it only when STALE: when
+# <changed> is 1 (something the service consumes was redeployed this run) or
+# the unit is not active (`restart` also starts an inactive unit, so one
+# branch covers both). An unchanged active service is left running — a no-op
+# re-run must not bounce it and drop live connections/sessions. Returns 1 on
+# restart failure (explicit `|| return 1`, so the outcome is the same whether
+# the caller runs it bare — fatal under `set -e` — or in an `if` condition);
+# 0 when restarted or left running.
+# Usage: restart_user_service_if_stale <name> <changed 0|1>
+restart_user_service_if_stale() {
+    local name="$1" changed="$2"
+    systemctl --user enable "$name" &>/dev/null || true
+    if [ "$changed" = "1" ] || ! systemctl --user is-active "$name" &>/dev/null; then
+        systemctl --user restart "$name" || return 1
+        log "${name} service (re)started"
+    else
+        log "${name} unchanged — service left running"
     fi
 }

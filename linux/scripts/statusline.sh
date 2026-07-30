@@ -18,8 +18,10 @@
 #
 # Mode is detected via ANTHROPIC_BASE_URL:
 #   DIRECT  — empty or non-local: show 5h/7d rate-limit budgets (Claude.ai
-#            Pro/Max), each with a reset countdown from rate_limits.*.resets_at
-#   LITELLM — 127.0.0.1:4000: show progress bar + model + ctx %, with the
+#            Pro/Max), each with a reset countdown from rate_limits.*.resets_at.
+#            NB a REMOTE LiteLLM router (the --harden-only setup) also lands
+#            here — line 2 then shows only model + ctx, no upstream/spend info
+#   LITELLM — 127.0.0.1/localhost:4000: show progress bar + model + ctx %, with the
 #            upstream model (e.g. gpt-5.6-terra) appended after an arrow when
 #            available via LiteLLM's /model/info endpoint, plus trailing
 #            30-day gateway spend (labelled "/30d") from LiteLLM's
@@ -34,11 +36,18 @@ exec 2>/dev/null
 IFS= read -rd '' input
 
 # Inside a bubblewrap sandbox the inherited $USER/$HOSTNAME may reflect the
-# outer environment, while `id`/`hostname` return the sandboxed values. `id`
-# must fork (NSS); the hostname comes fork-free from /proc, which is the live
-# per-UTS-namespace value (statusline shares CC's namespaces), with the
-# hostname binary as fallback.
-user=$(id -un)
+# outer environment, while /etc/passwd and `hostname` reflect the sandboxed
+# view. The uid->name lookup reads the namespace-visible /etc/passwd with
+# builtins (that IS what NSS-files does, minus the fork); `id -un` stays as
+# the fallback for non-files NSS (LDAP/SSSD) or an unreadable passwd. The
+# hostname comes fork-free from /proc, which is the live per-UTS-namespace
+# value (statusline shares CC's namespaces), with the hostname binary as
+# fallback.
+user=""
+while IFS=: read -r pw_name _ pw_uid _; do
+    [ "$pw_uid" = "$EUID" ] && { user="$pw_name"; break; }
+done < /etc/passwd
+[ -n "$user" ] || user=$(id -un)
 host=""
 IFS= read -r host < /proc/sys/kernel/hostname
 [ -n "$host" ] || host=$(hostname)
@@ -93,6 +102,21 @@ IFS=$'\t' read -r cwd proj_dir DURATION_MS MODEL MODEL_ID PCT CTX_SIZE FIVE_H WE
 # "-" is the absent-field sentinel from the jq @tsv above; restore empty for
 # fields whose emptiness carries meaning.
 [ "$MODEL_ID" = "-" ] && MODEL_ID=""
+
+# Per-user cache dir — shared by the sandbox-verdict memo below and the
+# LiteLLM endpoint caches further down.
+CACHE_DIR="${XDG_RUNTIME_DIR:-/tmp}"
+
+# Atomically persist one line per argument to file $1 ($$-suffixed tmp + mv,
+# so concurrent renders can't interleave). Fork-free. One writer for every
+# memo/derived file below — the target name is spelled once per call, so a
+# typo can't silently strand a cache (the global `exec 2>/dev/null` would
+# swallow the error).
+persist() {
+    local f="$1"
+    shift
+    printf '%s\n' "$@" > "${f}.$$.tmp" && mv "${f}.$$.tmp" "$f"
+}
 
 # Sandbox detection drives the fail-safe "(unsandboxed)" warning below.
 # SANDBOXED is set only on positive confirmation that bash commands are
@@ -166,13 +190,43 @@ else
                    "$HOME/.claude/settings.json"; do
         [ -r "$sb_file" ] && sb_files+=("$sb_file")
     done
-    # ONE jq over all readable files (the filter runs once per input document,
-    # in argument order) instead of a fork per file; the first true/false token
-    # is the highest-precedence file that defines the key. A malformed file
-    # aborts jq's remaining output, so files after it read as "unset" — which
-    # warns, per the fail-safe contract. Tokens are fixed words, so unquoted
-    # word-splitting of $sb_vals is safe.
-    if [ ${#sb_files[@]} -gt 0 ]; then
+    # Memoised verdict: the jq below used to re-parse up to 5 settings files
+    # on EVERY render for a value that changes ~never. Cache line 1 = verdict
+    # (1/0), lines 2..N = the readable-file list it was computed from. Reuse
+    # only when that file set is unchanged AND no listed file is newer than
+    # the memo (builtin -nt tests — zero forks on the steady-state render).
+    # A file appearing, disappearing, or changing all invalidate; the
+    # disappear case is load-bearing for the fail-safe contract (a stale
+    # "sandboxed" verdict must not outlive the file that justified it).
+    # Key the memo by project too (sanitized, last 64 chars): the verdict
+    # depends on proj_dir via two of the candidate paths, and a shared
+    # per-user file would make two concurrent sessions in different projects
+    # invalidate each other every render (0% hit rate). On a truncation
+    # collision the stored file-list comparison below still keeps the verdict
+    # correct — it just degrades to the recompute path.
+    sb_key="${proj_dir//[!A-Za-z0-9]/_}"
+    # Last <=64 chars via arithmetic offset — NB `${var: -64}` is a trap: it
+    # expands to EMPTY (not the whole string) when the string is shorter.
+    sb_memo="${CACHE_DIR}/claude-litellm-sbon-${EUID}-${sb_key:$(( ${#sb_key} > 64 ? ${#sb_key} - 64 : 0 ))}"
+    sb_fresh=""
+    if [ -r "$sb_memo" ]; then
+        mapfile -t sb_memo_lines < "$sb_memo"
+        if [ "${sb_memo_lines[*]:1}" = "${sb_files[*]}" ]; then
+            sb_fresh=1
+            for sb_file in "${sb_files[@]}"; do
+                [ "$sb_file" -nt "$sb_memo" ] && { sb_fresh=""; break; }
+            done
+        fi
+    fi
+    if [ -n "$sb_fresh" ]; then
+        [ "${sb_memo_lines[0]}" = "1" ] && SANDBOX_ON=1
+    elif [ ${#sb_files[@]} -gt 0 ]; then
+        # ONE jq over all readable files (the filter runs once per input
+        # document, in argument order) instead of a fork per file; the first
+        # true/false token is the highest-precedence file that defines the
+        # key. A malformed file aborts jq's remaining output, so files after
+        # it read as "unset" — which warns, per the fail-safe contract.
+        # Tokens are fixed words, so unquoted word-splitting of $sb_vals is safe.
         sb_vals=$(jq -r 'try (.sandbox.enabled) catch null | if .==true then "true" elif .==false then "false" else "unset" end' "${sb_files[@]}" 2>/dev/null)
         for sb_val in $sb_vals; do
             case "$sb_val" in
@@ -180,6 +234,7 @@ else
                 false) SANDBOX_ON=""; break ;;
             esac
         done
+        persist "$sb_memo" "${SANDBOX_ON:-0}" "${sb_files[@]}"
     fi
     # bwrap presence: prefer a PATH lookup, but fall back to the canonical apt
     # install locations. CC may invoke the statusline with a PATH lacking
@@ -204,8 +259,9 @@ fi
 # Resolve the LiteLLM master key on demand, memoised — shared by /model/info
 # and /global/spend. Sources, in order: env (when Claude Code passes it
 # through), ~/.profile (where update_profile_export writes it),
-# ~/.config/litellm/env (the systemd EnvironmentFile, mode 600). Lazy + memoised
-# so the sed forks happen only on a cache miss, at most once per render.
+# ~/.config/litellm/env (the systemd EnvironmentFile, mode 600). Called only
+# inside the DETACHED fetch job below, so its sed forks never land on the
+# render path; each job memoises for its own lifetime.
 TOKEN=""; TOKEN_RESOLVED=""
 resolve_token() {
     [ -n "$TOKEN_RESOLVED" ] && return
@@ -223,36 +279,47 @@ resolve_token() {
 }
 
 # Refresh cache file $1 from LiteLLM endpoint $3 when the last fetch ATTEMPT
-# is older than $2 minutes. Stale-while-revalidate: the fetch runs in a
-# DETACHED background job and the caller renders immediately with whatever
-# cache already exists — a render never blocks on the network; a cold cache
-# just means the data appears on a later render (fail-soft). The .ts stamp
-# records the attempt (written BEFORE fetching), so an unreachable endpoint is
-# retried at most once per window rather than piling up one curl per render,
-# and the freshness check is builtin arithmetic — no find/stat fork. The job's
-# stdio redirects are load-bearing: Claude Code waits for the statusline's
-# stdout to close, so the job must not inherit it. Writes atomically
-# (tmp + mv); concurrent refreshes are benign ($$-suffixed tmp, atomic mv).
-# --max-time 5 bounds only the background job, never a render.
+# is older than $2 minutes, then digest it with jq filter $4 into one-line
+# derived file $5 (optional $6 is exposed to the filter as $id). The digest
+# runs inside the already-detached background job, so the render path reads
+# the derived line with a builtin `read` — zero jq forks in steady state.
+# Stale-while-revalidate: the fetch runs in a DETACHED background job and the
+# caller renders immediately with whatever cache already exists — a render
+# never blocks on the network; a cold cache just means the data appears on a
+# later render (fail-soft). The .ts stamp records the attempt (written BEFORE
+# fetching), so an unreachable endpoint is retried at most once per window
+# rather than piling up one curl per render, and the freshness check is
+# builtin arithmetic — no find/stat fork. The job's stdio redirects are
+# load-bearing: Claude Code waits for the statusline's stdout to close, so
+# the job must not inherit it. Writes atomically (tmp + mv); concurrent
+# refreshes are benign ($$-suffixed tmp, atomic mv). --max-time 5 bounds only
+# the background job, never a render.
 fetch_litellm_cache() {
-    local cache_file="$1" max_age_min="$2" endpoint="$3" tmp stamp ts="" now
+    local cache_file="$1" max_age_min="$2" endpoint="$3" digest="$4" derived="$5" key="${6:-}"
+    local tmp stamp ts="" now
     stamp="${cache_file}.ts"
     IFS= read -r ts < "$stamp"
     printf -v now '%(%s)T' -1
     if [[ "$ts" =~ ^[0-9]+$ ]] && (( now - ts < max_age_min * 60 )); then
         return
     fi
-    resolve_token
-    [ -n "$TOKEN" ] || return
     printf '%s' "$now" > "$stamp"
     tmp="${cache_file}.$$.tmp"
+    # Token resolution lives INSIDE the detached job: its sed forks never
+    # block a render, and a token-less box retries once per stamp window
+    # instead of re-grepping ~/.profile on every render. --arg id is passed
+    # unconditionally — jq tolerates an unused or empty binding.
     (
+        resolve_token
+        [ -n "$TOKEN" ] || exit 0
         curl -sf --max-time 5 \
             -H "Authorization: Bearer $TOKEN" \
             "${ANTHROPIC_BASE_URL%/}/$endpoint" \
             -o "$tmp" \
-            && mv "$tmp" "$cache_file"
-        rm -f "$tmp"
+            && mv "$tmp" "$cache_file" \
+            && jq -r --arg id "$key" "$digest" "$cache_file" > "${derived}.$$.tmp" \
+            && mv "${derived}.$$.tmp" "$derived"
+        rm -f "$tmp" "${derived}.$$.tmp"
     ) </dev/null >/dev/null 2>&1 &
 }
 
@@ -261,30 +328,52 @@ fetch_litellm_cache() {
 UPSTREAM_MODEL=""
 SPEND=""
 if [ "$MODE" = "LITELLM" ]; then
-    CACHE_DIR="${XDG_RUNTIME_DIR:-/tmp}"
+    # /model/info digest: match model_name (public alias) OR model_info.id
+    # (internal uuid) — Claude Code's .model.id is usually the alias but be
+    # defensive. One definition feeds both the background digest and the
+    # first-render fallback below.
+    MODELINFO_DIGEST='[.data[]? | select(.model_name == $id or (.model_info.id // "") == $id) | .litellm_params.model][0] // ""'
 
-    # Resolve upstream model via /model/info (cached 5min).
+    # Resolve upstream model via /model/info (cached 5min, digested inside the
+    # background fetch — the steady-state render is one builtin read). The
+    # derived file is keyed by MODEL_ID in its NAME (sanitized), so concurrent
+    # sessions on different models each keep their own fork-free line instead
+    # of re-keying a shared one every render; the raw cache + stamp stay
+    # shared (one fetch per window serves every session).
     if [ -n "$MODEL_ID" ]; then
         CACHE_FILE="${CACHE_DIR}/claude-litellm-modelinfo-${EUID}.json"
-        fetch_litellm_cache "$CACHE_FILE" 5 "model/info"
-        if [ -s "$CACHE_FILE" ]; then
-            # Match against model_name (public alias) OR model_info.id (internal
-            # uuid); Claude Code's .model.id is usually the alias but be defensive.
-            UPSTREAM_MODEL=$(jq -r --arg id "$MODEL_ID" \
-                '[.data[]? | select(.model_name == $id or (.model_info.id // "") == $id) | .litellm_params.model][0] // empty' \
-                "$CACHE_FILE" 2>/dev/null)
-            UPSTREAM_MODEL="${UPSTREAM_MODEL#*/}"
+        MODELINFO_DERIVED="${CACHE_DIR}/claude-litellm-modelinfo-${EUID}-${MODEL_ID//[!A-Za-z0-9._-]/_}.derived"
+        fetch_litellm_cache "$CACHE_FILE" 5 "model/info" "$MODELINFO_DIGEST" "$MODELINFO_DERIVED" "$MODEL_ID"
+        IFS= read -r UPSTREAM_MODEL < "$MODELINFO_DERIVED"
+        if [ ! -e "$MODELINFO_DERIVED" ] && [ -s "$CACHE_FILE" ]; then
+            # No derived line for THIS model yet (first render after a model
+            # switch / in a new session, or a cache from a pre-digest
+            # version): derive once and persist — even an empty result, so
+            # the branch is terminal and can't re-fork every render.
+            UPSTREAM_MODEL=$(jq -r --arg id "$MODEL_ID" "$MODELINFO_DIGEST" "$CACHE_FILE" 2>/dev/null)
+            persist "$MODELINFO_DERIVED" "$UPSTREAM_MODEL"
         fi
+        UPSTREAM_MODEL="${UPSTREAM_MODEL#*/}"
     fi
 
-    # Trailing-30-day gateway spend via /global/spend (cached 1min). The master
-    # key is proxy admin, so user_api_key_auth passes; returns {"spend": <usd>}.
+    # Trailing-30-day gateway spend via /global/spend (cached 1min, digested
+    # inside the background fetch). The master key is proxy admin, so
+    # user_api_key_auth passes; returns {"spend": <usd>}.
     # NB: /global/spend sums the MonthlyGlobalSpend view, whose WHERE clause is
     # "startTime >= CURRENT_DATE - INTERVAL '30 days'" — a rolling 30-day window,
     # not calendar month-to-date. Labelled "/30d" below to match.
+    SPEND_DIGEST='.spend // ""'
     SPEND_CACHE="${CACHE_DIR}/claude-litellm-spend-${EUID}.json"
-    fetch_litellm_cache "$SPEND_CACHE" 1 "global/spend"
-    [ -s "$SPEND_CACHE" ] && SPEND=$(jq -r '.spend // empty' "$SPEND_CACHE" 2>/dev/null)
+    SPEND_DERIVED="${CACHE_DIR}/claude-litellm-spend-${EUID}.derived"
+    fetch_litellm_cache "$SPEND_CACHE" 1 "global/spend" "$SPEND_DIGEST" "$SPEND_DERIVED"
+    IFS= read -r SPEND < "$SPEND_DERIVED"
+    if [ ! -e "$SPEND_DERIVED" ] && [ -s "$SPEND_CACHE" ]; then
+        # Raw cache exists but no derived line yet (pre-digest version):
+        # derive once and persist — even an empty (null-spend) result, so the
+        # branch is terminal and can't re-fork every render.
+        SPEND=$(jq -r "$SPEND_DIGEST" "$SPEND_CACHE" 2>/dev/null)
+        persist "$SPEND_DERIVED" "$SPEND"
+    fi
 fi
 
 # Line 1: identity + directory + (duration, only once the first turn completes)
@@ -302,16 +391,18 @@ printf "\033[0m\n"
 
 GREEN='\033[32m'; YELLOW='\033[33m'; RED='\033[31m'; RESET='\033[0m'
 
-# Compact "time remaining" from an epoch-seconds timestamp; prints nothing on
-# invalid input, "now" once the window has elapsed.
+# Compact "time remaining" from an epoch-seconds timestamp, returned via the
+# RESET_IN global (printf -v, no command-substitution fork). Empty on invalid
+# input, "now" once the window has elapsed.
 fmt_reset() {
     local at="$1" now diff d h m
-    [[ "$at" =~ ^[0-9]+$ ]] || return
-    printf -v now '%(%s)T' -1; diff=$((at - now)); (( diff <= 0 )) && { printf 'now'; return; }
+    RESET_IN=""
+    [[ "$at" =~ ^[0-9]+$ ]] || return 0
+    printf -v now '%(%s)T' -1; diff=$((at - now)); (( diff <= 0 )) && { RESET_IN="now"; return 0; }
     d=$((diff/86400)); h=$(((diff%86400)/3600)); m=$(((diff%3600)/60))
-    if   (( d > 0 )); then printf '%dd%dh' "$d" "$h"
-    elif (( h > 0 )); then printf '%dh%dm' "$h" "$m"
-    else printf '%dm' "$m"; fi
+    if   (( d > 0 )); then printf -v RESET_IN '%dd%dh' "$d" "$h"
+    elif (( h > 0 )); then printf -v RESET_IN '%dh%dm' "$h" "$m"
+    else printf -v RESET_IN '%dm' "$m"; fi
 }
 
 # Color-coded progress bar
@@ -347,19 +438,30 @@ LINE2="${GREEN}[${MODEL_LABEL}] ${BAR_COLOR}${BAR}${GREEN} ${PCT}% (${CTX_LABEL}
 # the inherited locale; the regex requires a well-formed number (no multi-dot).
 SUFFIX=""
 if [ "$MODE" = "DIRECT" ]; then
-    # Anthropic Pro/Max: 5h and 7d budget percentages, each with a reset countdown
+    # Anthropic Pro/Max: 5h and 7d budget percentages, each with a reset
+    # countdown. All builtin printf -v — no subshell forks.
     if [[ "$FIVE_H" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
-        r=$(fmt_reset "$FIVE_H_RESET"); SUFFIX="5h: $(LC_ALL=C printf '%.0f' "$FIVE_H")%${r:+ ($r)}"
+        fmt_reset "$FIVE_H_RESET"
+        LC_ALL=C printf -v pct '%.0f' "$FIVE_H"
+        SUFFIX="5h: ${pct}%${RESET_IN:+ ($RESET_IN)}"
     fi
     if [[ "$WEEK" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
-        r=$(fmt_reset "$WEEK_RESET"); SUFFIX="${SUFFIX:+$SUFFIX, }7d: $(LC_ALL=C printf '%.0f' "$WEEK")%${r:+ ($r)}"
+        fmt_reset "$WEEK_RESET"
+        LC_ALL=C printf -v pct '%.0f' "$WEEK"
+        SUFFIX="${SUFFIX:+$SUFFIX, }7d: ${pct}%${RESET_IN:+ ($RESET_IN)}"
     fi
 elif [ "$MODE" = "LITELLM" ] && [[ "$SPEND" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
     # Trailing-30-day gateway spend, explicitly labelled "/30d" so it can't be
-    # mistaken for session cost or for calendar month-to-date; awk for the float
-    # compare
-    if   LC_ALL=C awk "BEGIN{exit !($SPEND>=0.01)}"; then SUFFIX="$(LC_ALL=C printf '$%.2f/30d' "$SPEND")"
-    elif LC_ALL=C awk "BEGIN{exit !($SPEND>0)}";    then SUFFIX="$(LC_ALL=C printf '$%.4f/30d' "$SPEND")"; fi
+    # mistaken for session cost or for calendar month-to-date. Builtin
+    # printf -v %f — fork-free, matching the DIRECT branch: 2 decimals when
+    # that shows a visible cent, else 4, else no suffix. Only divergence from
+    # the old awk float-compare: [0.005,0.01) now rounds up to "$0.01".
+    LC_ALL=C printf -v spend_fmt '%.2f' "$SPEND"
+    if [ "$spend_fmt" = "0.00" ]; then
+        LC_ALL=C printf -v spend_fmt '%.4f' "$SPEND"
+        [ "$spend_fmt" = "0.0000" ] && spend_fmt=""
+    fi
+    [ -n "$spend_fmt" ] && SUFFIX="\$${spend_fmt}/30d"
 fi
 
 [ -n "$SUFFIX" ] && LINE2="${LINE2} | ${SUFFIX}"
