@@ -42,6 +42,16 @@ litellm_settings:
   request_timeout: 600
   num_retries: 2
   json_logs: true
+  # Ask Azure for reasoning summaries (summary: "detailed") on the Responses
+  # API. Without this (LiteLLM default: off) the Anthropic→Responses adapter
+  # emits ZERO thinking blocks: reasoning tokens still bill, Claude Code
+  # displays nothing. Summaries are not guaranteed on every request (expected —
+  # Azure reasoning-models doc). If Azure 400s naming `summary` (subscription
+  # lacks summary access), set this to false in the repo's
+  # linux/configs/litellm-config.yaml — setup.sh regenerates the deployed copy
+  # from that template on every run, so hand-edits here don't survive.
+  # Mechanism + source refs: CLAUDE.md > Troubleshooting.
+  reasoning_auto_summary: true
 
 general_settings:
   master_key: os.environ/LITELLM_MASTER_KEY

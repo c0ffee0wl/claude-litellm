@@ -659,6 +659,15 @@ else
     remove_profile_export "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"
 fi
 
+# Retired mirror toggle — scrubbed BEFORE the mirror loop below so that a
+# deliberate re-add to the managed env: block would win (writer runs last).
+# The umbrella was replaced by its four documented components
+# (DISABLE_AUTOUPDATER/FEEDBACK_COMMAND/ERROR_REPORTING/TELEMETRY): it
+# disables gateway model discovery at ANY value, even "0" — presence-triggered
+# (anthropics/claude-code#61112) — while the individual flags don't. It also
+# gated GrowthBook fetches (#45918); DISABLE_GROWTHBOOK above still covers that.
+remove_profile_export "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"
+
 # Claude Code feature/privacy toggles — single-sourced from the managed-settings
 # template's env: block (the authoritative policy artifact), so full/harden
 # (managed file) and --router-only (~/.profile only) can't drift apart on adds
@@ -683,10 +692,13 @@ update_profile_export "CLAUDE_CODE_ATTRIBUTION_HEADER"           "0"
 
 # UX/behavior preferences (all modes). Kept in ~/.profile (user-level prefs,
 # not enforced policy → user can `unset`), so they apply regardless of flags.
-#   * AUTOCOMPACT_PCT_OVERRIDE: auto-compact at 75% of the context window
-#     (earlier than the ~83.5% default → more response headroom). Only *lowers*
-#     the threshold; a Math.min clamp ignores values above the default
-#     (anthropics/claude-code#31806). Applies to main + subagents.
+#   * AUTOCOMPACT_PCT_OVERRIDE: percentage of the auto-compaction window at
+#     which auto-compact triggers. Currently INERT on this gateway path — it
+#     only applies when compaction is proactive (cloud sessions, Sonnet/Opus
+#     4.6, or CLAUDE_CODE_AUTO_COMPACT_WINDOW set — deliberately unset here;
+#     see CLAUDE.md > "Model naming" for the window-var reasoning). Kept as a
+#     cheap forward-compatible pref: self-activates if any condition ever
+#     holds, and only *lowers* the threshold (anthropics/claude-code#31806).
 #   * FORK_SUBAGENT: let Claude spawn forked subagents — a subagent that inherits
 #     the full session context (same model/tools/history) instead of a fresh one.
 #     `/fork` works without it (default v2.1.161+); the var additionally lets Claude
@@ -704,57 +716,38 @@ update_profile_export "CLAUDE_CODE_FORK_SUBAGENT"               "1"
 # statusline + hooks (anthropics/claude-code #37780).
 remove_profile_export "IS_DEMO"
 
-# Default model selectors + gateway discovery. In ~/.profile (not managed-settings)
-# so they apply in --router-only too. Values are the upstream provider-prefixed
-# ids surfaced by litellm-config.yaml when Azure creds are supplied. When the
-# user leaves Azure blank in .env, write empty values (unless a prior re-run /
-# manual edit already set them) and emit a banner at end-of-script telling the
-# user to add a model via /ui and fill these in. CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
-# is always on so any `claude-*` model added later via /ui auto-appears in
-# /model. See CLAUDE.md > "Model naming".
-#
-# The *_SUPPORTED_CAPABILITIES companions tell Claude Code which features the
-# pinned model supports. Claude Code's built-in detection only matches
-# claude-*/anthropic-* ids, so with upstream-prefixed ids like azure/gpt-5.6-terra
-# it would otherwise leave extended thinking + effort DISABLED (and never send a
-# thinking block). Values are tuned for Azure GPT-5.6: `xhigh_effort` is included
-# for the terra/sol tiers and is genuinely active, not merely tolerated — LiteLLM's
-# model map declares `supports_xhigh_reasoning_effort: true` for gpt-5.6-{sol,terra,luna},
-# so it runs as real xhigh rather than silently clamping to high (the pre-5.6
-# rationale). `max_effort` stays excluded, but NOT because `max` is Anthropic-only —
-# Azure GPT-5.6 does accept reasoning_effort=max on the Responses API. It is excluded
-# because LiteLLM's map carries no `supports_max_reasoning_effort` for these ids, so
-# it still clamps max->xhigh (BerriAI/litellm#26111) — a misleading picker entry.
-# Revisit if that map flag ever lands. The haiku tier (gpt-5.6-luna) omits
-# `xhigh_effort` by CHOICE, not constraint: luna declares the flag true (the
-# previous fast tier declared it false), but xhigh on the fast tier defeats its
-# purpose.
-# `adaptive_thinking` routes effort via output_config.effort, which LiteLLM's
-# Anthropic->Responses adapter reads directly. See CLAUDE.md > "Model naming".
+# Retired exports — scrubbed on every run (exports only accumulate; the
+# IS_DEMO pattern above). The *_SUPPORTED_CAPABILITIES trio is inert behind an
+# ANTHROPIC_BASE_URL gateway — the gateway protocol reference scopes it to
+# CLAUDE_CODE_USE_{BEDROCK,VERTEX,FOUNDRY,MANTLE} only. Thinking needs no
+# declaration (CC treats unrecognized ids as current models and sends
+# thinking:{"type":"adaptive"}); effort comes from
+# CLAUDE_CODE_ALWAYS_ENABLE_EFFORT below. Re-add only if this box ever moves
+# to a CLAUDE_CODE_USE_* provider.
+remove_profile_export "ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES"
+remove_profile_export "ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES"
+remove_profile_export "ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES"
+
+# Default model selectors + gateway discovery + effort. In ~/.profile (not
+# managed-settings) so they apply in --router-only too. Values are the upstream
+# provider-prefixed ids surfaced by litellm-config.yaml when Azure creds are
+# supplied. When the user leaves Azure blank in .env, write empty values
+# (unless a prior re-run / manual edit already set them) and emit a banner at
+# end-of-script telling the user to add a model via /ui and fill these in.
+# No *_SUPPORTED_CAPABILITIES companions (scrubbed above); the full
+# thinking/effort story is in CLAUDE.md > "Model naming".
 NEEDS_MODEL_CONFIG=0
 # Skipped entirely under --install-only: the default-model selectors point at the
-# upstream provider ids that only resolve through the LiteLLM gateway, and gateway
-# model discovery is moot with no gateway. NEEDS_MODEL_CONFIG stays 0 so its
+# upstream provider ids that only resolve through the LiteLLM gateway, and the
+# discovery + effort levers are moot with no gateway (direct Anthropic API
+# recognizes its own model ids). NEEDS_MODEL_CONFIG stays 0 so its
 # end-of-script banner never fires in that mode.
 if [ "$WITH_GATEWAY" = "true" ]; then
     if [ -n "${AZURE_OPENAI_API_KEY:-}" ] && [ -n "${AZURE_RESOURCE_ENDPOINT:-}" ]; then
-        update_profile_export "ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES"   "thinking,adaptive_thinking,interleaved_thinking,effort,xhigh_effort"
-        update_profile_export "ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES" "thinking,adaptive_thinking,interleaved_thinking,effort,xhigh_effort"
-        update_profile_export "ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES"  "thinking,adaptive_thinking,effort"
         update_profile_export "ANTHROPIC_DEFAULT_HAIKU_MODEL"  "azure/gpt-5.6-luna"
         update_profile_export "ANTHROPIC_DEFAULT_SONNET_MODEL" "azure/gpt-5.6-terra"
         update_profile_export "ANTHROPIC_DEFAULT_OPUS_MODEL"   "azure/gpt-5.6-terra"
     else
-        # Capability declarations track the model ids; clear them when no model is
-        # pinned (preserving any manual value). Kept out of the NEEDS_MODEL_CONFIG
-        # loop above — capabilities aren't themselves a reason to nag for a model id.
-        for var in ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES \
-                   ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES \
-                   ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES; do
-            if [ -z "$(read_profile_export "$var")" ]; then
-                update_profile_export "$var" ""
-            fi
-        done
         for var in ANTHROPIC_DEFAULT_HAIKU_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL; do
             existing="$(read_profile_export "$var")"
             if [ -z "$existing" ]; then
@@ -763,7 +756,18 @@ if [ "$WITH_GATEWAY" = "true" ]; then
             fi
         done
     fi
+    # Discovery: populate /model from the gateway's /v1/models (CC >=2.1.129;
+    # claude-*/anthropic-* ids only; also needs LiteLLM >=1.95.0 — the
+    # two-gate story is in CLAUDE.md > "Model naming").
     update_profile_export "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY" "1"
+    # Effort for custom model ids — the documented gateway lever; models that
+    # reject effort are still excluded by CC, so safe for /ui-added entries.
+    update_profile_export "CLAUDE_CODE_ALWAYS_ENABLE_EFFORT" "1"
+else
+    # Box flipped from a gateway mode → clean the gateway-only levers
+    # (the SUBPROCESS_ENV_SCRUB pattern above).
+    remove_profile_export "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"
+    remove_profile_export "CLAUDE_CODE_ALWAYS_ENABLE_EFFORT"
 fi
 
 update_profile_export "NO_PROXY"             "127.0.0.1"
@@ -1521,10 +1525,7 @@ if [ "$NEEDS_MODEL_CONFIG" = "1" ] && [ -t 1 ]; then
     echo -e "         ${GREEN}export ANTHROPIC_DEFAULT_HAIKU_MODEL=\"<name>\"${NC}"
     echo -e "         ${GREEN}export ANTHROPIC_DEFAULT_SONNET_MODEL=\"<name>\"${NC}"
     echo -e "         ${GREEN}export ANTHROPIC_DEFAULT_OPUS_MODEL=\"<name>\"${NC}"
-    echo -e "    3. If that name is not \`claude-*\`/\`anthropic-*\`, also declare its"
-    echo -e "       capabilities or Claude Code leaves thinking + effort OFF:"
-    echo -e "         ${GREEN}export ANTHROPIC_DEFAULT_{HAIKU,SONNET,OPUS}_MODEL_SUPPORTED_CAPABILITIES=\"thinking,adaptive_thinking,interleaved_thinking,effort\"${NC}"
-    echo -e "    4. ${GREEN}source ~/.profile${NC} (or log out and back in) before \`claude\`."
+    echo -e "    3. ${GREEN}source ~/.profile${NC} (or log out and back in) before \`claude\`."
     echo -e "${YELLOW}${rule}${NC}"
     echo ""
 fi
