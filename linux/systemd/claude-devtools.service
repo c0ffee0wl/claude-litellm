@@ -8,7 +8,9 @@ StartLimitIntervalSec=60
 Type=simple
 WorkingDirectory=__CLAUDE_DEVTOOLS_DIR__
 ExecStart=__BUN_BIN__ run __CLAUDE_DEVTOOLS_DIR__/dist-standalone/index.cjs
-Restart=on-failure
+# `always`, not `on-failure` — see CLAUDE.md. A bun HTTP server exits 0 when its
+# event loop drains, and on-failure ignores a clean exit.
+Restart=always
 RestartSec=5
 Environment=PATH=__PATH__
 Environment=PORT=__CLAUDE_DEVTOOLS_PORT__

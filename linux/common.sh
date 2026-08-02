@@ -759,6 +759,14 @@ deploy_user_systemd_service() {
         error "Rendered ${name}.service is empty (template: ${template}) — refusing to install it"
         return 1
     fi
+    # sed silently passes __TOKEN__ placeholders through when a caller forgets an
+    # -e, and systemd would then take them literally (Environment=PATH=__PATH__,
+    # an ExecStart that does not exist). Checked before the write, not after, so
+    # a bad render never lands on disk.
+    if [[ $rendered =~ __[A-Z_]+__ ]]; then
+        error "${name}.service has unreplaced template tokens — refusing to install it"
+        return 1
+    fi
 
     local changed=0
     printf '%s\n' "$rendered" | write_if_changed "$dest" && changed=1

@@ -5,9 +5,12 @@ Description=LiteLLM (Docker) — Anthropic-compatible gateway via rootless Docke
 After=docker.service network-online.target
 Wants=docker.service network-online.target
 # First boot pulls the image (~367 MB) and runs Prisma migrations against the
-# host DB; give it generous start headroom so retries don't trip start-limit-hit.
-StartLimitBurst=10
-StartLimitIntervalSec=300
+# host DB. Must stay identical to litellm.service — Phase 7 deploys either
+# template under the same `litellm` unit name. Note ExecStartPre re-pulls on
+# every restart, so an unbounded retry loop here also means unbounded registry
+# round-trips; the give-up envelope below is what bounds it.
+StartLimitBurst=20
+StartLimitIntervalSec=600
 
 [Service]
 Type=simple
@@ -20,7 +23,10 @@ Environment=DOCKER_HOST=unix://%t/docker.sock
 ExecStartPre=-/usr/bin/docker compose pull
 ExecStart=/usr/bin/docker compose up
 ExecStop=/usr/bin/docker compose down
-Restart=on-failure
+# `always`, not `on-failure` — see CLAUDE.md. `docker compose up` exits 0 when
+# the container stops on its own, which on-failure would ignore. ExecStop still
+# runs on a commanded stop, and systemd does not restart after one.
+Restart=always
 RestartSec=10
 
 [Install]

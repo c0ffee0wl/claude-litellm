@@ -2,10 +2,12 @@
 Description=LiteLLM — Anthropic-compatible gateway to Azure OpenAI / Vertex Gemini / etc.
 After=network-online.target
 Wants=network-online.target
-# Tolerate slow first boots: Prisma migrations + engine-binary fetch can take
-# 15–25s on a fresh DB, and 5 retries * 5s = 25s used to hit start-limit-hit.
-StartLimitBurst=10
-StartLimitIntervalSec=300
+# Headroom for slow first boots (Prisma migrations + engine fetch, 15–25s) and
+# for the boot race against Postgres. Raise BOTH numbers together: the limiter
+# gives up at a cycle time below IntervalSec/Burst, so widening Burst alone
+# would narrow that. See CLAUDE.md, "StartLimitBurst=20 on the litellm units".
+StartLimitBurst=20
+StartLimitIntervalSec=600
 
 [Service]
 Type=simple
@@ -19,7 +21,9 @@ Environment=PRISMA_BINARY_CACHE_DIR=%h/.cache/prisma-python/binaries
 Environment=PRISMA_HIDE_UPDATE_MESSAGE=1
 Environment=PRISMA_SKIP_POSTINSTALL_GENERATE=1
 ExecStart=__LITELLM_BIN__ --config __APP_DIR__/config.yaml --port __PORT__ --host 127.0.0.1 --num_workers 1 --telemetry False
-Restart=on-failure
+# `always`, not `on-failure` — see CLAUDE.md, "Restart policy for long-lived
+# user services". A commanded stop is still never restarted.
+Restart=always
 RestartSec=10
 
 [Install]
