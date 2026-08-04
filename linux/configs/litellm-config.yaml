@@ -39,17 +39,16 @@ model_list:
   #     terra  2.75 / 0.275 / 16.50   |  5.50 / 0.55 / 24.75
   #     luna   1.10 / 0.11  /  6.60   |  2.20 / 0.22 /  9.90
   #     sol    5.50 / 0.55  / 33.00   |  11.0 / 1.10 / 49.50
-  # Re-check with:
-  #   productName eq 'Azure OpenAI GPT5' and armRegionName eq 'swedencentral'
-  #   → https://prices.azure.com/api/retail/prices?api-version=2023-01-01-preview
+  # Refresh these with the `update-azure-openai-prices` skill
+  # (.claude/skills/), which reads the live feed and rewrites both the rate
+  # blocks and the table above. Do not hand-query the feed — the skill's script
+  # owns the meter-name grammar, and a second recipe here would drift from it.
   #
-  # These are hand-maintained — nothing refreshes them. Two triggers to edit:
-  #   - Deployment type/zone changes. GlobalStandard is the `Gl` meters (drop the
-  #     10% zone uplift); the US zone bills the same `DZ` rates.
-  #   - Azure follows OpenAI's 2026-07-30 cut (terra -20%, luna -80%, sol flat),
-  #     which it had NOT as of this writing — hence luna costing 5.5x its OpenAI
-  #     list price. Re-run the retail query above to check; a meter dated later
-  #     than 2026-07-01 means Azure repriced.
+  # Worth re-running when the deployment type or zone changes (the script takes
+  # --scope Gl / --region), or when Azure follows OpenAI's 2026-07-30 cut
+  # (terra -20%, luna -80%, sol flat) — which it had NOT as of this writing,
+  # hence luna costing 5.5x its OpenAI list price. Meters dated later than
+  # 2026-07-01 mean Azure repriced.
   - model_name: azure/gpt-5.6-terra
     litellm_params:
       model: openai/gpt-5.6-terra

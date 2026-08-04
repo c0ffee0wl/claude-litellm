@@ -201,8 +201,13 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 
-# Claude
-.claude
+# Claude — track project skills, keep local/personal state out.
+# Ignore the *contents* rather than `.claude` itself: git does not descend into
+# an ignored directory, which would make the negation below unreachable.
+.claude/*
+!.claude/skills/
+# Belt-and-braces, in case local state ever lands under a re-included path.
+.claude/**/*.local.json
 docs/superpowers/
 
 __marimo__/
