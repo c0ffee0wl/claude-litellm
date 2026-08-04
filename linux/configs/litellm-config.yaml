@@ -15,17 +15,50 @@ model_list:
   # api_base is the Azure v1 surface (…/openai/v1), canonicalized by
   # normalize_azure_v1_endpoint in setup.sh. No api_version: the v1 GA API does
   # not take one, and a query string would corrupt the `{api_base}/responses` URL.
+  #
+  # model_info.base_model exists ONLY to fix cost tracking. The `openai/` route
+  # above also drives the price lookup — _select_model_name_for_cost_calc resolves
+  # the map key `gpt-5.6-<tier>`, i.e. OPENAI list prices, for traffic that Azure
+  # actually invoices. base_model overrides that key (it wins over every other
+  # signal, reaching the cost calc via metadata.model_info.base_model) without
+  # touching the route: the other base_model consumers in litellm/utils.py are
+  # gated on custom_llm_provider == "azure", which never fires here. The two map
+  # entries are otherwise identical — same supports_*, max_*, mode,
+  # supported_endpoints; only litellm_provider differs.
+  #
+  # `azure/eu/` = Data Zone Standard in the EU zone. Sweden Central sits inside the
+  # Azure EU Data Boundary, so a DataZoneStandard deployment there bills the `DZ`
+  # meters. Verified 2026-08-04 against the Azure retail feed — $/1M tokens,
+  # short-context standard (in / cached-in / out):
+  #     terra  2.75 / 0.275 / 16.50      luna  1.10 / 0.11 / 6.60
+  #     sol    5.50 / 0.55  / 33.00
+  # which LiteLLM's azure/eu/gpt-5.6-* entries match exactly, long-context tiers
+  # included. Re-check with:
+  #   productName eq 'Azure OpenAI GPT5' and armRegionName eq 'swedencentral'
+  #   → https://prices.azure.com/api/retail/prices?api-version=2023-01-01-preview
+  #
+  # Two ways this can go stale:
+  #   - Deployment type/zone changes → GlobalStandard is `azure/gpt-5.6-*`, the US
+  #     zone is `azure/us/gpt-5.6-*`. Those must be edited here.
+  #   - Azure follows OpenAI's 2026-07-30 cut (terra -20%, luna -80%, sol flat),
+  #     which it had NOT as of this writing — hence luna costing 5.5x its OpenAI
+  #     list price. NO edit needed when it lands: only a map key is pinned here,
+  #     never a rate, so a refreshed price map propagates on the next upgrade.
   - model_name: azure/gpt-5.6-terra
     litellm_params:
       model: openai/gpt-5.6-terra
       api_base: os.environ/AZURE_RESOURCE_ENDPOINT
       api_key: os.environ/AZURE_OPENAI_API_KEY
+    model_info:
+      base_model: azure/eu/gpt-5.6-terra
 
   - model_name: azure/gpt-5.6-luna
     litellm_params:
       model: openai/gpt-5.6-luna
       api_base: os.environ/AZURE_RESOURCE_ENDPOINT
       api_key: os.environ/AZURE_OPENAI_API_KEY
+    model_info:
+      base_model: azure/eu/gpt-5.6-luna
 
   # Flagship tier — wired to Claude Code's `fable` alias via
   # ANTHROPIC_DEFAULT_FABLE_MODEL (setup.sh Phase 5a), so `/model fable`,
@@ -39,6 +72,8 @@ model_list:
       model: openai/gpt-5.6-sol
       api_base: os.environ/AZURE_RESOURCE_ENDPOINT
       api_key: os.environ/AZURE_OPENAI_API_KEY
+    model_info:
+      base_model: azure/eu/gpt-5.6-sol
 
 litellm_settings:
   drop_params: true
