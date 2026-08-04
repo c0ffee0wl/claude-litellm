@@ -23,10 +23,21 @@
 #            here — line 2 then shows only model + ctx, no upstream/spend info
 #   LITELLM — 127.0.0.1/localhost:4000: show progress bar + model + ctx %, with the
 #            upstream model (e.g. gpt-5.6-terra) appended after an arrow when
-#            available via LiteLLM's /model/info endpoint, plus trailing
-#            30-day gateway spend (labelled "/30d") from LiteLLM's
-#            /global/spend (the MonthlyGlobalSpend view is a rolling
-#            CURRENT_DATE - 30 days window, NOT calendar month-to-date)
+#            available via LiteLLM's /model/info endpoint, plus up to three
+#            gateway spend figures — "$X/sess · $Y/day · $Z/30d":
+#              /sess — THIS Claude Code session, summed from
+#                      /spend/logs/session/ui. LiteLLM tags each spend log with
+#                      the session id it splits out of the Anthropic
+#                      metadata.user_id, which is the same id Claude Code hands
+#                      the statusline. Paged, capped at 2000 requests; a
+#                      truncated sum is marked "$X+/sess"
+#              /day  — today in UTC (the spend view groups on DATE(startTime),
+#                      and startTime is stored UTC)
+#              /30d  — rolling CURRENT_DATE - 30 days, NOT calendar
+#                      month-to-date
+#            /day and /30d both come from one /global/spend/logs request, so
+#            they cannot disagree. Each figure drops out on its own when it is
+#            absent or rounds to zero.
 #   OTHER   — other local proxy (CCR etc.): hide line 2 like the upstream script
 
 # Errors must never leak to Claude Code's UI
@@ -71,7 +82,8 @@ tsv_output=$(jq -er '[
     .rate_limits.five_hour.used_percentage // "-",
     .rate_limits.seven_day.used_percentage // "-",
     .rate_limits.five_hour.resets_at // "-",
-    .rate_limits.seven_day.resets_at // "-"
+    .rate_limits.seven_day.resets_at // "-",
+    .session_id // "-"
 ] | @tsv' <<<"$input" 2>/dev/null)
 
 # Identity colors (root → red info_color as a warning) are resolved up here so
@@ -93,7 +105,7 @@ if [ -z "$tsv_output" ]; then
     exit 0
 fi
 
-IFS=$'\t' read -r cwd proj_dir DURATION_MS MODEL MODEL_ID PCT CTX_SIZE FIVE_H WEEK FIVE_H_RESET WEEK_RESET <<<"$tsv_output"
+IFS=$'\t' read -r cwd proj_dir DURATION_MS MODEL MODEL_ID PCT CTX_SIZE FIVE_H WEEK FIVE_H_RESET WEEK_RESET SESSION_ID <<<"$tsv_output"
 
 # Sanitize numerics — defend against any surprise output from jq
 [[ "$DURATION_MS" =~ ^[0-9]+$ ]] || DURATION_MS=0
@@ -102,6 +114,11 @@ IFS=$'\t' read -r cwd proj_dir DURATION_MS MODEL MODEL_ID PCT CTX_SIZE FIVE_H WE
 # "-" is the absent-field sentinel from the jq @tsv above; restore empty for
 # fields whose emptiness carries meaning.
 [ "$MODEL_ID" = "-" ] && MODEL_ID=""
+# The session id reaches both a cache FILENAME and a query string, so pin it to
+# the same conservative charset the model-keyed cache name uses. Claude Code
+# sends a uuid, which survives unchanged.
+[ "$SESSION_ID" = "-" ] && SESSION_ID=""
+SESSION_ID="${SESSION_ID//[!A-Za-z0-9._-]/_}"
 
 # Per-user cache dir — shared by the sandbox-verdict memo below and the
 # LiteLLM endpoint caches further down. XDG_RUNTIME_DIR is already a
@@ -294,6 +311,21 @@ resolve_token() {
     fi
 }
 
+# Freshness gate shared by both fetch helpers below: returns 1 (caller skips)
+# while $1's ".ts" stamp is younger than $2 minutes, otherwise re-stamps it and
+# returns 0. The stamp records the ATTEMPT — it is written BEFORE fetching — so
+# an unreachable endpoint is retried at most once per window rather than piling
+# up one curl per render, and the check is builtin arithmetic (no find/stat
+# fork). Owned in one place so the freshness contract can't drift between the
+# helpers, or get copied a third time by the next cached endpoint.
+stamp_gate() {
+    local cache_file="$1" max_age_min="$2" ts="" now
+    IFS= read -r ts < "${cache_file}.ts"
+    printf -v now '%(%s)T' -1
+    [[ "$ts" =~ ^[0-9]+$ ]] && (( now - ts < max_age_min * 60 )) && return 1
+    printf '%s' "$now" > "${cache_file}.ts"
+}
+
 # Refresh cache file $1 from LiteLLM endpoint $3 when the last fetch ATTEMPT
 # is older than $2 minutes, then digest it with jq filter $4 into one-line
 # derived file $5 (optional $6 is exposed to the filter as $id). The digest
@@ -302,24 +334,15 @@ resolve_token() {
 # Stale-while-revalidate: the fetch runs in a DETACHED background job and the
 # caller renders immediately with whatever cache already exists — a render
 # never blocks on the network; a cold cache just means the data appears on a
-# later render (fail-soft). The .ts stamp records the attempt (written BEFORE
-# fetching), so an unreachable endpoint is retried at most once per window
-# rather than piling up one curl per render, and the freshness check is
-# builtin arithmetic — no find/stat fork. The job's stdio redirects are
-# load-bearing: Claude Code waits for the statusline's stdout to close, so
-# the job must not inherit it. Writes atomically (tmp + mv); concurrent
-# refreshes are benign ($$-suffixed tmp, atomic mv). --max-time 5 bounds only
-# the background job, never a render.
+# later render (fail-soft); stamp_gate above bounds the retry rate. The job's
+# stdio redirects are load-bearing: Claude Code waits for the statusline's
+# stdout to close, so the job must not inherit it. Writes atomically
+# (tmp + mv); concurrent refreshes are benign ($$-suffixed tmp, atomic mv).
+# --max-time 5 bounds only the background job, never a render.
 fetch_litellm_cache() {
     local cache_file="$1" max_age_min="$2" endpoint="$3" digest="$4" derived="$5" key="${6:-}"
-    local tmp stamp ts="" now
-    stamp="${cache_file}.ts"
-    IFS= read -r ts < "$stamp"
-    printf -v now '%(%s)T' -1
-    if [[ "$ts" =~ ^[0-9]+$ ]] && (( now - ts < max_age_min * 60 )); then
-        return
-    fi
-    printf '%s' "$now" > "$stamp"
+    local tmp
+    stamp_gate "$cache_file" "$max_age_min" || return
     tmp="${cache_file}.$$.tmp"
     # Token resolution lives INSIDE the detached job: its sed forks never
     # block a render, and a token-less box retries once per stamp window
@@ -339,10 +362,69 @@ fetch_litellm_cache() {
     ) </dev/null >/dev/null 2>&1 &
 }
 
+# Spend for ONE Claude Code session, via /spend/logs/session/ui. Same contract
+# as fetch_litellm_cache above (stamp-gated, detached, atomic, token resolved
+# inside the job) — it differs only in having to PAGE: that endpoint caps
+# page_size at 100 and returns no aggregate, so a long session must be summed
+# across pages. It is still the right endpoint: it filters on
+# `WHERE session_id = $1` (an indexed equality) and its SQL omits the heavy
+# messages/response columns, whereas the public /spend/logs/v2 alias demands a
+# date window and matches session_id with LIKE '%…%' — a sequential scan over
+# the whole spend-logs table, once a minute, forever.
+# Args: $1 raw cache, $2 max age (min), $3 sanitized session id, $4 derived file.
+# The derived file carries two lines: the summed spend, then 1 if the page cap
+# truncated that sum (rendered as a trailing "+" so a capped figure can't pass
+# itself off as the total).
+fetch_session_spend() {
+    local cache_file="$1" max_age_min="$2" sid="$3" derived="$4" fresh=""
+    local tmp
+    [ -e "$cache_file" ] || fresh=1
+    stamp_gate "$cache_file" "$max_age_min" || return
+    tmp="${cache_file}.$$.tmp"
+    (
+        resolve_token
+        [ -n "$TOKEN" ] || exit 0
+        page=1 pages=1 truncated=0 ok=1
+        : > "$tmp"
+        while :; do
+            # curl appends straight to the accumulator — jq reads concatenated
+            # JSON documents natively, so the pages need no separate files and
+            # no `cat` per page. A failed transfer breaks out below and $tmp is
+            # discarded unread, so a partial append can never be digested.
+            curl -sf --max-time 5 \
+                -H "Authorization: Bearer $TOKEN" \
+                "${ANTHROPIC_BASE_URL%/}/spend/logs/session/ui?session_id=${sid}&page=${page}&page_size=100" \
+                >> "$tmp" || { ok=""; break; }
+            if [ "$page" = 1 ]; then
+                # $tmp holds exactly page 1 at this point.
+                pages=$(jq -r '.total_pages // 1' "$tmp")
+                [[ "$pages" =~ ^[0-9]+$ ]] || pages=1
+                (( pages > 20 )) && { pages=20; truncated=1; }
+            fi
+            (( page >= pages )) && break
+            page=$(( page + 1 ))
+        done
+        if [ -n "$ok" ] && mv "$tmp" "$cache_file"; then
+            spend=$(jq -sr '[.[].data[]?.spend // 0] | add // 0' "$cache_file") \
+                && persist "$derived" "$spend" "$truncated"
+            # First SUCCESSFUL fetch for this session: reap the cache files of
+            # sessions that ended a week ago (this session's were just
+            # written, so they are never in range). Gated on success rather
+            # than on the cache being absent, so an unreachable proxy can't
+            # turn this into a once-a-minute directory scan.
+            [ -n "$fresh" ] && find "$CACHE_DIR" -maxdepth 1 -name "${SESSION_CACHE_PREFIX##*/}*" -mtime +7 -delete
+        fi
+        rm -f "$tmp"
+    ) </dev/null >/dev/null 2>&1 &
+}
+
 # LiteLLM lookups (cached). Falls through silently on any error — statusline
 # must never block or error.
 UPSTREAM_MODEL=""
-SPEND=""
+SPEND_SESSION=""
+SPEND_TRUNC=""
+SPEND_TODAY=""
+SPEND_30D=""
 if [ "$MODE" = "LITELLM" ]; then
     # /model/info digest: match model_name (public alias) OR model_info.id
     # (internal uuid) — Claude Code's .model.id is usually the alias but be
@@ -378,23 +460,60 @@ if [ "$MODE" = "LITELLM" ]; then
         UPSTREAM_MODEL="${UPSTREAM_MODEL//[!A-Za-z0-9._:\/-]/}"
     fi
 
-    # Trailing-30-day gateway spend via /global/spend (cached 1min, digested
-    # inside the background fetch). The master key is proxy admin, so
-    # user_api_key_auth passes; returns {"spend": <usd>}.
-    # NB: /global/spend sums the MonthlyGlobalSpend view, whose WHERE clause is
-    # "startTime >= CURRENT_DATE - INTERVAL '30 days'" — a rolling 30-day window,
-    # not calendar month-to-date. Labelled "/30d" below to match.
-    SPEND_DIGEST='.spend // ""'
-    SPEND_CACHE="${CACHE_DIR}/claude-litellm-spend-${EUID}.json"
-    SPEND_DERIVED="${CACHE_DIR}/claude-litellm-spend-${EUID}.derived"
-    fetch_litellm_cache "$SPEND_CACHE" 1 "global/spend" "$SPEND_DIGEST" "$SPEND_DERIVED"
-    IFS= read -r SPEND < "$SPEND_DERIVED"
+    # Today's + trailing-30-day gateway spend via /global/spend/logs (cached
+    # 1min, digested inside the background fetch). The master key is proxy
+    # admin, so user_api_key_auth passes and the endpoint takes its admin
+    # branch: one {date, spend} row per day of the MonthlyGlobalSpend view.
+    # Both figures come from that single request and so can never disagree.
+    # NB the view is "startTime >= CURRENT_DATE - INTERVAL '30 days'" — a
+    # rolling 30-day window, not calendar month-to-date, hence the "/30d"
+    # label. startTime is stored UTC and the view groups on DATE(startTime),
+    # so "today" is resolved in UTC too; the TZ prefix applies to that one
+    # builtin call and does not persist. An unexpected body (a
+    # prometheus-backed proxy answers this endpoint in a different shape)
+    # digests to two empty lines rather than a jq error, so the figures drop
+    # out instead of the cache silently going stale.
+    SPEND_DIGEST='if type=="array" then
+        ([.[] | select((.spend|type)=="number")]) as $r
+        | ([$r[] | select((.date|tostring)[0:10]==$id) | .spend] | add // 0),
+          ([$r[].spend] | add // 0)
+        else "","" end'
+    TZ=UTC printf -v today_utc '%(%F)T' -1
+    # Basename deliberately differs from the single-figure version's: that
+    # file holds one line, which would read here as a today-only value.
+    SPEND_CACHE="${CACHE_DIR}/claude-litellm-spendlogs-${EUID}.json"
+    SPEND_DERIVED="${CACHE_DIR}/claude-litellm-spendlogs-${EUID}.derived"
+    fetch_litellm_cache "$SPEND_CACHE" 1 "global/spend/logs" "$SPEND_DIGEST" "$SPEND_DERIVED" "$today_utc"
+    { IFS= read -r SPEND_TODAY; IFS= read -r SPEND_30D; } < "$SPEND_DERIVED"
     if [ ! -e "$SPEND_DERIVED" ] && [ -s "$SPEND_CACHE" ]; then
-        # Raw cache exists but no derived line yet (pre-digest version):
-        # derive once and persist — even an empty (null-spend) result, so the
-        # branch is terminal and can't re-fork every render.
-        SPEND=$(jq -r "$SPEND_DIGEST" "$SPEND_CACHE" 2>/dev/null)
-        persist "$SPEND_DERIVED" "$SPEND"
+        # Raw cache exists but no derived lines yet: derive once and persist —
+        # even an empty result, so the branch is terminal and can't re-fork
+        # every render.
+        mapfile -t spend_lines < <(jq -r --arg id "$today_utc" "$SPEND_DIGEST" "$SPEND_CACHE" 2>/dev/null)
+        SPEND_TODAY="${spend_lines[0]}"
+        SPEND_30D="${spend_lines[1]}"
+        persist "$SPEND_DERIVED" "$SPEND_TODAY" "$SPEND_30D"
+    fi
+
+    # Spend for THIS session (cached 1min). LiteLLM tags every spend log with
+    # Claude Code's own session id: it splits the Anthropic metadata.user_id
+    # ("user_<hash>_account__session_<uuid>") on "_session_" into
+    # litellm_session_id, which becomes the logging payload's trace_id and
+    # lands in the indexed SpendLogs.session_id column. So this is the true
+    # gateway cost of the session on screen — the one figure Claude Code
+    # cannot produce itself behind a gateway, since its own cost accounting
+    # prices against an Anthropic table that has no entry for the served
+    # model. Cache/derived are keyed by session id so concurrent sessions
+    # don't overwrite each other's figure.
+    if [ -n "$SESSION_ID" ]; then
+        # Spelled once: fetch_session_spend derives its reap glob from this
+        # prefix, so a change to the naming scheme can't silently strand the
+        # cleanup (the script's `exec 2>/dev/null` would hide the miss).
+        SESSION_CACHE_PREFIX="${CACHE_DIR}/claude-litellm-sess-${EUID}-"
+        SESSION_CACHE="${SESSION_CACHE_PREFIX}${SESSION_ID}.json"
+        SESSION_DERIVED="${SESSION_CACHE_PREFIX}${SESSION_ID}.derived"
+        fetch_session_spend "$SESSION_CACHE" 1 "$SESSION_ID" "$SESSION_DERIVED"
+        { IFS= read -r SPEND_SESSION; IFS= read -r SPEND_TRUNC; } < "$SESSION_DERIVED"
     fi
 fi
 
@@ -425,6 +544,21 @@ fmt_reset() {
     if   (( d > 0 )); then printf -v RESET_IN '%dd%dh' "$d" "$h"
     elif (( h > 0 )); then printf -v RESET_IN '%dh%dm' "$h" "$m"
     else printf -v RESET_IN '%dm' "$m"; fi
+}
+
+# Format one USD figure, returned via the SPEND_FMT global (builtin printf -v,
+# no fork — same shape as fmt_reset). 2 decimals when that shows a visible
+# cent, else 4; empty when the input is not a well-formed number or rounds away
+# to nothing, which is how a figure drops out of the line entirely. That
+# numeric gate is also what keeps these values safe for the `echo -e` below.
+fmt_spend() {
+    SPEND_FMT=""
+    [[ "$1" =~ ^[0-9]+(\.[0-9]+)?$ ]] || return 0
+    LC_ALL=C printf -v SPEND_FMT '%.2f' "$1"
+    if [ "$SPEND_FMT" = "0.00" ]; then
+        LC_ALL=C printf -v SPEND_FMT '%.4f' "$1"
+        [ "$SPEND_FMT" = "0.0000" ] && SPEND_FMT=""
+    fi
 }
 
 # Color-coded progress bar
@@ -472,18 +606,21 @@ if [ "$MODE" = "DIRECT" ]; then
         LC_ALL=C printf -v pct '%.0f' "$WEEK"
         SUFFIX="${SUFFIX:+$SUFFIX, }7d: ${pct}%${RESET_IN:+ ($RESET_IN)}"
     fi
-elif [ "$MODE" = "LITELLM" ] && [[ "$SPEND" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
-    # Trailing-30-day gateway spend, explicitly labelled "/30d" so it can't be
-    # mistaken for session cost or for calendar month-to-date. Builtin
-    # printf -v %f — fork-free, matching the DIRECT branch: 2 decimals when
-    # that shows a visible cent, else 4, else no suffix. Only divergence from
-    # the old awk float-compare: [0.005,0.01) now rounds up to "$0.01".
-    LC_ALL=C printf -v spend_fmt '%.2f' "$SPEND"
-    if [ "$spend_fmt" = "0.00" ]; then
-        LC_ALL=C printf -v spend_fmt '%.4f' "$SPEND"
-        [ "$spend_fmt" = "0.0000" ] && spend_fmt=""
-    fi
-    [ -n "$spend_fmt" ] && SUFFIX="\$${spend_fmt}/30d"
+elif [ "$MODE" = "LITELLM" ]; then
+    # Three gateway spend figures, each dropping out on its own when absent or
+    # zero (a fresh session shows only day + 30d; an unreachable proxy shows no
+    # suffix at all). The labels carry the meaning: "/sess" is this Claude Code
+    # session, "/day" is today in UTC, "/30d" is a rolling window and NOT
+    # calendar month-to-date. Assembled with the same ${SUFFIX:+…} idiom as the
+    # DIRECT branch above.
+    trunc=""
+    [ "$SPEND_TRUNC" = "1" ] && trunc="+"   # sum hit the page cap; a floor, not a total
+    fmt_spend "$SPEND_SESSION"
+    [ -n "$SPEND_FMT" ] && SUFFIX="\$${SPEND_FMT}${trunc}/sess"
+    fmt_spend "$SPEND_TODAY"
+    [ -n "$SPEND_FMT" ] && SUFFIX="${SUFFIX:+$SUFFIX · }\$${SPEND_FMT}/day"
+    fmt_spend "$SPEND_30D"
+    [ -n "$SPEND_FMT" ] && SUFFIX="${SUFFIX:+$SUFFIX · }\$${SPEND_FMT}/30d"
 fi
 
 [ -n "$SUFFIX" ] && LINE2="${LINE2} | ${SUFFIX}"
