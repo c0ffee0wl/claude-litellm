@@ -40,8 +40,17 @@
 #            absent or rounds to zero.
 #   OTHER   — other local proxy (CCR etc.): hide line 2 like the upstream script
 
-# Errors must never leak to Claude Code's UI
-exec 2>/dev/null
+# Errors must never leak to Claude Code's UI. CLAUDE_STATUSLINE_DEBUG=1 lifts
+# that silence and turns on the dbg() traces below — the script is otherwise
+# unintrospectable (silent by contract, opaque caches), which makes diagnosing
+# a missing figure guesswork. Debug output goes to STDERR only: stdout is what
+# Claude Code renders. Cost when unset is one variable test per render.
+if [ -n "${CLAUDE_STATUSLINE_DEBUG:-}" ]; then
+    dbg() { printf 'statusline: %s\n' "$*" >&2; }
+else
+    exec 2>/dev/null
+    dbg() { :; }
+fi
 
 # read -d '' hits EOF (status 1) after filling $input — builtin, no cat fork.
 IFS= read -rd '' input
@@ -280,6 +289,11 @@ else
         SANDBOXED=1
     fi
 fi
+# The verdict plus the two inputs that decide it. This block is the most
+# failure-prone logic in the file (memo staleness, a truncated cache key, a
+# detection gap that must fail SAFE), and "(unsandboxed)" showing on a box you
+# believe is sandboxed is otherwise indistinguishable from a detection miss.
+dbg "sandboxed=${SANDBOXED:-no} outer=${outer_sandbox:-no} settings_enabled=${SANDBOX_ON:-no}"
 
 # Mode detection
 MODE="DIRECT"
@@ -288,6 +302,7 @@ if [[ "$ANTHROPIC_BASE_URL" =~ ^https?://(127\.0\.0\.1|localhost):4000(/|$) ]]; 
 elif [[ "$ANTHROPIC_BASE_URL" =~ ^https?://(127\.0\.0\.1|localhost)(:|/) ]]; then
     MODE="OTHER"
 fi
+dbg "mode=$MODE base=${ANTHROPIC_BASE_URL:-<unset>} session=${SESSION_ID:-<none>} cache_dir=$CACHE_DIR"
 
 # Resolve the LiteLLM master key on demand, memoised — shared by /model/info
 # and /global/spend. Sources, in order: env (when Claude Code passes it
@@ -309,6 +324,8 @@ resolve_token() {
         TOKEN="${TOKEN%\"}"; TOKEN="${TOKEN#\"}"
         TOKEN="${TOKEN%\'}"; TOKEN="${TOKEN#\'}"
     fi
+    # Masked to the last 4 characters — a debug trace must never print the key.
+    if [ -n "$TOKEN" ]; then dbg "token=resolved(…${TOKEN: -4})"; else dbg "token=NOT FOUND"; fi
 }
 
 # Freshness gate shared by both fetch helpers below: returns 1 (caller skips)
@@ -357,9 +374,20 @@ fetch_litellm_cache() {
             -o "$tmp" \
             && mv "$tmp" "$cache_file" \
             && jq -r --arg id "$key" "$digest" "$cache_file" > "${derived}.$$.tmp" \
-            && mv "${derived}.$$.tmp" "$derived"
+            && mv "${derived}.$$.tmp" "$derived" \
+            || dbg "fetch FAILED rc=$? endpoint=$endpoint"
+        # (shellcheck SC2015: the `|| dbg` firing when a LATER step fails is
+        # the point — any broken link in the chain should be traced. curl -sf
+        # is silent on an HTTP error, so without this a 401 from a stale key
+        # produced no output at all, in debug mode or otherwise.)
         rm -f "$tmp" "${derived}.$$.tmp"
-    ) </dev/null >/dev/null 2>&1 &
+    # No `2>&1` here, deliberately: stderr is already /dev/null process-wide
+    # (the exec at the top) UNLESS CLAUDE_STATUSLINE_DEBUG is set, and letting
+    # the job inherit it is what puts a failing curl/jq — and resolve_token's
+    # trace — in front of you under debug. Re-adding `2>&1` for symmetry would
+    # silently blind the debug switch inside these jobs. Only the stdout
+    # redirect is load-bearing for Claude Code.
+    ) </dev/null >/dev/null &
 }
 
 # Spend for ONE Claude Code session, via /spend/logs/session/ui. Same contract
@@ -394,7 +422,7 @@ fetch_session_spend() {
             curl -sf --max-time 5 \
                 -H "Authorization: Bearer $TOKEN" \
                 "${ANTHROPIC_BASE_URL%/}/spend/logs/session/ui?session_id=${sid}&page=${page}&page_size=100" \
-                >> "$tmp" || { ok=""; break; }
+                >> "$tmp" || { dbg "session fetch FAILED rc=$? page=$page"; ok=""; break; }
             if [ "$page" = 1 ]; then
                 # $tmp holds exactly page 1 at this point.
                 pages=$(jq -r '.total_pages // 1' "$tmp")
@@ -415,7 +443,13 @@ fetch_session_spend() {
             [ -n "$fresh" ] && find "$CACHE_DIR" -maxdepth 1 -name "${SESSION_CACHE_PREFIX##*/}*" -mtime +7 -delete
         fi
         rm -f "$tmp"
-    ) </dev/null >/dev/null 2>&1 &
+    # No `2>&1` here, deliberately: stderr is already /dev/null process-wide
+    # (the exec at the top) UNLESS CLAUDE_STATUSLINE_DEBUG is set, and letting
+    # the job inherit it is what puts a failing curl/jq — and resolve_token's
+    # trace — in front of you under debug. Re-adding `2>&1` for symmetry would
+    # silently blind the debug switch inside these jobs. Only the stdout
+    # redirect is load-bearing for Claude Code.
+    ) </dev/null >/dev/null &
 }
 
 # LiteLLM lookups (cached). Falls through silently on any error — statusline
@@ -458,6 +492,7 @@ if [ "$MODE" = "LITELLM" ]; then
         # escape sequences into the user's statusline. (SPEND is already
         # regex-gated below; this is the only free-text field.)
         UPSTREAM_MODEL="${UPSTREAM_MODEL//[!A-Za-z0-9._:\/-]/}"
+        dbg "upstream_model=[$UPSTREAM_MODEL] (model_id=[$MODEL_ID])"
     fi
 
     # Today's + trailing-30-day gateway spend via /global/spend/logs (cached
@@ -467,29 +502,40 @@ if [ "$MODE" = "LITELLM" ]; then
     # Both figures come from that single request and so can never disagree.
     # NB the view is "startTime >= CURRENT_DATE - INTERVAL '30 days'" — a
     # rolling 30-day window, not calendar month-to-date, hence the "/30d"
-    # label. startTime is stored UTC and the view groups on DATE(startTime),
-    # so "today" is resolved in UTC too; the TZ prefix applies to that one
-    # builtin call and does not persist. An unexpected body (a
+    # label. startTime is stored UTC and the view groups on DATE(startTime), so
+    # "today" must be resolved in UTC too — jq's strftime is gmtime-based
+    # whatever TZ says, so the date is computed IN the filter. It used to come
+    # from a `TZ=UTC printf -v` on the render path, which leans on an
+    # assignment prefix reaching a builtin's strftime; that resolved empty on
+    # at least one box, and an empty date silently matches no row, so the /day
+    # figure vanished while /30d (which needs no date) kept working. Deriving
+    # it here also puts it where it belongs: evaluated in the background job at
+    # digest time, not on the render path. An unexpected body (a
     # prometheus-backed proxy answers this endpoint in a different shape)
     # digests to two empty lines rather than a jq error, so the figures drop
     # out instead of the cache silently going stale.
+    # `gmtime|strftime`, not the shorter `now|strftime`: jq only grew the
+    # accept-a-bare-number form later, and feeding a number to strftime on an
+    # older jq is a filter ERROR — which would blank BOTH figures instead of
+    # the one this fix is about. gmtime -> broken-down time is accepted by
+    # every version.
     SPEND_DIGEST='if type=="array" then
-        ([.[] | select((.spend|type)=="number")]) as $r
-        | ([$r[] | select((.date|tostring)[0:10]==$id) | .spend] | add // 0),
+        (now|gmtime|strftime("%Y-%m-%d")) as $today
+        | ([.[] | select((.spend|type)=="number")]) as $r
+        | ([$r[] | select((.date|tostring)[0:10]==$today) | .spend] | add // 0),
           ([$r[].spend] | add // 0)
         else "","" end'
-    TZ=UTC printf -v today_utc '%(%F)T' -1
     # Basename deliberately differs from the single-figure version's: that
     # file holds one line, which would read here as a today-only value.
     SPEND_CACHE="${CACHE_DIR}/claude-litellm-spendlogs-${EUID}.json"
     SPEND_DERIVED="${CACHE_DIR}/claude-litellm-spendlogs-${EUID}.derived"
-    fetch_litellm_cache "$SPEND_CACHE" 1 "global/spend/logs" "$SPEND_DIGEST" "$SPEND_DERIVED" "$today_utc"
+    fetch_litellm_cache "$SPEND_CACHE" 1 "global/spend/logs" "$SPEND_DIGEST" "$SPEND_DERIVED"
     { IFS= read -r SPEND_TODAY; IFS= read -r SPEND_30D; } < "$SPEND_DERIVED"
     if [ ! -e "$SPEND_DERIVED" ] && [ -s "$SPEND_CACHE" ]; then
         # Raw cache exists but no derived lines yet: derive once and persist —
         # even an empty result, so the branch is terminal and can't re-fork
         # every render.
-        mapfile -t spend_lines < <(jq -r --arg id "$today_utc" "$SPEND_DIGEST" "$SPEND_CACHE" 2>/dev/null)
+        mapfile -t spend_lines < <(jq -r "$SPEND_DIGEST" "$SPEND_CACHE" 2>/dev/null)
         SPEND_TODAY="${spend_lines[0]}"
         SPEND_30D="${spend_lines[1]}"
         persist "$SPEND_DERIVED" "$SPEND_TODAY" "$SPEND_30D"
@@ -515,6 +561,15 @@ if [ "$MODE" = "LITELLM" ]; then
         fetch_session_spend "$SESSION_CACHE" 1 "$SESSION_ID" "$SESSION_DERIVED"
         { IFS= read -r SPEND_SESSION; IFS= read -r SPEND_TRUNC; } < "$SESSION_DERIVED"
     fi
+    # Raw derived values, before fmt_spend decides which ones survive. An empty
+    # figure here means "no derived line yet" (cold cache, failed fetch, or a
+    # digest that matched nothing); a "0" means the gateway really reported
+    # zero. The two look identical on the rendered line, which is exactly the
+    # ambiguity this trace exists to resolve.
+    dbg "spendlogs=$SPEND_CACHE"
+    dbg "  today=[$SPEND_TODAY] 30d=[$SPEND_30D]"
+    dbg "session=${SESSION_CACHE:-<no session id>}"
+    dbg "  session=[$SPEND_SESSION] truncated=[$SPEND_TRUNC]"
 fi
 
 # Line 1: identity + directory + (duration, only once the first turn completes)
@@ -623,6 +678,7 @@ elif [ "$MODE" = "LITELLM" ]; then
     [ -n "$SPEND_FMT" ] && SUFFIX="${SUFFIX:+$SUFFIX · }\$${SPEND_FMT}/30d"
 fi
 
+dbg "suffix=[$SUFFIX]"
 [ -n "$SUFFIX" ] && LINE2="${LINE2} | ${SUFFIX}"
 
 echo -e "${LINE2}${RESET}"
