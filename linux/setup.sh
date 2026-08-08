@@ -14,12 +14,13 @@
 #   ./linux/setup.sh --install-only   # Claude Code + hardening env vars only — no LiteLLM/Postgres, no gateway wiring, no managed-settings
 #   ./linux/setup.sh --install-obsidian  # Also install the ACP adapter + latest Obsidian (.deb); combinable with any mode
 #   ./linux/setup.sh --docker         # Run LiteLLM via rootless Docker Compose (Postgres stays on the host); additive
+#   ./linux/setup.sh --no-profile-toggles  # Don't mirror the Claude Code toggles into ~/.profile (and scrub prior ones) — for overlays that carry them in their own managed-settings env: block
 #
 # --router-only, --harden-only, and --install-only are mutually exclusive.
-# --install-obsidian and --docker are additive (combinable with any mode except
-# --docker + --harden-only / --install-only, which have no LiteLLM). Flags are NOT
-# persisted — each invocation is fresh; rerunning without a flag falls through to
-# full mode.
+# --install-obsidian, --docker, and --no-profile-toggles are additive (combinable
+# with any mode except --docker + --harden-only / --install-only, which have no
+# LiteLLM). Flags are NOT persisted — each invocation is fresh; rerunning without
+# a flag falls through to full mode.
 
 set -e
 
@@ -43,6 +44,7 @@ HARDEN_ONLY=false
 INSTALL_ONLY=false
 INSTALL_OBSIDIAN=false
 DOCKER_MODE=false
+PROFILE_TOGGLES=true
 ORIGINAL_ARGS=("$@")
 
 while [[ $# -gt 0 ]]; do
@@ -65,6 +67,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --docker)
             DOCKER_MODE=true
+            shift
+            ;;
+        --no-profile-toggles)
+            PROFILE_TOGGLES=false
             shift
             ;;
         --yes)
@@ -662,14 +668,24 @@ log "Writing gateway + telemetry env vars to ~/.profile..."
 
 # Shell-wide telemetry opt-outs (not Claude Code specific)
 update_profile_export "DO_NOT_TRACK"             "1"
-update_profile_export "VSCODE_TELEMETRY_DISABLE" "1"
-update_profile_export "VSCODE_CRASH_REPORTER_DISABLE" "1"
 update_profile_export "DOTNET_CLI_TELEMETRY_OPTOUT"   "1"
 update_profile_export "POWERSHELL_TELEMETRY_OPTOUT"   "1"
 update_profile_export "AZURE_CORE_COLLECT_TELEMETRY"  "0"
 update_profile_export "HF_HUB_DISABLE_TELEMETRY"      "1"
-update_profile_export "DISABLE_GROWTHBOOK"            "1"
 update_profile_export "SCARF_ANALYTICS"               "false"
+
+# Write or scrub one Claude Code toggle. Under --no-profile-toggles (overlays
+# like ct-dfir-llm/ct-kali-llm, whose own setup deploys
+# /etc/claude-code/managed-settings.json carrying these in its env: block) the
+# profile mirror is redundant, so nothing is written and previously-written
+# toggles are scrubbed — already-deployed boxes self-heal on their next run.
+profile_toggle() {
+    if [ "$PROFILE_TOGGLES" = "true" ]; then
+        update_profile_export "$1" "$2"
+    else
+        remove_profile_export "$1"
+    fi
+}
 
 # Subprocess env scrubbing: kept in ~/.profile (not managed-settings) so users
 # can `unset CLAUDE_CODE_SUBPROCESS_ENV_SCRUB` before `claude --dangerously-skip-permissions`
@@ -689,7 +705,8 @@ fi
 # (DISABLE_AUTOUPDATER/FEEDBACK_COMMAND/ERROR_REPORTING/TELEMETRY): it
 # disables gateway model discovery at ANY value, even "0" — presence-triggered
 # (anthropics/claude-code#61112) — while the individual flags don't. It also
-# gated GrowthBook fetches (#45918); DISABLE_GROWTHBOOK above still covers that.
+# gated GrowthBook fetches (#45918); the env: block's DISABLE_GROWTHBOOK
+# (mirrored below) still covers that.
 remove_profile_export "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"
 
 # Claude Code feature/privacy toggles — single-sourced from the managed-settings
@@ -701,21 +718,22 @@ remove_profile_export "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"
 # from the env: block, also add a remove_profile_export scrub (the IS_DEMO
 # pattern below) or every deployed ~/.profile keeps exporting it. The
 # `VAR=$(jq …)` form aborts under `set -e` if the template is missing/invalid
-# (repo-owned — fail loudly, not with silently-missing toggles).
+# (repo-owned — fail loudly, not with silently-missing toggles). The jq
+# extraction runs under --no-profile-toggles too: its key list is the scrub
+# list for the current block (a key retired upstream still needs the explicit
+# retired-exports scrub below, same as the write path).
 managed_env_toggles="$(jq -r '.env | to_entries[] | "\(.key)=\(.value)"' "$SCRIPT_DIR/configs/claude-managed-settings.json")"
 if [ -z "$managed_env_toggles" ]; then
     error "No env toggles found in claude-managed-settings.json — refusing to continue with an empty policy env block"
     exit 1
 fi
 while IFS='=' read -r toggle_var toggle_val; do
-    update_profile_export "$toggle_var" "$toggle_val"
+    profile_toggle "$toggle_var" "$toggle_val"
 done <<< "$managed_env_toggles"
 
-# Non-hardening toggles
-update_profile_export "CLAUDE_CODE_ATTRIBUTION_HEADER"           "0"
-
-# UX/behavior preferences (all modes). Kept in ~/.profile (user-level prefs,
-# not enforced policy → user can `unset`), so they apply regardless of flags.
+# UX/behavior preferences — ~/.profile prefs the user can `unset`, not
+# enforced policy; a --no-profile-toggles overlay instead carries them in its
+# managed env: block, where they ARE enforced (overlay's deliberate choice).
 #   * AUTOCOMPACT_PCT_OVERRIDE: percentage of the auto-compaction window at
 #     which auto-compact triggers. Currently INERT on this gateway path — it
 #     only applies when compaction is proactive (cloud sessions, Sonnet/Opus
@@ -731,8 +749,8 @@ update_profile_export "CLAUDE_CODE_ATTRIBUTION_HEADER"           "0"
 #     (azure/gpt-5.6-terra) — no hardcoded claude-* id, no 404. Its advertised cost win
 #     (parent prompt-cache reuse) is Anthropic-cache-specific; over LiteLLM→Azure it
 #     degrades to a normal full-context request.
-update_profile_export "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"          "75"
-update_profile_export "CLAUDE_CODE_FORK_SUBAGENT"               "1"
+profile_toggle "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"          "75"
+profile_toggle "CLAUDE_CODE_FORK_SUBAGENT"               "1"
 
 # Scrub IS_DEMO=1 from ~/.profile if a prior tool / demo container left it
 # behind. Claude Code treats it as a "demo session" marker that silently
@@ -751,6 +769,12 @@ remove_profile_export "IS_DEMO"
 remove_profile_export "ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES"
 remove_profile_export "ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES"
 remove_profile_export "ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES"
+# VSCODE_TELEMETRY_DISABLE / VSCODE_CRASH_REPORTER_DISABLE: community folklore
+# (a Windows-telemetry gist) — nothing in VS Code reads them. The real control
+# is the telemetry.telemetryLevel setting / enterprise TelemetryLevel policy
+# (vscode-setup's domain, not an env var).
+remove_profile_export "VSCODE_TELEMETRY_DISABLE"
+remove_profile_export "VSCODE_CRASH_REPORTER_DISABLE"
 
 # Default model selectors + gateway discovery + effort. In ~/.profile (not
 # managed-settings) so they apply in --router-only too. Four selectors:
