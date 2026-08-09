@@ -803,6 +803,9 @@ restart_user_service_if_stale() {
         # A crash-looped unit latches failed/start-limit-hit; clear it so the
         # restart below is deterministic rather than reliant on the burst
         # window having expired. No-op for units not in a failed state.
+        # Trade-off: the restart's exit code no longer flags a crash-looping
+        # unit (it starts cleanly and may die moments later) — real liveness
+        # needs a probe, e.g. wait_for_litellm after the litellm call site.
         systemctl --user reset-failed "$name" &>/dev/null || true
         systemctl --user restart "$name" || return 1
         log "${name} service (re)started"

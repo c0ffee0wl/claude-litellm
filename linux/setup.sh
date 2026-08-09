@@ -211,15 +211,17 @@ LITELLM_PATH="${HOME}/.local/share/uv/tools/litellm/bin:${USER_TOOL_PATH}"
 # The uv requirement string for LiteLLM — one definition for the fresh-install
 # and upgrade paths in Phase 4a, so a floor bump can't skew the two.
 LITELLM_SPEC='litellm[proxy,proxy-runtime]>=1.84.0'
-# fastapi ceiling for the LiteLLM venv. fastapi 0.140.7 removed the private
-# get_flat_dependant helper (fastapi/fastapi#16076) that litellm >=1.95.0's
-# management_v1 endpoints import at proxy startup — with fastapi >=0.140.7 the
-# proxy dies on import (~650ms) and systemd latches start-limit-hit
-# (BerriAI/litellm#35763). litellm's own bound (fastapi>=0.136.3,<1.0) does not
-# exclude it, and the code fix (PR #35773, get_flat_params) missed both 1.95.1
-# and 1.96.0 (wheels verified 2026-08-09). DROP this guard once a litellm
-# release containing merge ecba48d has aged past the uv cooldown.
+# fastapi ceiling for the LiteLLM venv: litellm >=1.95.0 crash-loops on
+# fastapi >=0.140.7 (BerriAI/litellm#35763; full story in CLAUDE.md > Setup
+# Phases > 4a). DROP once a litellm release containing upstream merge ecba48d
+# has aged past the uv cooldown — Phase 4a warns when a candidate ages in
+# (releases through LITELLM_FASTAPI_GUARD_STALE_ABOVE are verified broken).
 LITELLM_FASTAPI_GUARD='fastapi<0.140.7'
+LITELLM_FASTAPI_GUARD_STALE_ABOVE='1.96.0'
+# The uv --with set shared by both Phase 4a install paths — one definition so
+# the guard drop (or a future third --with) can't skew fresh-install vs
+# upgrade, same rule as LITELLM_SPEC above.
+LITELLM_UV_WITH=(--with prisma --with "$LITELLM_FASTAPI_GUARD")
 # LiteLLM runtime state directory. config.yaml, the env file, and (under
 # --docker) docker-compose.yml MUST stay siblings here: the docker unit's
 # WorkingDirectory points at this dir and the compose file mounts ./config.yaml
@@ -419,7 +421,7 @@ if [ "$WITH_LOCAL_LITELLM" = "true" ] && [ "$DOCKER_MODE" != "true" ]; then
         # ACTUALLY changed — see LITELLM_UPGRADED below.
         litellm_ver_before="$(litellm_tool_version)"
         log "LiteLLM present at $LITELLM_BIN (${litellm_ver_before:-unknown}) — upgrading (re-asserts >=1.84.0 floor)..."
-        if uv tool install --upgrade --with prisma --with "$LITELLM_FASTAPI_GUARD" "$LITELLM_SPEC"; then
+        if uv tool install --upgrade "${LITELLM_UV_WITH[@]}" "$LITELLM_SPEC"; then
             # `uv tool install --upgrade` returns 0 even on a no-op (already at the
             # newest aged-in release), so gating the Prisma regen on its exit code
             # alone regenerated the client on EVERY re-run (the "skip" branch below
@@ -440,12 +442,21 @@ if [ "$WITH_LOCAL_LITELLM" = "true" ] && [ "$DOCKER_MODE" != "true" ]; then
         fi
     else
         log "Installing LiteLLM via uv tool install..."
-        uv tool install --with prisma --with "$LITELLM_FASTAPI_GUARD" "$LITELLM_SPEC"
-        # To enable optional LiteLLM features, swap the line above for:
-        #   uv tool install 'litellm[proxy,proxy-runtime,extra_proxy]>=1.84.0'
+        uv tool install "${LITELLM_UV_WITH[@]}" "$LITELLM_SPEC"
+        # To enable optional LiteLLM features, swap the spec above for:
+        #   'litellm[proxy,proxy-runtime,extra_proxy]>=1.84.0'
         # The extra_proxy extra adds: RedisVL semantic caching, Google Cloud KMS
         # + Azure Key Vault as secret backends, and Resend for email — plus
-        # prisma, which makes --with prisma redundant.
+        # prisma, which makes LITELLM_UV_WITH's --with prisma redundant.
+    fi
+
+    # The fastapi ceiling is a live pin on a network-facing framework — nag as
+    # soon as a litellm release NEWER than the ones verified broken has aged
+    # in, so the guard gets re-checked instead of rotting (it would otherwise
+    # keep succeeding silently, through fastapi security releases too).
+    litellm_ver_now="${litellm_ver_after:-$(litellm_tool_version)}"
+    if [ -n "$litellm_ver_now" ] && [ "$(printf '%s\n' "$litellm_ver_now" "$LITELLM_FASTAPI_GUARD_STALE_ABOVE" | sort -V | tail -n1)" != "$LITELLM_FASTAPI_GUARD_STALE_ABOVE" ]; then
+        warn "litellm ${litellm_ver_now} > ${LITELLM_FASTAPI_GUARD_STALE_ABOVE}: check whether it contains upstream merge ecba48d (BerriAI/litellm#35763) — if yes drop LITELLM_FASTAPI_GUARD, if no bump LITELLM_FASTAPI_GUARD_STALE_ABOVE"
     fi
 
     # Generate the Prisma client + fetch engine binaries. Upstream's Dockerfiles
