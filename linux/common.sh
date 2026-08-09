@@ -800,6 +800,10 @@ restart_user_service_if_stale() {
     local name="$1" changed="$2"
     systemctl --user enable "$name" &>/dev/null || true
     if [ "$changed" = "1" ] || ! systemctl --user is-active "$name" &>/dev/null; then
+        # A crash-looped unit latches failed/start-limit-hit; clear it so the
+        # restart below is deterministic rather than reliant on the burst
+        # window having expired. No-op for units not in a failed state.
+        systemctl --user reset-failed "$name" &>/dev/null || true
         systemctl --user restart "$name" || return 1
         log "${name} service (re)started"
     else
