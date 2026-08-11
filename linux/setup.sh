@@ -529,6 +529,13 @@ else
     ensure_managed_bash_profile force
 fi
 
+# Keep only the active binary in ~/.local/share/claude/versions. Claude Code's
+# own sweep bottoms out at three ~300 MB versions (see prune_claude_versions in
+# common.sh); this reclaims the other two. Also the one place that notices when
+# the launcher stopped being a symlink, which silently disables both that sweep
+# and future updates.
+prune_claude_versions || warn "Claude Code version prune failed — continuing"
+
 # 4c. ACP adapter (install-if-missing). Only installed with --install-obsidian:
 # the ACP bridge exists to drive Claude Code from editors like Obsidian.
 if [ "$INSTALL_OBSIDIAN" = "true" ]; then

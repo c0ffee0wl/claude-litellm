@@ -418,6 +418,63 @@ SHIM
     chmod 644 "$shim"
 }
 
+# Prune stale native-installer binaries from ~/.local/share/claude/versions,
+# keeping only the one the launcher points at (~300 MB each).
+#
+# Claude Code sweeps this directory itself on startup, but retains
+# VERSION_RETENTION_COUNT=2 (a compile-time constant — no env var, no settings
+# key) *plus* every protected version: the running executable, the
+# ~/.local/bin/claude symlink target, and anything holding a live lock. Since
+# the overlays pin the stable channel after an update, the symlink target is
+# usually not among the two newest files, so the floor is three binaries.
+#
+# Precondition, borrowed from upstream: the launcher must be a symlink into the
+# versions dir. When it is not, Claude Code skips its own cleanup entirely ("the
+# launcher ... is externally managed, so the version(s) it needs cannot be
+# determined") *and* `claude install` refuses to replace a launcher it does not
+# own — a silent state worth surfacing. We bail out for the same reason it does:
+# with no symlink there is no way to tell which binary is live.
+prune_claude_versions() {
+    local launcher versions_dir target running f size removed=0 freed=0
+
+    launcher="$(command -v claude 2>/dev/null || echo "${HOME}/.local/bin/claude")"
+    # Same resolution the binary uses (env-paths): XDG_DATA_HOME, else ~/.local/share.
+    versions_dir="${XDG_DATA_HOME:-${HOME}/.local/share}/claude/versions"
+    [ -d "$versions_dir" ] || return 0
+
+    if [ ! -L "$launcher" ]; then
+        warn "Claude Code launcher ${launcher} is not a symlink — its built-in version cleanup is disabled and updates cannot replace it; remove the file and re-run 'claude install stable'"
+        return 0
+    fi
+    target="$(readlink -f "$launcher" 2>/dev/null)" || return 0
+    if [[ "$target" != "$versions_dir"/* ]]; then
+        warn "Claude Code launcher ${launcher} resolves outside ${versions_dir} — skipping version prune"
+        return 0
+    fi
+
+    # Binaries of live processes, collected once. Deleting a running executable
+    # is harmless on Linux (the inode survives), but a session that re-execs
+    # itself would lose its path, so leave those alone.
+    running="$(readlink /proc/[0-9]*/exe 2>/dev/null || true)"
+
+    for f in "$versions_dir"/*; do
+        [ -f "$f" ] || continue
+        [ "$f" = "$target" ] && continue
+        # An install may be in flight; upstream's own 1h rule reaps these.
+        case "$f" in *.tmp.*) continue ;; esac
+        grep -qxF -- "$f" <<<"$running" && continue
+        size="$(stat -c %s "$f" 2>/dev/null || echo 0)"
+        rm -f "$f" || continue
+        removed=$((removed + 1))
+        freed=$((freed + size))
+    done
+
+    if [ "$removed" -gt 0 ]; then
+        log "Pruned ${removed} stale Claude Code version(s) — freed $((freed / 1024 / 1024)) MB"
+    fi
+    return 0
+}
+
 #############################################################################
 # AppArmor (for bwrap sandbox used by Claude Code)
 #############################################################################
