@@ -716,11 +716,11 @@ pg_setting() {
 # The other half of the invariant — the role's stored verifier must itself be
 # scram, or this rule can never match — is owned by Phase 6's role branch,
 # which (re)hashes the password under `password_encryption = 'scram-sha-256'`.
-# Sets PG_HBA_CHANGED=1 when it actually inserted + reloaded (0 otherwise), so
-# the caller can tell a fresh async reload from settled steady state.
+# The reload is best-effort (warn on failure): the idempotence check below
+# tests the *file*, not the postmaster's loaded config, so Phase 6's preflight
+# owns re-asserting the loaded state (pg_reload_conf + retry on probe failure).
 ensure_pg_socket_scram_rule() {
     local hba_file
-    PG_HBA_CHANGED=0
     hba_file="$(pg_setting hba_file)"
     if [ -z "$hba_file" ]; then
         warn "Could not determine pg_hba.conf path — skipping socket scram rule (litellm DB auth may fail)"
@@ -732,7 +732,6 @@ ensure_pg_socket_scram_rule() {
     log "Adding scoped pg_hba socket rule (local litellm scram-sha-256)..."
     # Insert at the top so it precedes Debian's default `local all all peer`.
     sudo sed -i '1i local   litellm   litellm   scram-sha-256' "$hba_file"
-    PG_HBA_CHANGED=1
     sudo systemctl reload postgresql 2>/dev/null || warn "Could not reload Postgres — apply with: sudo systemctl reload postgresql"
 }
 

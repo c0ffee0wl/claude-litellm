@@ -950,15 +950,20 @@ if [ "$WITH_LOCAL_LITELLM" = "true" ]; then
     fi
 
     # The exclusion globs must match ONLY the URLs this phase generates below
-    # (host+port+dbname all pinned), not any loopback URL with the `litellm`
-    # role: a user-supplied `…@127.0.0.1:5433/mydb` (pgbouncer / SSH tunnel to
-    # a remote Postgres) is external, and a port-agnostic glob would silently
-    # discard it and provision a local DB instead. Second glob: our own socket
-    # URL (with or without the authority port), so pasting it into .env doesn't
-    # read as an external DB either.
+    # (role, host, and dbname all pinned), not any loopback URL with the
+    # `litellm` role: a user-supplied `…@127.0.0.1:5433/mydb` (pgbouncer / SSH
+    # tunnel to a remote Postgres) is external, and a broader glob would
+    # silently discard it and provision a local DB instead. The TCP glob is
+    # port-wildcarded because the fallback below is port-corrected
+    # (`:${pg_port}` on a drifted cluster) — the dbname pin keeps tunnel URLs
+    # to other databases external. The socket globs require `:` or `/`
+    # immediately after `localhost` (hosts merely prefixed with "localhost"
+    # stay external) and the exact query tail; the portless form is the URL
+    # shape older installs wrote.
     if [ -n "${DATABASE_URL:-}" ] \
-       && [[ "${DATABASE_URL}" != postgresql://litellm:*@127.0.0.1:5432/litellm ]] \
-       && [[ "${DATABASE_URL}" != postgresql://litellm:*@localhost*/litellm\?host=/run/postgresql* ]]; then
+       && [[ "${DATABASE_URL}" != postgresql://litellm:*@127.0.0.1:*/litellm ]] \
+       && [[ "${DATABASE_URL}" != postgresql://litellm:*@localhost:*/litellm\?host=/run/postgresql ]] \
+       && [[ "${DATABASE_URL}" != postgresql://litellm:*@localhost/litellm\?host=/run/postgresql ]]; then
         log "DATABASE_URL set externally — skipping local Postgres install"
         LITELLM_DB_URL="$DATABASE_URL"
     else
@@ -1001,7 +1006,7 @@ if [ "$WITH_LOCAL_LITELLM" = "true" ]; then
         # check was a false positive that let the psql calls below run against a
         # dead socket (the "No such file or directory" failure on a fresh boot).
         for _ in {1..30}; do pg_isready -q && break; sleep 1; done
-        pg_isready -q || { error "Postgres not accepting connections on port 5432 after 30s"; exit 1; }
+        pg_isready -q || { error "Postgres not accepting connections after 30s"; exit 1; }
 
         LITELLM_DB_PASSWORD="${PERSISTED_DB_PASSWORD:-$(openssl rand -hex 24)}"
         [ -z "$PERSISTED_DB_PASSWORD" ] && log "Generated new LITELLM_DB_PASSWORD"
@@ -1021,13 +1026,19 @@ if [ "$WITH_LOCAL_LITELLM" = "true" ]; then
             # changed, or re-hash the same value in place when the verifier
             # predates the scram default — skip the SQL round-trip only when
             # both hold (the no-op rerun). SET is session-scoped; both
-            # statements ride one psql -c.
+            # statements ride one psql invocation, fed via stdin so the
+            # password stays out of world-readable argv (/proc/*/cmdline —
+            # same rule as pg_url_works). ON_ERROR_STOP keeps a SQL failure
+            # fatal for `set -e` (stdin scripts otherwise exit 0); the
+            # pipeline's status is psql's, so `set -e` still sees it.
             if [ "$LITELLM_DB_PASSWORD" != "$PERSISTED_DB_PASSWORD" ] || [ "$role_scram" != "t" ]; then
-                sudo -u postgres psql -c "SET password_encryption='scram-sha-256'; ALTER ROLE litellm WITH LOGIN PASSWORD '${LITELLM_DB_PASSWORD}'" >/dev/null
+                printf '%s\n' "SET password_encryption='scram-sha-256'; ALTER ROLE litellm WITH LOGIN PASSWORD '${LITELLM_DB_PASSWORD}'" \
+                    | sudo -u postgres psql -q -v ON_ERROR_STOP=1 -f - >/dev/null
                 log "Synced Postgres role 'litellm' password (scram-sha-256)"
             fi
         else
-            sudo -u postgres psql -c "SET password_encryption='scram-sha-256'; CREATE ROLE litellm WITH LOGIN PASSWORD '${LITELLM_DB_PASSWORD}'" >/dev/null
+            printf '%s\n' "SET password_encryption='scram-sha-256'; CREATE ROLE litellm WITH LOGIN PASSWORD '${LITELLM_DB_PASSWORD}'" \
+                | sudo -u postgres psql -q -v ON_ERROR_STOP=1 -f - >/dev/null
             log "Created Postgres role 'litellm'"
         fi
 
@@ -1053,24 +1064,38 @@ if [ "$WITH_LOCAL_LITELLM" = "true" ]; then
         pg_port="$(pg_setting port)"
         pg_port="${pg_port:-5432}"
 
-        # Preflight the socket URL and only then commit it, falling back to TCP
-        # (port-corrected) so no existing install can be broken by the switch —
-        # a hand-edited pg_hba or otherwise failed socket auth costs a warning,
-        # not the proxy. The port rides the URL *authority* (@localhost:PORT/),
-        # which libpq and Prisma both parse; a &port= query param is only
-        # libpq-verified. The probe URL carries no password (see pg_url_works);
-        # the retry exists solely for a fresh pg_hba reload (async SIGHUP)
-        # racing the first probe, so it is gated on PG_HBA_CHANGED — steady-
-        # state failures fall straight through to the TCP fallback.
+        # Preflight the socket URL and only then commit it, falling back so no
+        # existing install can be broken by the switch — a hand-edited pg_hba
+        # or otherwise failed socket auth costs a warning, not the proxy. The
+        # port rides the URL *authority* (@localhost:PORT/), which libpq and
+        # Prisma both parse; a &port= query param is only libpq-verified. The
+        # probe URL carries no password (see pg_url_works). On a first-probe
+        # failure, force the postmaster to re-read pg_hba (pg_reload_conf —
+        # works regardless of the umbrella unit's state, unlike `systemctl
+        # reload`) and retry once: that covers both a freshly inserted rule
+        # racing its async SIGHUP and a rule a previous run left on disk whose
+        # reload never landed — the shape ensure_pg_socket_scram_rule's
+        # file-presence idempotence check cannot see.
         ensure_pg_socket_scram_rule
         socket_tail="localhost:${pg_port}/litellm?host=/run/postgresql"
         probe_url="postgresql://litellm@${socket_tail}"
         if pg_url_works "$probe_url" "$LITELLM_DB_PASSWORD" \
-           || { [ "$PG_HBA_CHANGED" = 1 ] && sleep 1 && pg_url_works "$probe_url" "$LITELLM_DB_PASSWORD"; }; then
+           || { sudo -u postgres psql -qAtc 'SELECT pg_reload_conf()' >/dev/null 2>&1
+                sleep 1
+                pg_url_works "$probe_url" "$LITELLM_DB_PASSWORD"; }; then
             LITELLM_DB_URL="postgresql://litellm:${LITELLM_DB_PASSWORD}@${socket_tail}"
+        elif [ "$DOCKER_MODE" = "true" ]; then
+            # No TCP fallback exists under --docker: 127.0.0.1 inside the
+            # container is the container's own loopback (bridge network, no
+            # host-gateway by design — see CLAUDE.md "Docker mode"), so a TCP
+            # URL is guaranteed dead there. Commit the socket URL anyway: the
+            # container's auth path differs from this host-side probe only in
+            # UID, which the scram rule doesn't consult.
+            LITELLM_DB_URL="postgresql://litellm:${LITELLM_DB_PASSWORD}@${socket_tail}"
+            warn "Postgres socket auth failed — committing the socket URL anyway (no TCP fallback can work inside the container). Check the 'local litellm litellm scram-sha-256' line in pg_hba.conf and that the role password matches LITELLM_DB_PASSWORD in ~/.config/litellm/env, then re-run setup.sh"
         else
             LITELLM_DB_URL="postgresql://litellm:${LITELLM_DB_PASSWORD}@127.0.0.1:${pg_port}/litellm"
-            warn "Postgres socket auth failed — keeping the TCP URL. Check the 'local litellm litellm scram-sha-256' line in pg_hba.conf, then re-run setup.sh"
+            warn "Postgres socket auth failed — keeping the TCP URL. Check the 'local litellm litellm scram-sha-256' line in pg_hba.conf and that the role password matches LITELLM_DB_PASSWORD in ~/.config/litellm/env, then re-run setup.sh"
         fi
     fi
 
