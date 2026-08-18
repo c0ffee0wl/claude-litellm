@@ -695,18 +695,35 @@ install_docker_rootless() {
     systemctl --user start docker &>/dev/null || warn "Could not start rootless docker.service — start it manually with: systemctl --user start docker"
 }
 
+# Read a single server setting from the live cluster through pg_wrapper's
+# psql, which routes to the same cluster the rest of the Phase 6 bootstrap
+# talks to. Prints nothing on failure (the pipeline's status is tr's, so a
+# psql failure never trips `set -e`) — callers own their fallback policy.
+# Usage: pg_setting <name>
+pg_setting() {
+    sudo -u postgres psql -tAc "SHOW $1;" 2>/dev/null | tr -d '[:space:]'
+}
+
 # Ensure the host Postgres accepts password (scram) auth for the `litellm` role
-# over its Unix socket. Used by --docker, where the (rootless) LiteLLM container
-# connects to the host DB over a bind-mounted socket instead of TCP — no network
-# exposure at all. Debian's default pg_hba uses peer auth for `local`
-# connections, which rejects the litellm role (the container's mapped UID has no
-# matching OS user), so we add a scoped scram rule. Idempotent; inserts the rule
+# over its Unix socket. Used by every local-Postgres install: Phase 6 connects
+# LiteLLM over the socket in both runtimes (native since the socket switch;
+# --docker from the start, via the bind-mounted socket dir). Debian's default
+# pg_hba uses peer auth for `local` connections, which rejects the litellm role
+# either way — natively the service runs as the deploy user (no `litellm` OS
+# account), and under --docker the container's mapped UID has no matching OS
+# user at all — so we add a scoped scram rule. Idempotent; inserts the rule
 # ABOVE existing `local` rules (pg_hba is first-match-wins) and reloads Postgres.
+# The other half of the invariant — the role's stored verifier must itself be
+# scram, or this rule can never match — is owned by Phase 6's role branch,
+# which (re)hashes the password under `password_encryption = 'scram-sha-256'`.
+# Sets PG_HBA_CHANGED=1 when it actually inserted + reloaded (0 otherwise), so
+# the caller can tell a fresh async reload from settled steady state.
 ensure_pg_socket_scram_rule() {
     local hba_file
-    hba_file="$(sudo -u postgres psql -tAc 'SHOW hba_file;' 2>/dev/null | tr -d '[:space:]' || true)"
+    PG_HBA_CHANGED=0
+    hba_file="$(pg_setting hba_file)"
     if [ -z "$hba_file" ]; then
-        warn "Could not determine pg_hba.conf path — skipping socket scram rule (container DB auth may fail)"
+        warn "Could not determine pg_hba.conf path — skipping socket scram rule (litellm DB auth may fail)"
         return 0
     fi
     if sudo grep -qE '^[[:space:]]*local[[:space:]]+litellm[[:space:]]+litellm[[:space:]]+scram-sha-256' "$hba_file"; then
@@ -715,7 +732,17 @@ ensure_pg_socket_scram_rule() {
     log "Adding scoped pg_hba socket rule (local litellm scram-sha-256)..."
     # Insert at the top so it precedes Debian's default `local all all peer`.
     sudo sed -i '1i local   litellm   litellm   scram-sha-256' "$hba_file"
+    PG_HBA_CHANGED=1
     sudo systemctl reload postgresql 2>/dev/null || warn "Could not reload Postgres — apply with: sudo systemctl reload postgresql"
+}
+
+# Probe a Postgres connection URL (Phase 6's socket preflight). The URL must
+# NOT embed the password — psql's argv is world-readable in /proc/*/cmdline —
+# so it is passed separately and rides PGPASSWORD. Always call in a
+# conditional so a failed probe never trips `set -e`.
+# Usage: pg_url_works <url-without-password> <password>
+pg_url_works() {
+    PGPASSWORD="$2" PGCONNECT_TIMEOUT=5 psql "$1" -tAc 'SELECT 1' &>/dev/null
 }
 
 #############################################################################
