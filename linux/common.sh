@@ -732,7 +732,16 @@ ensure_pg_socket_scram_rule() {
     log "Adding scoped pg_hba socket rule (local litellm scram-sha-256)..."
     # Insert at the top so it precedes Debian's default `local all all peer`.
     sudo sed -i '1i local   litellm   litellm   scram-sha-256' "$hba_file"
-    sudo systemctl reload postgresql 2>/dev/null || warn "Could not reload Postgres — apply with: sudo systemctl reload postgresql"
+    # Reload via the server itself (pg_reload_conf = SIGHUP), NOT `systemctl
+    # reload postgresql`: that targets the umbrella unit, which is inactive on
+    # exactly the boxes this repo configures — Phase 6 enables the *instance*
+    # unit (postgresql@<ver>-main) directly because Kali's umbrella is a
+    # preset-disabled /bin/true shell (see the Phase 6 comment) — so the
+    # systemctl form fails with "not active, cannot reload" on every native
+    # install. The server is definitionally up here (it just answered SHOW
+    # hba_file), so a failure is anomalous; warn with a command that works.
+    sudo -u postgres psql -qAtc 'SELECT pg_reload_conf()' >/dev/null 2>&1 \
+        || warn "Could not reload Postgres — apply with: sudo -u postgres psql -c 'SELECT pg_reload_conf()'"
 }
 
 # Probe a Postgres connection URL (Phase 6's socket preflight). The URL must
