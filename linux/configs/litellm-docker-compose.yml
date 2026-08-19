@@ -58,6 +58,11 @@ services:
       LITELLM_MODE: "PRODUCTION"
       LITELLM_LOG: "ERROR"
       LITELLM_LOCAL_ANTHROPIC_BETA_HEADERS: "true"
+      # Outbound TLS/DNS tuning — keep in sync with systemd/litellm.service.
+      # Rationale: CLAUDE.md, "TLSV1_UNRECOGNIZED_NAME".
+      SSL_ECDH_CURVE: "prime256v1"
+      DISABLE_AIOHTTP_TRUST_ENV: "True"
+      AIOHTTP_TTL_DNS_CACHE: "10"
     command:
       - "--config"
       - "/app/config.yaml"

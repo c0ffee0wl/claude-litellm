@@ -17,6 +17,28 @@ Environment=PATH=__PATH__
 Environment=LITELLM_MODE=PRODUCTION
 Environment=LITELLM_LOG=ERROR
 Environment=LITELLM_LOCAL_ANTHROPIC_BETA_HEADERS=true
+# --- Outbound TLS/DNS tuning for the aiohttp transport ---------------------
+# Keep these three in sync with litellm-docker-compose.yml. Env vars, NOT
+# `litellm_settings` — the cost-map and beta-header fetches run at module level
+# during `import litellm`, before config.yaml is parsed, so a config-file pin
+# would silently miss them. Measurements + the diagnostic runbook live in
+# CLAUDE.md, "TLSV1_UNRECOGNIZED_NAME"; don't restate the figures here.
+#
+# One ECDH group, so the ClientHello stays inside one MSS — OpenSSL 3.5+ defaults
+# to a PQC hybrid that splits it, and SNI-inspecting middleboxes then lose the
+# hostname. NOT the X25519 litellm's own comment recommends: that one resets
+# against Azure. Whatever value sits here must satisfy EVERY host the daemon
+# dials, not just the provider.
+Environment=SSL_ECDH_CURVE=prime256v1
+# Never take an egress proxy from the ambient environment: a --user unit inherits
+# the whole user-manager environment, so a desktop proxy setting would tunnel
+# prompt content and the provider API key through it. Remove this line if a
+# deployment genuinely needs a corporate proxy to reach its provider.
+Environment=DISABLE_AIOHTTP_TRUST_ENV=True
+# Restore aiohttp's own 10s DNS-cache default (litellm overrides it to 300s):
+# provider endpoints behind Traffic Manager publish ~10s A records, and aiohttp
+# never invalidates a cached address on connect failure.
+Environment=AIOHTTP_TTL_DNS_CACHE=10
 Environment=PRISMA_BINARY_CACHE_DIR=%h/.cache/prisma-python/binaries
 Environment=PRISMA_HIDE_UPDATE_MESSAGE=1
 Environment=PRISMA_SKIP_POSTINSTALL_GENERATE=1
