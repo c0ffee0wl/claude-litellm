@@ -18,9 +18,21 @@ WorkingDirectory=__APP_DIR__
 Environment=PATH=__PATH__
 # Rootless daemon socket lives in the user runtime dir (%t = /run/user/<uid>).
 Environment=DOCKER_HOST=unix://%t/docker.sock
+# TimeoutStartSec must cover the pull PLUS the pg gate below (first-run pull
+# ~367MB; previously the 90s default bounded the pull alone).
+TimeoutStartSec=300
 # Re-pull on (re)start so a bumped image tag in docker-compose.yml is honoured.
-# Leading "-" makes a failed pull (offline / already cached) non-fatal.
+# Leading "-" makes a failed pull (offline / already cached) non-fatal. Runs
+# BEFORE the Postgres gate: the pull has no DB dependency, so a slow-booting
+# cluster comes up while the registry round-trip is in flight.
 ExecStartPre=-/usr/bin/docker compose pull
+# Wait (bounded) for the HOST Postgres socket before `docker compose up` —
+# same gate as litellm.service (the container reaches the DB over the
+# bind-mounted /run/postgresql socket, so probing it host-side is exact).
+# `$$` = systemd's literal-$ escape; ~120s ceiling with exit-0 fall-through
+# (can only delay the start, never fail it). Phase 7 substitutes __PGPORT__
+# or deletes the line for an external DATABASE_URL.
+ExecStartPre=/bin/sh -c 'for _ in $$(seq 60); do pg_isready -q -h /run/postgresql -p __PGPORT__ && exit 0; sleep 2; done; exit 0'
 ExecStart=/usr/bin/docker compose up
 ExecStop=/usr/bin/docker compose down
 # `always`, not `on-failure` — see CLAUDE.md. `docker compose up` exits 0 when

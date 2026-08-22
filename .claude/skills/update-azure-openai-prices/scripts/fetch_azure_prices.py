@@ -20,6 +20,12 @@ Only the Std meters map into litellm-config.yaml. `Cd Wr` is deliberately
 unmapped: nothing on the openai/-route reports cache-creation tokens, so a
 cache-write rate would never be applied.
 
+Note the config still SETS `cache_creation_input_token_cost` (equal to
+input_cost_per_token) to stop LiteLLM inheriting OpenAI's cache-write rate for
+Azure traffic. This script does not manage that key — whoever refreshes the
+rates must keep it equal to the new input rate by hand. See the comment above
+`model_list` in litellm-config.yaml.
+
 Usage:
     fetch_azure_prices.py --config ../../../linux/configs/litellm-config.yaml
     fetch_azure_prices.py --model gpt-5.6-luna --scope Gl --region eastus2

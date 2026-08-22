@@ -10,34 +10,56 @@
 # volume). claude-devtools also stays native (Phase 9).
 #
 # Relative paths (./config.yaml, ./env) resolve against this file's directory
-# (~/.config/litellm). The only substituted token is the port (setup.sh's
-# LITELLM_PORT, same value the native unit's render gets) — Phase 7 seds it
-# before writing the deployed copy.
+# (~/.config/litellm). Two substituted tokens, both rendered by Phase 7 from the
+# same constants the native unit's render uses: __PORT__ (LITELLM_PORT) and
+# __LITELLM_IMAGE_TAG__ (LITELLM_VERSION).
 
 services:
   litellm:
-    # Pinned image — a deliberate pin like the claude-devtools release-tag pin
-    # (CLAUDE.md > "install-if-missing"). This uses LiteLLM's plain per-release
-    # tag (vX.Y.Z), NOT the `-stable` channel: `-stable` tags are promoted later
-    # and LAG (newest is v1.83.14-stable), so they can't match the native uv
-    # `>=1.84.0` floor. v1.93.0 satisfies that floor, clears the compromised
-    # 1.82.7/1.82.8, and carries the Responses-adapter support this setup relies
-    # on for GPT-5.6 (the Anthropic /v1/messages -> Responses adapter honours
-    # output_config.effort; the `openai/` route in litellm-config.yaml takes that
-    # adapter). It is also what the native uv install resolves to under a 1-week
-    # dependency cooldown, so both runtimes track the same version.
+    # Rendered from setup.sh's LITELLM_VERSION — the SAME constant that pins the
+    # native uv install, so the two runtimes can never diverge. That matters
+    # beyond tidiness: they share one host Postgres by design, so a floating
+    # native version could migrate the schema ahead of a pinned image, and
+    # flipping to --docker would then be a schema downgrade. Bump the constant,
+    # not this line.
     #
-    # Bump intentionally, and prefer a tag that is (a) aged in past the cooldown,
-    # (b) git-tagged upstream, and (c) present on ghcr.io — the three can diverge.
-    # Counter-example seen at the v1.93.0 bump: 1.93.1 was on PyPI and ghcr.io but
-    # had NO upstream git tag (unauditable source) and shipped same-day, and it
-    # post-dates 1.94.0 (a backport lane, not mainline). Verify with:
-    #   T=$(curl -s "https://ghcr.io/token?scope=repository:berriai/litellm:pull" | jq -r .token)
-    #   curl -sI -H "Authorization: Bearer $T" \
-    #     https://ghcr.io/v2/berriai/litellm/manifests/vX.Y.Z
-    # (a given version's `-stable` may not exist). ExecStartPre re-pulls on start.
-    image: ghcr.io/berriai/litellm:v1.93.0
-    restart: unless-stopped
+    # LiteLLM's plain per-release tag (vX.Y.Z), NOT the `-stable` channel:
+    # `-stable` tags are promoted later and LAG, so no `-stable` image exists for
+    # the versions this repo pins.
+    #
+    # Four criteria to verify on every bump — they diverge, so check all four
+    # (the v1.93.0-era counter-example: 1.93.1 was on PyPI and ghcr.io with NO
+    # upstream git tag, a same-day backport lane):
+    #   (1) aged past the ~7-day cooldown (ghcr config blob .created);
+    #   (2) git-tagged upstream (auditable source);
+    #   (3) the tag's committed uv.lock pins fastapi <0.140.7 — the image builds
+    #       with `uv sync --frozen`, so this is the BerriAI/litellm#35763 check
+    #       the native LITELLM_FASTAPI_GUARD cannot perform inside an image;
+    #   (4) the ghcr manifest exists:
+    #         T=$(curl -s "https://ghcr.io/token?scope=repository:berriai/litellm:pull" | jq -r .token)
+    #         curl -sI -H "Authorization: Bearer $T" \
+    #           https://ghcr.io/v2/berriai/litellm/manifests/vX.Y.Z
+    # For the current pin all four are recorded next to LITELLM_VERSION in
+    # setup.sh. ExecStartPre re-pulls on start.
+    image: ghcr.io/berriai/litellm:v__LITELLM_IMAGE_TAG__
+    # `no`, not `unless-stopped`: the systemd unit wrapping `docker compose up`
+    # already declares Restart=always, and two supervisors on one process means
+    # Docker's policy silently governs — diverging from the native unit whose
+    # parity CLAUDE.md relies on. Upstream's own compose declares no restart
+    # policy on the litellm service either.
+    restart: "no"
+    # Upstream's hardened compose sets this and it needs no image change (unlike
+    # read_only / user:, which require Dockerfile.non_root rather than the
+    # ghcr.io/berriai/litellm image pinned above).
+    security_opt:
+      - no-new-privileges:true
+    # The rootless daemon otherwise keeps an unrotated json-file log per
+    # container, on top of everything compose relays into the journal.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     # Publish to loopback only — same localhost-only exposure as the native unit
     # (which binds --host 127.0.0.1). The container itself listens on 0.0.0.0
     # (required so the published port reaches it); it is NOT reachable off-host.
@@ -56,13 +78,26 @@ services:
       - ./env
     environment:
       LITELLM_MODE: "PRODUCTION"
-      LITELLM_LOG: "ERROR"
+      # WARNING, not ERROR — see systemd/litellm.service for which silent
+      # single-surface failures this makes visible.
+      LITELLM_LOG: "WARNING"
       LITELLM_LOCAL_ANTHROPIC_BETA_HEADERS: "true"
-      # Outbound TLS/DNS tuning — keep in sync with systemd/litellm.service.
-      # Rationale: CLAUDE.md, "TLSV1_UNRECOGNIZED_NAME".
-      SSL_ECDH_CURVE: "prime256v1"
+      # Outbound TLS/DNS tuning — keep in sync with systemd/litellm.service,
+      # including the deliberate ABSENCE of SSL_ECDH_CURVE (rationale there).
       DISABLE_AIOHTTP_TRUST_ENV: "True"
-      AIOHTTP_TTL_DNS_CACHE: "10"
+      AIOHTTP_TTL_DNS_CACHE: "300"
+      # Prisma startup-migration budgets — upstream's own defaults, pinned so a
+      # future retune can't move us. Rationale: configs/litellm-prisma.env,
+      # which is where the native side reads them from.
+      LITELLM_PRISMA_BOOTSTRAP_TIMEOUT: "600"
+      LITELLM_PRISMA_COMMAND_TIMEOUT: "60"
+      # Prisma CLI phone-home (checkpoint.prisma.io) off — same as the native
+      # unit. PRISMA_USE_GLOBAL_NODE is deliberately NOT set here: the image
+      # bakes its CLI under /opt/prisma and relies on the image's /usr/bin/node
+      # ("node (without npm) is required by the prisma CLI at runtime",
+      # upstream Dockerfile); the native unit's opt-out guards against the
+      # host's ~/.bun/bin/node -> bun symlink, which the container never sees.
+      CHECKPOINT_DISABLE: "1"
     command:
       - "--config"
       - "/app/config.yaml"
@@ -74,10 +109,18 @@ services:
       - "1"
       - "--telemetry"
       - "False"
-    # The image runs Prisma migrations on startup (against the host DB), so the
-    # first boot can take a while — generous start_period before unhealthy.
+      # Schema posture, in sync with litellm.service's ExecStart — see
+      # CLAUDE.md > Key Conventions, "DB schema posture" — including why the
+      # resolver's ahead-of-head warning is likely inert inside this image
+      # (psycopg is dev-only upstream), leaving the LITELLM_VERSION pin that
+      # renders the tag above as what actually prevents a schema downgrade.
+      - "--use_v2_migration_resolver"
+    # Startup syncs the DB schema via `prisma migrate deploy` (against the host
+    # DB), so the first boot can take a while — generous start_period.
+    # /health/readiness, not liveliness: liveliness answers 200 with the DB
+    # unreachable, so an unhealthy DB would never mark the container unhealthy.
     healthcheck:
-      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:__PORT__/health/liveliness')\""]
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:__PORT__/health/readiness')\""]
       interval: 30s
       timeout: 10s
       retries: 3

@@ -227,6 +227,28 @@ update_profile_export() {
     fi
 }
 
+# Read NAME's value from a KEY=value env file (systemd EnvironmentFile /
+# docker env_file shape — no `export`, no quoting). Prints the value of the
+# LAST match, empty when the file or key is absent. Never fails.
+# Last, not first: both consumers of these files — systemd EnvironmentFile and
+# docker-compose env_file — are last-wins, so a duplicated key (the natural
+# shape of a hand-fix appended at the bottom) means the SERVICE ran with the
+# last value. Reading the first would hand callers a value the service never
+# used — and one caller latches it forever (LITELLM_SALT_KEY, Phase 6).
+# Usage: read_env_file_var <file> <NAME>
+read_env_file_var() {
+    local file="$1" name="$2"
+    [ -f "$file" ] || return 0
+    grep "^${name}=" "$file" 2>/dev/null | tail -1 | cut -d= -f2-
+}
+
+# The path deploy_user_systemd_service writes <name>.service to — one spelling
+# for the writer and for callers that test/mask/restore the deployed unit.
+# Usage: user_unit_path <name>
+user_unit_path() {
+    echo "${HOME}/.config/systemd/user/$1.service"
+}
+
 # Read a previously written value from PROFILE_FILE. Prints nothing if not
 # present.
 # Usage: read_profile_export VAR_NAME
@@ -292,30 +314,126 @@ normalize_azure_v1_endpoint() {
     printf '%s' "${url}/openai/v1"
 }
 
-# Emit `KEY=VALUE` lines for every LiteLLM-relevant provider env var found in
-# the current shell environment or ~/.profile. Output is intended to be
-# concatenated into the LiteLLM systemd EnvironmentFile.
-#
-# Coverage (verified by grepping get_secret/os.environ.get in upstream LiteLLM):
+# Which env vars count as LiteLLM provider credentials. Coverage (verified by
+# grepping get_secret/os.environ.get in upstream LiteLLM):
 #   - Pattern: <PROVIDER>_API_{KEY,BASE,VERSION,TOKEN}  (covers ~120 vars)
 #   - Plus AWS / GCP / Vertex / watsonx / Azure-AD / OpenAI-org / HF_TOKEN extras
 #   - Excludes master key, base URL, internal LITELLM_/UI_ config
-#
-# Priority when a var is set in multiple places: current env > ~/.profile.
-collect_litellm_provider_vars() {
-    local pattern='^[A-Z][A-Z0-9_]*_(API_KEY|API_BASE|API_VERSION|API_TOKEN)$'
-    local named=(
-        AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
-        AWS_REGION_NAME AWS_DEFAULT_REGION AWS_REGION AWS_BEARER_TOKEN_BEDROCK
-        GOOGLE_APPLICATION_CREDENTIALS GOOGLE_CLOUD_PROJECT GOOGLE_API_KEY
-        VERTEXAI_PROJECT VERTEXAI_LOCATION VERTEX_PROJECT VERTEX_LOCATION
-        WATSONX_PROJECT_ID WATSONX_REGION WX_PROJECT_ID WX_REGION
-        AZURE_RESOURCE_ENDPOINT AZURE_CLIENT_SECRET AZURE_AD_TOKEN
-        OPENAI_ORGANIZATION OPENAI_PROJECT
-        HF_TOKEN
-    )
-    local exclude='^(ANTHROPIC_AUTH_TOKEN|ANTHROPIC_BASE_URL|LITELLM_|UI_)'
+# At file scope so is_litellm_provider_var can share them: a second copy would
+# drift, and the carry-forward that uses it decides whether a secret survives
+# the env-file rewrite.
+LITELLM_PROVIDER_PATTERN='^[A-Z][A-Z0-9_]*_(API_KEY|API_BASE|API_VERSION|API_TOKEN)$'
+LITELLM_PROVIDER_EXCLUDE='^(ANTHROPIC_AUTH_TOKEN|ANTHROPIC_BASE_URL|LITELLM_|UI_)'
+LITELLM_PROVIDER_NAMED=(
+    AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+    AWS_REGION_NAME AWS_DEFAULT_REGION AWS_REGION AWS_BEARER_TOKEN_BEDROCK
+    GOOGLE_APPLICATION_CREDENTIALS GOOGLE_CLOUD_PROJECT GOOGLE_API_KEY
+    VERTEXAI_PROJECT VERTEXAI_LOCATION VERTEX_PROJECT VERTEX_LOCATION
+    WATSONX_PROJECT_ID WATSONX_REGION WX_PROJECT_ID WX_REGION
+    AZURE_RESOURCE_ENDPOINT AZURE_CLIENT_SECRET AZURE_AD_TOKEN
+    OPENAI_ORGANIZATION OPENAI_PROJECT
+    HF_TOKEN
+)
 
+# The endpoint-shaped subset of the above: provider vars whose VALUE is a URL,
+# so a DNS pre-flight knows which ones name a host. Deliberately a separate
+# constant rather than derived from the two above — those answer "is this a
+# credential", which would drag AWS_ACCESS_KEY_ID into a name lookup. Edit it
+# together with them: a new endpoint-shaped var added to LITELLM_PROVIDER_NAMED
+# reaches the env file but goes unprobed unless it is added here too.
+# Two things are out of reach by construction, not by omission: endpoints LiteLLM
+# DERIVES rather than reads (Bedrock from AWS_REGION_NAME, Vertex from
+# VERTEX_LOCATION — never URL-shaped), and the api_base of any model added
+# through /ui, which STORE_MODEL_IN_DB puts in Postgres. The env file is the
+# deterministic source for the endpoints this repo itself configures.
+LITELLM_ENDPOINT_PATTERN='^([A-Z][A-Z0-9_]*_API_BASE|AZURE_RESOURCE_ENDPOINT)='
+
+# Resolve <host> the way LiteLLM's transport will, and print HOW it went:
+#   ok      resolves
+#   v4only  resolves over IPv4 only — the dual-stack lookup fails
+#   dead    does not resolve at all
+#
+# `getent ahosts` is AF_UNSPEC, i.e. the same getaddrinfo call aiohttp's
+# ThreadedResolver makes; `ahostsv4` is A-only. Splitting them is the whole
+# point of this probe rather than a plain `getent hosts`: the documented failure
+# for Azure Foundry endpoints is that the A answer fits inside glibc's 512-byte
+# no-EDNS buffer while the AAAA answer truncates, so the dual-stack lookup times
+# out (EAI_AGAIN) on a name that resolves perfectly over IPv4. `v4only` IS that
+# shape, and its fix differs from `dead`'s — hence three states, not a predicate.
+# Printed rather than returned: a non-zero exit would be a finding, not a
+# failure, and callers run under `set -e`.
+# Under --docker this probes the HOST resolver, which the container inherits
+# only when /etc/resolv.conf carries no loopback nameserver (dockerd filters
+# those out and substitutes public resolvers).
+# Cost against a blackholed resolver is `timeout x attempts x NAMESERVERS`, not
+# the per-call `timeout x attempts` the defaults suggest — glibc spends the
+# budget on each nameserver in turn (measured: 10s / 20s / 28s for 1 / 2 / 3
+# servers at the default timeout:5 attempts:2). Two is the ordinary
+# NetworkManager shape, so `timeout 15` is the operative bound here, not a
+# belt-and-braces one: it deliberately truncates glibc mid-retry, because a
+# lookup that needs more than 15s is already useless to the proxy. Consequence
+# to know: a name that would only have resolved via the SECOND nameserver at
+# ~16-20s is reported v4only/dead. Worst case is 2 x 15s per endpoint, and only
+# on a box that is already failing.
+# Usage: endpoint_dns_state <host>
+endpoint_dns_state() {
+    local host="$1"
+    if timeout 15 getent ahosts "$host" &>/dev/null; then
+        echo ok
+    elif timeout 15 getent ahostsv4 "$host" &>/dev/null; then
+        echo v4only
+    else
+        echo dead
+    fi
+}
+
+# Hostnames LiteLLM will dial, read from the deployed EnvironmentFile. Values
+# are URLs; bare hosts (and host:port) are tolerated. Loopback is skipped — it
+# is never a provider. One per line, deduplicated by NAME. The sed mirrors how
+# the value is consumed: surrounding quotes are stripped (systemd's
+# EnvironmentFile strips them, so a hand-appended `KEY="https://…"` line is
+# valid — probing `"https` would cry wolf on exactly the just-repaired box),
+# then scheme, path/query, a `user[:pass]@` userinfo prefix and the port.
+#
+# `tac | awk '!seen[$1]++'` is last-wins on the key — same rule, same reason as
+# read_env_file_var above.
+# Usage: litellm_endpoint_hosts <env-file>
+litellm_endpoint_hosts() {
+    local file="$1"
+    [ -f "$file" ] || return 0
+    grep -E "$LITELLM_ENDPOINT_PATTERN" "$file" 2>/dev/null \
+        | tac | awk -F= '!seen[$1]++' \
+        | cut -d= -f2- \
+        | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//; s/^(["'"'"'])(.*)\1$/\2/; s#^[a-zA-Z][a-zA-Z0-9+.-]*://##; s#[/?].*$##; s#^[^@]*@##; s#:.*$##' \
+        | grep -vE '^(localhost|127\.|\[|$)' \
+        | sort -u
+}
+
+# True when <have> is a strictly newer version than <marker>; false when <have>
+# is empty (an unreadable version must not fire a staleness nag). `sort -V` is
+# the comparison; wrapping it means the "is a > b" idiom — easy to write
+# backwards — is spelled once for every pin that carries a STALE_ABOVE marker.
+# Usage: version_newer_than <have> <marker>
+version_newer_than() {
+    [ -n "$1" ] && [ "$(printf '%s\n' "$1" "$2" | sort -V | tail -n1)" != "$2" ]
+}
+
+# True when NAME is a var the collector below would emit. Used by setup.sh's
+# carry-forward to decide which keys of a previously-deployed env file may be
+# preserved when the collector didn't find them.
+# Usage: is_litellm_provider_var <NAME>
+is_litellm_provider_var() {
+    local name="$1"
+    [[ "$name" =~ $LITELLM_PROVIDER_EXCLUDE ]] && return 1
+    [[ "$name" =~ $LITELLM_PROVIDER_PATTERN ]] && return 0
+    [[ " ${LITELLM_PROVIDER_NAMED[*]} " == *" $name "* ]]
+}
+
+# Emit `KEY=VALUE` lines for every LiteLLM-relevant provider env var found in
+# the current shell environment or ~/.profile — intended to be concatenated
+# into the LiteLLM systemd EnvironmentFile. Priority when a var is set in more
+# than one place: current env > ~/.profile.
+collect_litellm_provider_vars() {
     declare -A seen profile
     local v val line
 
@@ -333,8 +451,8 @@ collect_litellm_provider_vars() {
 
     # Pass 1: pattern-match current shell env
     while IFS= read -r v; do
-        [[ "$v" =~ $pattern ]] || continue
-        [[ "$v" =~ $exclude ]] && continue
+        [[ "$v" =~ $LITELLM_PROVIDER_PATTERN ]] || continue
+        [[ "$v" =~ $LITELLM_PROVIDER_EXCLUDE ]] && continue
         val="${!v}"
         [ -z "$val" ] && continue
         printf '%s=%s\n' "$v" "$val"
@@ -342,7 +460,7 @@ collect_litellm_provider_vars() {
     done < <(compgen -e)
 
     # Pass 2: named non-pattern vars (current env, fallback to profile map)
-    for v in "${named[@]}"; do
+    for v in "${LITELLM_PROVIDER_NAMED[@]}"; do
         [ -n "${seen[$v]:-}" ] && continue
         val="${!v:-}"
         [ -z "$val" ] && val="${profile[$v]:-}"
@@ -354,8 +472,8 @@ collect_litellm_provider_vars() {
     # Pass 3: pattern-matched names found in ~/.profile but not in current env
     for v in "${!profile[@]}"; do
         [ -n "${seen[$v]:-}" ] && continue
-        [[ "$v" =~ $pattern ]] || continue
-        [[ "$v" =~ $exclude ]] && continue
+        [[ "$v" =~ $LITELLM_PROVIDER_PATTERN ]] || continue
+        [[ "$v" =~ $LITELLM_PROVIDER_EXCLUDE ]] && continue
         val="${profile[$v]}"
         [ -z "$val" ] && continue
         printf '%s=%s\n' "$v" "$val"
@@ -757,25 +875,121 @@ pg_url_works() {
 # LiteLLM service readiness
 #############################################################################
 
-# Poll LiteLLM liveliness endpoint until it responds (max ~90s).
-# First boot runs Prisma migrations + may fetch Prisma engine binaries, which
-# can take 15–25s on a fresh DB and occasionally longer under load; the prior
-# 30s window produced false warnings while LiteLLM was still mid-startup.
-# Usage: wait_for_litellm [port]
+# Poll LiteLLM's readiness endpoint until it responds.
+# Typical starts answer in 15–25s (uvicorn + a no-op `prisma migrate deploy`
+# sync); LITELLM_WAIT_SHORT covers those. The caller passes
+# LITELLM_WAIT_LONG ONLY for a start that actually happened this run (Phase 7
+# — in native mode that is every run, since Phase 4a stops the unit for the
+# venv/toolchain work and never restarts it itself) because such a start can
+# legitimately run long: the schema sync is bounded at ≤4 attempts × 60s
+# hard-killed + 5–15s sleeps (litellm_proxy_extras/utils.py::_setup_database_v2,
+# see CLAUDE.md > Troubleshooting, "prisma in the process list") ≈ 300s. Under
+# the v2 resolver an UNRECOVERABLE sync does NOT fall through to a bind — it
+# raises and proxy_cli.py exits 2 — so a genuinely broken sync ends this wait
+# via the crash-loop bail-out below, not by timing out. On
+# a CPU-starved VM every arc step (bare `prisma` spawn, migrate, the proxy
+# import) stretches further (observed 2026-08-20: a converging start ran past
+# the old 360s budget while sharing ~1 core with the rest of the run, and the
+# resulting "not responding" warning invited an overlay recovery restart that
+# killed it mid-arc and paid the arc again). 900s is safe to grant because
+# the wait no longer sits out the whole budget blind: it bails as soon as the
+# unit parks `failed` (start-limit) or is demonstrably crash-looping
+# (NRestarts grew ≥3 while waiting — reset-failed zeroes the counter before
+# the initial restart, so growth during the wait is all crash-loop). Where
+# `systemctl --user` itself is unavailable, both probes degrade to no-ops and
+# only the wall-clock bound applies. An unchanged already-running service
+# keeps the short budget so a genuinely broken box doesn't stall a no-op
+# re-run. The budget is wall-clock (SECONDS deadline), not an iteration count
+# — curl's --max-time 3 would otherwise stretch each iteration to 4s on a
+# hung connect and quietly quadruple it. Cadence: 1s while a fast start is
+# still plausible, 5s once the wait is clearly in the bounded-sync regime
+# (the fast path is unchanged — returns the second the probe passes); a
+# progress note at 60s on the long budget tells the operator the
+# long-but-bounded case is expected.
+# Usage: wait_for_litellm [port] [max_wait_seconds]
+LITELLM_WAIT_SHORT=90
+LITELLM_WAIT_LONG=900
 wait_for_litellm() {
     local port="${1:-4000}"
-    local url="http://127.0.0.1:${port}/health/liveliness"
-    local max_attempts=90
-    local i
+    local budget="${2:-$LITELLM_WAIT_SHORT}"
+    # /health/readiness, NOT /health/liveliness: liveliness returns "I'm alive!"
+    # unconditionally, so it answers 200 with the DB unreachable and setup.sh
+    # would report success on a box whose every authenticated request then 500s.
+    # readiness is unauthenticated too and reports `db` — what upstream's own
+    # charts use to mean "ready". A 503 keeps the loop waiting, correct while
+    # Postgres is still coming up behind the unit's pg_isready gate. Note its
+    # 15s server-side cache covers the CONNECTED path only; a not-yet-connected
+    # probe runs a real DB health check (and a reconnect attempt), so keep the
+    # poll cadence from getting tight — that is the one window we poll hardest.
+    local url="http://127.0.0.1:${port}/health/readiness"
+    local hint="check: journalctl --user -u litellm -n 100"
+    local start="$SECONDS" elapsed=0 interval=1 noted=0
+    local probe unit_state restarts_now restarts_start=""
 
-    for ((i=1; i<=max_attempts; i++)); do
+    while :; do
         if curl -sf --max-time 3 "$url" &>/dev/null; then
             log "LiteLLM is responding on port ${port}"
             return 0
         fi
-        sleep 1
+        elapsed=$((SECONDS - start))
+        [ "$elapsed" -ge "$budget" ] && break
+        # Early bail-outs — the big budget may only be spent on a start that
+        # is still progressing, never sat out against a dead or looping unit.
+        # One `systemctl show` answers both probes (ActiveState carries what
+        # is-active would say); the NRestarts baseline is taken on the first
+        # failed readiness probe, so a box that answers immediately never
+        # spawns systemctl at all. An empty/garbled read (no user bus) makes
+        # both probes no-ops and leaves only the wall-clock bound.
+        # Parsed as KEY=VALUE, not by position: `systemctl show` emits properties
+        # in bus/vtable order, not the order requested, and --value strips the
+        # names that would make the parse order-independent. Today's ordering
+        # happens to match; a flip would silently turn both bail-outs into dead
+        # code and sit out the whole 900s budget against a dead unit. Matched
+        # with BASH_REMATCH rather than `sed`: this runs every iteration of a
+        # loop that can last 900s, and those forks would be stolen from the very
+        # single-core start arc the loop is waiting on.
+        probe="$(systemctl --user show -p ActiveState -p NRestarts litellm 2>/dev/null || true)"
+        unit_state=""; restarts_now=""
+        [[ $probe =~ (^|$'\n')ActiveState=([^$'\n']*) ]] && unit_state="${BASH_REMATCH[2]}"
+        [[ $probe =~ (^|$'\n')NRestarts=([^$'\n']*) ]] && restarts_now="${BASH_REMATCH[2]}"
+        if [ "$unit_state" = "failed" ]; then
+            warn "litellm parked failed (start-limit) after ${elapsed}s — not waiting out the ${budget}s budget; ${hint}"
+            return 1
+        fi
+        if [[ "$restarts_now" =~ ^[0-9]+$ ]]; then
+            [ -n "$restarts_start" ] || restarts_start="$restarts_now"
+            if [ $((restarts_now - restarts_start)) -ge 3 ]; then
+                # Restart growth has two shapes under the v2 migration resolver
+                # and the journal tells them apart: a DRIFTED LEDGER (a box
+                # provisioned in the brief --use_prisma_db_push era) heals ≤3
+                # migrations per start, exits 2 and comes back — dozens of
+                # cycles, far past any budget, but converging, and an overlay
+                # recovery restart would only reset it (see CLAUDE.md,
+                # "A `prisma migrate deploy` process"). Its fingerprint is
+                # "marking applied"/"creating baseline" lines — note each such
+                # cycle ALSO ends in "Database migration cannot proceed" (the
+                # 4-attempt budget raising), so that line alone does not mean
+                # fatal; fatal is "cannot proceed" WITHOUT the healing lines
+                # (or an import traceback). One journalctl spawn, at bail-out
+                # time only.
+                local jtail
+                jtail="$(journalctl --user -u litellm -n 400 --no-pager -o cat 2>/dev/null || true)"
+                if [[ $jtail == *"failed idempotently"* || $jtail == *"marking applied"* || $jtail == *"creating baseline"* ]]; then
+                    warn "litellm restarted $((restarts_now - restarts_start))x while waiting (${elapsed}s in) but the journal shows the startup schema sync CONVERGING (migrations being marked applied, ~3 per start; each cycle's trailing 'Database migration cannot proceed' is the 4-attempt budget, not a fatal error) — expected on a box with a drifted migrations ledger, not a crash loop. Leave the unit alone; it comes up by itself once the ledger is caught up. Not waiting out the ${budget}s budget; ${hint}"
+                else
+                    warn "litellm crash-looping ($((restarts_now - restarts_start)) restarts while waiting, ${elapsed}s in) — not waiting out the ${budget}s budget; ${hint} (look for 'Database migration cannot proceed' = fatal, needs a human)"
+                fi
+                return 1
+            fi
+        fi
+        if [ "$noted" = 0 ] && [ "$budget" -gt "$LITELLM_WAIT_SHORT" ] && [ "$elapsed" -ge 60 ]; then
+            log "LiteLLM still starting — the startup schema sync (prisma migrate deploy) is bounded at ~5 min worst case, longer on a CPU-starved box; waiting up to ${budget}s total"
+            noted=1
+        fi
+        [ "$elapsed" -ge 10 ] && interval=5
+        sleep "$interval"
     done
-    warn "LiteLLM not responding on port ${port} after 90s"
+    warn "LiteLLM not responding on port ${port} after ${budget}s; ${hint}"
     return 1
 }
 
@@ -825,58 +1039,156 @@ write_if_changed() {
 # systemd --user service helpers
 #############################################################################
 
+# Render a __TOKEN__ template through sed and install it, refusing anything that
+# would land broken on disk. Returns 0 only when the destination changed (1 for
+# unchanged AND for a refused render, so a caller that treats non-zero as
+# "nothing to do" keeps the previous good copy either way).
+#
+# Rendering into a variable first is the whole point: piping sed straight into
+# write_if_changed masks a sed failure (there is no `set -o pipefail` here), so
+# the pipeline's status is write_if_changed's and a missing template or a bad
+# -e expression installs a 0-BYTE file over a working one while reporting
+# "changed". The token check catches the other half — sed silently passes
+# __PLACEHOLDER__ through when a caller forgets an -e, and every consumer here
+# takes it literally (systemd runs `Environment=PATH=__PATH__`; a compose file
+# pulls image `:__LITELLM_IMAGE_TAG__`).
+# A leftover template token is a DELIMITED `__UPPER__` word — not any
+# `__UPPER__` substring. The distinction matters for managed-settings.json:
+# Claude Code's MCP permission rules are spelled `mcp__<server>__<tool>`, and
+# a server name in upper case (`mcp__JIRA__search_issues`) contains
+# `__JIRA__` glued to alphanumerics on both sides. Every token this repo
+# renders (`__PORT__`, `__REPO_DIR__`, …) is preceded/followed by a
+# non-alphanumeric (`=`, `:`, `"`, `/`, line edge), so requiring that edge
+# keeps the refusal for real leftovers and stops it false-positiving on a
+# policy entry — which would silently keep a STALE root-owned policy file
+# in place on every run. Shared by render_template_if_changed and the
+# Phase 8a sudo-install path, which restates the guard in grep form.
+TEMPLATE_TOKEN_RE='(^|[^A-Za-z0-9])__[A-Z][A-Z0-9_]*__([^A-Za-z0-9]|$)'
+
+# Usage: render_template_if_changed <template> <dest> <label> [sed_args...]
+# The validated render on its own, for callers that cannot use write_if_changed
+# to place the result (the managed-settings deploy needs `sudo install`). Prints
+# the rendered template on success; errors and returns 1 on any of the three
+# refusals. Keeping this separate from the placement is what lets every consumer
+# share ONE guard policy — a guard added here reaches the root-owned policy file
+# too, which is where a bad render is most severe.
+# Usage: render_template_or_fail <template> <label> [sed_args...]
+render_template_or_fail() {
+    local template="$1" label="$2"
+    shift 2
+
+    local rendered
+    rendered=$(sed "$@" "$template") || {
+        error "Failed to render ${template} for ${label} — keeping the existing copy"
+        return 1
+    }
+    if [ -z "$rendered" ]; then
+        error "Rendered ${label} is empty (template: ${template}) — refusing to install it"
+        return 1
+    fi
+    if [[ $rendered =~ $TEMPLATE_TOKEN_RE ]]; then
+        error "${label} has unreplaced template tokens — refusing to install it"
+        return 1
+    fi
+    printf '%s\n' "$rendered"
+}
+
+render_template_if_changed() {
+    local template="$1" dest="$2" label="$3"
+    shift 3
+
+    local rendered
+    rendered="$(render_template_or_fail "$template" "$label" "$@")" || return 1
+    printf '%s\n' "$rendered" | write_if_changed "$dest"
+}
+
 # Render a systemd --user service template (via sed), write it under
-# ~/.config/systemd/user/, daemon-reload on change. Returns 0 if changed.
+# ~/.config/systemd/user/, daemon-reload on change. Returns 0 if changed
+# (1 for unchanged AND for a render render_template_if_changed refused, so the
+# caller keeps the previous good unit either way).
 # Usage: deploy_user_systemd_service <name> <template> [sed_args...]
 deploy_user_systemd_service() {
     local name="$1"
     local template="$2"
     shift 2
 
-    local service_dir="${HOME}/.config/systemd/user"
-    local dest="${service_dir}/${name}.service"
-    mkdir -p "$service_dir"
+    local dest
+    dest="$(user_unit_path "$name")"
 
-    # Render first, then write — piping sed straight into write_if_changed
-    # would mask a sed failure (no `set -o pipefail` here): the pipeline's
-    # status is write_if_changed's, so a missing/unreadable template or a bad
-    # -e expression installs a 0-BYTE unit over a working one and reports
-    # "changed", after which the caller daemon-reloads and restarts against it.
-    local rendered
-    rendered=$(sed "$@" "$template") || {
-        error "Failed to render ${template} for ${name}.service — keeping the existing unit"
-        return 1
-    }
-    if [ -z "$rendered" ]; then
-        error "Rendered ${name}.service is empty (template: ${template}) — refusing to install it"
-        return 1
-    fi
-    # sed silently passes __TOKEN__ placeholders through when a caller forgets an
-    # -e, and systemd would then take them literally (Environment=PATH=__PATH__,
-    # an ExecStart that does not exist). Checked before the write, not after, so
-    # a bad render never lands on disk.
-    if [[ $rendered =~ __[A-Z_]+__ ]]; then
-        error "${name}.service has unreplaced template tokens — refusing to install it"
-        return 1
-    fi
+    render_template_if_changed "$template" "$dest" "${name}.service" "$@" || return 1
 
-    local changed=0
-    printf '%s\n' "$rendered" | write_if_changed "$dest" && changed=1
-
-    if [ "$changed" -eq 1 ]; then
-        systemctl --user daemon-reload
-        log "${name} service file updated"
-    fi
-    return $((1 - changed))
+    systemctl --user daemon-reload
+    log "${name} service file updated"
+    return 0
 }
 
-# Stop a systemd --user service if it's active. No-op otherwise.
-stop_user_service_if_active() {
+# Stop a systemd --user service, unconditionally. NEVER gate a stop on
+# `is-active`: that probe is non-zero for `activating (auto-restart)`
+# — where a crash-looping unit spends ~10s of every ~11s cycle — and for
+# `failed` (start-limit parked), so an activity gate skips the stop on exactly
+# the units that most need stopping, leaving their queued auto-restart live
+# (observed 2026-08-19: a wedged unit restarting into Phase 4a's venv rebuild
+# straight through the gated stop). `systemctl stop` on an inactive or unknown
+# unit is a free no-op that also cancels any queued restart. Always returns 0:
+# setup.sh calls this bare under `set -e` on paths where the unit is routinely
+# already inactive.
+stop_user_service() {
     local name="$1"
-    if systemctl --user is-active "$name" &>/dev/null; then
-        systemctl --user stop "$name"
-        log "${name} service stopped"
+    systemctl --user stop "$name" &>/dev/null || true
+    log "${name} stop issued (no-op if it wasn't running)"
+    return 0
+}
+
+# Hold / release MANUAL starts of a systemd --user unit across a maintenance
+# window (Phase 4a's venv rebuild). `systemctl --user mask --runtime` is the
+# obvious primitive and DOES NOT WORK for a unit deployed under
+# ~/.config/systemd/user: in the USER manager's load path that directory
+# outranks $XDG_RUNTIME_DIR/systemd/user (`systemd-analyze --user unit-paths`
+# — the reverse of the system manager's /run-over-/etc order), so the runtime
+# /dev/null link is shadowed by the real unit and a `start` goes straight
+# through; a persistent mask is refused outright ("File … already exists"),
+# and `--force` would REPLACE the deployed unit with the /dev/null link. A
+# runtime DROP-IN has neither problem: drop-ins from every load-path directory
+# are merged into the unit regardless of where its fragment lives. So the hold
+# is `RefuseManualStart=yes` in $XDG_RUNTIME_DIR/systemd/user/<name>.service.d/
+# — `systemctl start`/`restart` then fail with "Operation refused, unit … may
+# be requested by dependency only" (nothing depends on these units), `stop`
+# stays allowed, and the unit file is untouched. Restart= auto-restarts are
+# not manual and are NOT held — the caller's unconditional stop cancels those.
+# Lives in /run, so a hard-killed run is healed by reboot; release is an
+# explicit rm + daemon-reload. Both are free no-ops on a name with no unit yet
+# (fresh install: the drop-in waits for the unit Phase 7 deploys and is
+# released before that) and on a box with no user bus. Release also removes a
+# stale runtime MASK link an older setup.sh revision left for the same unit.
+# Usage: hold_user_service_starts <name> / release_user_service_starts <name>
+user_service_hold_dir() {
+    echo "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/systemd/user/$1.service.d"
+}
+hold_user_service_starts() {
+    local name="$1" dir
+    dir="$(user_service_hold_dir "$name")"
+    mkdir -p "$dir" 2>/dev/null || return 0
+    printf '[Unit]\n# claude-litellm setup.sh: starts held for the duration of a maintenance window.\n# Safe to delete (then `systemctl --user daemon-reload`) if setup.sh is no longer running.\nRefuseManualStart=yes\n' \
+        > "$dir/50-setup-hold.conf" 2>/dev/null || return 0
+    systemctl --user daemon-reload &>/dev/null || true
+    return 0
+}
+release_user_service_starts() {
+    local name="$1" dir changed=0
+    dir="$(user_service_hold_dir "$name")"
+    if [ -e "$dir/50-setup-hold.conf" ]; then
+        rm -f "$dir/50-setup-hold.conf"
+        rmdir "$dir" 2>/dev/null || true
+        changed=1
     fi
+    # Transitional: a runtime mask link from the previous mechanism (inert
+    # while the persistent unit exists, but it would mask a fresh install).
+    if [ -L "${dir%.d}" ] && [ "$(readlink "${dir%.d}")" = /dev/null ]; then
+        rm -f "${dir%.d}"
+        changed=1
+    fi
+    [ "$changed" = 1 ] && systemctl --user daemon-reload &>/dev/null
+    return 0
 }
 
 # Enable a systemd --user service and restart it only when STALE: when
@@ -886,10 +1198,15 @@ stop_user_service_if_active() {
 # re-run must not bounce it and drop live connections/sessions. Returns 1 on
 # restart failure (explicit `|| return 1`, so the outcome is the same whether
 # the caller runs it bare — fatal under `set -e` — or in an `if` condition);
-# 0 when restarted or left running.
+# 0 when restarted or left running. Reports which of those it did in
+# USER_SERVICE_RESTARTED (1 = (re)started, 0 = left running) so callers that
+# need the fact — e.g. Phase 7 sizing wait_for_litellm's budget — read the
+# action taken instead of re-deriving this function's staleness predicate at
+# the call site (two spellings of one policy silently desync).
 # Usage: restart_user_service_if_stale <name> <changed 0|1>
 restart_user_service_if_stale() {
     local name="$1" changed="$2"
+    USER_SERVICE_RESTARTED=0
     systemctl --user enable "$name" &>/dev/null || true
     if [ "$changed" = "1" ] || ! systemctl --user is-active "$name" &>/dev/null; then
         # A crash-looped unit latches failed/start-limit-hit; clear it so the
@@ -900,6 +1217,7 @@ restart_user_service_if_stale() {
         # needs a probe, e.g. wait_for_litellm after the litellm call site.
         systemctl --user reset-failed "$name" &>/dev/null || true
         systemctl --user restart "$name" || return 1
+        USER_SERVICE_RESTARTED=1
         log "${name} service (re)started"
     else
         log "${name} unchanged — service left running"

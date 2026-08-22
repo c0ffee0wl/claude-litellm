@@ -1,0 +1,22 @@
+# prisma-client-py configuration for the NATIVE LiteLLM install. Deployed by
+# setup.sh Phase 4a to ~/.config/litellm/pyproject.toml — the cwd of the Prisma
+# CLI calls that may (re)install the private nodeenv (setup.sh's run_prisma
+# wrapper cd's here; the litellm unit's WorkingDirectory is this dir, so the
+# proxy's own bare `prisma` spawn reads it too). prisma-client-py reads ONLY
+# ./pyproject.toml from the cwd (Config.load in prisma/_config.py), and a
+# pyproject is the only way to set a list option: PRISMA_NODEENV_EXTRA_ARGS is
+# declared as an env var but pydantic v2 rejects the string ("Input should be
+# a valid list"), verified at prisma 0.15.0. Every scalar switch lives in
+# prisma.env instead (one source for wrapper + unit) — keep this file to what
+# only a pyproject can express.
+#
+# Not deployed under --docker: the ghcr image bakes its own toolchain.
+[tool.prisma]
+# Private Node runtime for the Prisma CLI: pin nodeenv to the latest LTS line
+# instead of its default "latest" (the newest Current release — days old, a
+# new major every six months; RobertCraigie/prisma-client-py#1044 is the
+# precedent of a fresh Current line breaking the CLI). LTS is aged by
+# definition, matching the box's cooldown posture for every other tool.
+# Applies when the nodeenv is (re)installed — setup.sh's heals never remove a
+# healthy one, so an existing box keeps its current Node until a heal.
+nodeenv_extra_args = ["--node=lts"]

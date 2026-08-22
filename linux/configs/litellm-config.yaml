@@ -32,6 +32,18 @@ model_list:
   # route's, so it is unusable on the deliberate `openai/` route. Explicit rates
   # are provider-agnostic — they bypass the map lookup entirely.
   #
+  # cache_creation_input_token_cost is set equal to input_cost_per_token, and is
+  # absent from the table below because Azure has no such meter — cached-write
+  # tokens bill as ordinary input. It is stated rather than omitted because
+  # Router._inherit_builtin_cache_pricing copies the key from the OpenAI map
+  # entry when a deployment omits it. Today that inherited rate is inert: the
+  # Responses API reports no cache-creation tokens, so it multiplies zero (which
+  # is why the update-azure-openai-prices skill maps no `Cd Wr` meter). Stating
+  # it makes the deployment correct if that ever changes, instead of silently
+  # billing OpenAI's cache-write rate against Azure traffic. Keep it equal to
+  # input_cost_per_token whenever the rates below are refreshed — the skill does
+  # not manage this key.
+  #
   # Rates are Azure Data Zone Standard, EU zone: Sweden Central sits inside the
   # Azure EU Data Boundary, so a DataZoneStandard deployment there bills the `DZ`
   # meters. Verified 2026-08-04 against the Azure retail feed — $/1M tokens,
@@ -58,6 +70,7 @@ model_list:
       input_cost_per_token: 2.75e-06
       output_cost_per_token: 1.65e-05
       cache_read_input_token_cost: 2.75e-07
+      cache_creation_input_token_cost: 2.75e-06
       input_cost_per_token_above_272k_tokens: 5.5e-06
       output_cost_per_token_above_272k_tokens: 2.475e-05
       cache_read_input_token_cost_above_272k_tokens: 5.5e-07
@@ -71,6 +84,7 @@ model_list:
       input_cost_per_token: 1.1e-06
       output_cost_per_token: 6.6e-06
       cache_read_input_token_cost: 1.1e-07
+      cache_creation_input_token_cost: 1.1e-06
       input_cost_per_token_above_272k_tokens: 2.2e-06
       output_cost_per_token_above_272k_tokens: 9.9e-06
       cache_read_input_token_cost_above_272k_tokens: 2.2e-07
@@ -91,6 +105,7 @@ model_list:
       input_cost_per_token: 5.5e-06
       output_cost_per_token: 3.3e-05
       cache_read_input_token_cost: 5.5e-07
+      cache_creation_input_token_cost: 5.5e-06
       input_cost_per_token_above_272k_tokens: 1.1e-05
       output_cost_per_token_above_272k_tokens: 4.95e-05
       cache_read_input_token_cost_above_272k_tokens: 1.1e-06
@@ -111,9 +126,47 @@ litellm_settings:
   # Mechanism + source refs: CLAUDE.md > Troubleshooting.
   reasoning_auto_summary: true
 
+router_settings:
+  # No `stream_timeout` and no `request_timeout`: on the /v1/messages path
+  # Claude Code uses, neither is read (they sit on the chat-completion branch).
+  # The knob that WOULD bite is `timeout:`, left at the path's 600s default
+  # because an `effort: high/xhigh` turn can legitimately sit silent for
+  # minutes. Full precedence chain + how it reaches aiohttp: CLAUDE.md >
+  # "Retries and fallbacks DO apply on /v1/messages". Per-request override:
+  # the `x-litellm-timeout` header.
+  # Every model group here has exactly ONE deployment, so a cooldown has nothing
+  # to fail over to — it just converts a single recoverable error into
+  # "No deployments available for selected model" for the cooldown window. That
+  # fires on any non-retryable status, e.g. the 404 from `azure/gpt-5.6-sol`
+  # when no `sol` deployment exists. Safe to disable precisely BECAUSE there is
+  # no second deployment; revisit if a group ever gains one.
+  disable_cooldowns: true
+
 general_settings:
   master_key: os.environ/LITELLM_MASTER_KEY
   database_url: os.environ/DATABASE_URL  # local Postgres provisioned by setup.sh Phase 6; enables /ui model management + spend/key tracking
+  # Bound server-side so a stuck query cannot hold its locks indefinitely — the
+  # fix for an orphaned Prisma child holding the advisory lock after a killed
+  # schema sync. Two traps live on these two lines:
+  #   * UNITS ARE SECONDS. litellm multiplies by 1000 itself, so writing the
+  #     millisecond value is a silent no-op guard (60000 => a 16.7-HOUR bound).
+  #   * The startup `prisma migrate deploy` runs UNDER these bounds — litellm's
+  #     schema declares no `directUrl`, so upstream's "migrations are exempt"
+  #     carve-out does not apply here. Hence 600, not the 60s a runtime-only
+  #     bound would want: a cancelled migration crash-loops the unit.
+  # Derivation, symptoms and when to raise: CLAUDE.md > Troubleshooting.
+  database_statement_timeout: 600  # seconds -> statement_timeout=600000ms
+  database_lock_timeout: 10        # seconds -> lock_timeout=10000ms
+  # Prune LiteLLM_SpendLogs — it grows unbounded on a single box nobody
+  # administers, and the statusline only ever reads a trailing 30 days.
+  maximum_spend_logs_retention_period: "90d"
+  # Batch spend writes at 60s instead of the 10s default — the statusline
+  # tolerates a minute of lag and this removes most idle DB traffic.
+  proxy_batch_write_at: 60
+  # With store_model_in_db the proxy polls the DB for config changes; the 30s
+  # default is ~2880 round-trips/day on a single-user box that changes models
+  # by hand.
+  proxy_config_reload_interval_seconds: 300
 
 # --- Guardrails (deferred — uncomment to enable) ---------------------------
 # All four below are OSS, no enterprise license required.
