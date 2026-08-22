@@ -202,8 +202,9 @@ LITELLM_PORT=4000
 ANTHROPIC_GATEWAY_URL="http://127.0.0.1:${LITELLM_PORT}"
 USER_TOOL_PATH="${HOME}/.local/bin:${HOME}/.bun/bin:/usr/local/bin:/usr/bin:/bin"
 # uv tool venv bin first: `prisma` CLI lives there (we install via --with prisma),
-# and LiteLLM shells out to `prisma migrate deploy` on startup. Without this,
-# migrations silently fail and UI-required tables like LiteLLM_UserTable never get created.
+# and LiteLLM shells out to `prisma db push` on startup (--use_prisma_db_push in
+# the unit). Without this, the schema sync silently fails and UI-required tables
+# like LiteLLM_UserTable never get created.
 # Kept separate from USER_TOOL_PATH: the venv exposes generic names (httpx,
 # openai, fastapi, nodeenv, mcp, …) that would shadow system tools for unrelated
 # services.
@@ -212,12 +213,15 @@ LITELLM_PATH="${HOME}/.local/share/uv/tools/litellm/bin:${USER_TOOL_PATH}"
 # and upgrade paths in Phase 4a, so a floor bump can't skew the two.
 LITELLM_SPEC='litellm[proxy,proxy-runtime]>=1.84.0'
 # fastapi ceiling for the LiteLLM venv: litellm >=1.95.0 crash-loops on
-# fastapi >=0.140.7 (BerriAI/litellm#35763; full story in CLAUDE.md > Setup
-# Phases > 4a). DROP once a litellm release containing upstream merge ecba48d
-# has aged past the uv cooldown — Phase 4a warns when a candidate ages in
-# (releases through LITELLM_FASTAPI_GUARD_STALE_ABOVE are verified broken).
+# fastapi >=0.140.7 (issue BerriAI/litellm#35763; full story in CLAUDE.md >
+# Setup Phases > 4a). DROP once a litellm release containing upstream merge
+# ecba48d has aged past the uv cooldown — Phase 4a warns when a candidate ages
+# in (releases through LITELLM_FASTAPI_GUARD_STALE_ABOVE are verified broken).
+# Verify by grepping the wheel, NOT by comparing SHAs (recipe + why in CLAUDE.md).
+# Checked 2026-08-19 — 1.96.2 AND 1.97.0 both still import `get_flat_dependant`,
+# i.e. the fix has not shipped in either; guard stays, marker bumped to 1.97.0.
 LITELLM_FASTAPI_GUARD='fastapi<0.140.7'
-LITELLM_FASTAPI_GUARD_STALE_ABOVE='1.96.0'
+LITELLM_FASTAPI_GUARD_STALE_ABOVE='1.97.0'
 # The uv --with set shared by both Phase 4a install paths — one definition so
 # the guard drop (or a future third --with) can't skew fresh-install vs
 # upgrade, same rule as LITELLM_SPEC above.
@@ -229,6 +233,22 @@ LITELLM_UV_WITH=(--with prisma --with "$LITELLM_FASTAPI_GUARD")
 LITELLM_CONFIG_DIR="${HOME}/.config/litellm"
 LITELLM_ENV_FILE="${LITELLM_CONFIG_DIR}/env"
 LITELLM_CONFIG_FILE="${LITELLM_CONFIG_DIR}/config.yaml"
+# Prisma toolchain files (native mode only; see the templates' comments):
+# prisma.env is the single source of the PRISMA_* switches for BOTH setup.sh's
+# run_prisma and the unit's EnvironmentFile=; pyproject.toml is prisma-client-py's
+# per-cwd config (Node LTS pin for the nodeenv).
+LITELLM_PRISMA_ENV_FILE="${LITELLM_CONFIG_DIR}/prisma.env"
+LITELLM_PYPROJECT_FILE="${LITELLM_CONFIG_DIR}/pyproject.toml"
+# Raised by Phase 4a when prisma.env changed — the service consumes it, so it
+# feeds Phase 7's LITELLM_CHANGED like the other deployed files.
+LITELLM_PRISMA_ENV_CHANGED=0
+# Set by Phase 4a when the Prisma client could not be generated: the proxy
+# would crash on import ("The Client hasn't been generated yet"), so every
+# litellm start site (the 4a restore, Phase 7) leaves the unit STOPPED instead
+# of feeding a 20x crash loop, and the end-of-run banner says so. Non-fatal by
+# design — a broken gateway must not abort the rest of the run (or an
+# overlay's remaining phases); the next run's import probe regenerates.
+LITELLM_CLIENT_BROKEN=0
 # Rootless Docker daemon socket (used by the --docker paths in Phase 7).
 DOCKER_SOCK="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/docker.sock"
 
@@ -398,6 +418,11 @@ log "=== Phase 4: Tools ==="
 # mechanism — the `openai/` route in litellm-config.yaml takes the dedicated
 # adapter instead. See CLAUDE.md > "Model naming" > "Why the openai/ route".
 LITELLM_BIN="${HOME}/.local/bin/litellm"
+# One name for the deployed unit path: Phase 4a keys its restore on it, Phase 7
+# reads it for the native<->docker variant switch. Two independent spellings
+# desynced on a rename would mask a unit the restore path then declines to
+# restore.
+INSTALLED_LITELLM_UNIT="$(user_unit_path litellm)"
 
 # uv tool list's version column for litellm — read before/after the upgrade to
 # gate the Prisma client regen on a real version change.
@@ -410,6 +435,43 @@ litellm_tool_version() {
 # `prisma generate` step below is needed. Skipped under --install-only too (that
 # mode installs no local LiteLLM).
 if [ "$WITH_LOCAL_LITELLM" = "true" ] && [ "$DOCKER_MODE" != "true" ]; then
+    # Take the service down for the venv rebuild + prisma generate below: a live
+    # unit restarts into the half-built venv and then races THIS script over the
+    # shared ~/.cache/prisma-python/nodeenv toolchain, which is how that cache
+    # ends up half-installed. Full story: CLAUDE.md > Troubleshooting, "any
+    # `prisma` command hangs".
+    #
+    # The stop is unconditional (stop_user_service — see its docstring for why
+    # an `is-active` gate skips exactly the wedged boxes this window exists
+    # for, observed 2026-08-19), then the unit is masked for the duration of
+    # the window: the stop cancels systemd's own pending restart, but nothing
+    # else prevents a start commanded mid-rebuild (an operator, a health-check
+    # script) from re-opening the race. --runtime keeps the mask in /run, so
+    # even a hard crash of this script is healed by the next reboot. Masking a
+    # not-yet-deployed name (fresh install) is harmless: every exit below
+    # unmasks before Phase 7 deploys it.
+    stop_user_service litellm
+    systemctl --user mask --runtime litellm &>/dev/null || true
+
+    # ABORT BELT ONLY — the normal path never starts litellm before Phase 7
+    # (see the end of 4a). An unexpected `set -e` abort anywhere between here
+    # and Phase 7's own start would otherwise leave the proxy down (and
+    # masked) with nothing to bring it back (no timer, updates are manual).
+    # Unmask unconditionally (also clears a stale mask a killed earlier run
+    # left), then start an inactive unit — unless there is no unit yet (fresh
+    # install: deployed in Phase 7) or no Prisma client to import (starting
+    # would only burn 20 start-limit cycles of proxy import). Phase 7 disarms
+    # it after its start. Bash has ONE EXIT-trap slot: do not add another
+    # `trap … EXIT` anywhere between here and that disarm — it would silently
+    # replace this belt (and be nuked by the disarm in turn).
+    restore_litellm_service() {
+        systemctl --user unmask litellm &>/dev/null || true
+        [ -f "$INSTALLED_LITELLM_UNIT" ] || return 0
+        [ "$LITELLM_CLIENT_BROKEN" = "1" ] && return 0
+        restart_user_service_if_stale litellm 0 \
+            || warn "Could not restart litellm — re-run setup.sh"
+    }
+    trap restore_litellm_service EXIT
     if [ -x "$LITELLM_BIN" ]; then
         # Upgrade-in-place (not skip): re-asserts the >=1.84.0 floor so an existing
         # install is lifted off a compromised 1.82.7/1.82.8 and picks up newer
@@ -456,55 +518,181 @@ if [ "$WITH_LOCAL_LITELLM" = "true" ] && [ "$DOCKER_MODE" != "true" ]; then
     # keep succeeding silently, through fastapi security releases too).
     litellm_ver_now="${litellm_ver_after:-$(litellm_tool_version)}"
     if [ -n "$litellm_ver_now" ] && [ "$(printf '%s\n' "$litellm_ver_now" "$LITELLM_FASTAPI_GUARD_STALE_ABOVE" | sort -V | tail -n1)" != "$LITELLM_FASTAPI_GUARD_STALE_ABOVE" ]; then
-        warn "litellm ${litellm_ver_now} > ${LITELLM_FASTAPI_GUARD_STALE_ABOVE}: check whether it contains upstream merge ecba48d (BerriAI/litellm#35763) — if yes drop LITELLM_FASTAPI_GUARD, if no bump LITELLM_FASTAPI_GUARD_STALE_ABOVE"
+        warn "litellm ${litellm_ver_now} > ${LITELLM_FASTAPI_GUARD_STALE_ABOVE}: check whether it contains upstream merge ecba48d (PR BerriAI/litellm#35773, issue #35763) — grep the wheel for get_flat_params, do NOT compare SHAs (see LITELLM_FASTAPI_GUARD). If present drop LITELLM_FASTAPI_GUARD, else bump LITELLM_FASTAPI_GUARD_STALE_ABOVE"
     fi
 
     # Generate the Prisma client + fetch engine binaries. Upstream's Dockerfiles
     # do `prisma generate --schema=./schema.prisma` as a build step right after
     # pip install; `uv tool install` doesn't, so without this the proxy crashes
     # on first DB connect with "The Client hasn't been generated yet".
-    # PRISMA_BINARY_CACHE_DIR must match the value in litellm.service or the
-    # engine binaries get fetched twice (once here, once on first request).
     UV_LITELLM_VENV="${HOME}/.local/share/uv/tools/litellm"
-    PRISMA_BINARY_CACHE_DIR="${HOME}/.cache/prisma-python/binaries"
     if [ -x "${UV_LITELLM_VENV}/bin/prisma" ]; then
+        # The two toolchain files, deployed BEFORE anything reads the cache
+        # paths or runs prisma. prisma.env is the single source of every
+        # PRISMA_* switch for the run_prisma wrapper below AND the unit
+        # (EnvironmentFile=) — what we warm is what the service reads,
+        # structurally (a drifted pair left the service npm-installing into a
+        # different tree at every start; CLAUDE.md > Troubleshooting, "any
+        # `prisma` command hangs"); a change is a service change, so it feeds
+        # LITELLM_CHANGED. pyproject.toml is prisma-client-py's per-cwd config
+        # (Node LTS pin for the nodeenv) — nothing running consumes it. Both
+        # templates carry the per-switch rationale.
+        if sed -e "s|__HOME__|${HOME}|g" "$SCRIPT_DIR/configs/litellm-prisma.env" \
+            | write_if_changed "$LITELLM_PRISMA_ENV_FILE"; then
+            LITELLM_PRISMA_ENV_CHANGED=1
+        fi
+        deploy_config "$SCRIPT_DIR/configs/litellm-pyproject.toml" "$LITELLM_PYPROJECT_FILE"
+        PRISMA_BINARY_CACHE_DIR="$(read_env_file_var "$LITELLM_PRISMA_ENV_FILE" PRISMA_BINARY_CACHE_DIR)"
+        # --- Toolchain heal + warm-up: runs on EVERY pass, deliberately outside
+        # the generate gate below — a no-version-change run skips generate, and
+        # that was exactly the run on which a wedged box needed repair. The
+        # service's own bare `prisma` spawn (proxy_cli.py, untimed) re-installs
+        # the CLI whenever these caches are incomplete, so they must be complete
+        # BEFORE the unit starts. Mechanism + the two cache paths: CLAUDE.md >
+        # Troubleshooting, "any `prisma` command hangs".
+        PRISMA_NODEENV_DIR="${HOME}/.cache/prisma-python/nodeenv"
+        # The npm-owned entries in the (shared) binaries dir — one definition
+        # for both rm sites below, same rule as LITELLM_UV_WITH: a drifted pair
+        # that removes node_modules but leaves package.json is a state npm
+        # treats as satisfied. The engine copies live INSIDE node_modules
+        # (@prisma/engines/) and go with it — that is fine: the CLI restores
+        # them from ~/.cache/prisma/master/<hash>/ without touching the
+        # network (verified), and that tree is never removed here.
+        PRISMA_NPM_ENTRIES=(
+            "${PRISMA_BINARY_CACHE_DIR}/node_modules"
+            "${PRISMA_BINARY_CACHE_DIR}/package.json"
+            "${PRISMA_BINARY_CACHE_DIR}/package-lock.json"
+        )
+        # Every prisma call goes through this wrapper so no call site can
+        # silently drop a guard (claude_mutate's rule): the prisma.env switches
+        # (sourced, not restated); the cwd (the pyproject above); the generator
+        # PATH (prisma's Node CLI shells out to `prisma-client-py` in the
+        # venv); stdin from /dev/null (nothing in the toolchain may wait on a
+        # terminal — the bun-REPL stall would have been an instant fall-through
+        # with this alone); and the per-step budget (prisma.env's
+        # LITELLM_PRISMA_BOOTSTRAP_TIMEOUT, upstream 0.4.84's own; `-k` is
+        # required, not decoration — plain `timeout` sends only SIGTERM then
+        # waits, and this child is a Node CLI; timeout signals its whole
+        # process group, so npm/node grandchildren die with it).
+        # Network note: `--version` and `generate` fetch a missing engine from
+        # binaries.prisma.sh (the npm postinstall that would otherwise fetch
+        # it is disabled on overlays with ignore-scripts=true) into
+        # ~/.cache/prisma/master/<hash>/<target>/ and copy it into
+        # node_modules/@prisma/engines/; with the cache populated neither
+        # touches the network, which is why rm-ing the npm entries is safe.
+        PRISMA_STEP_TIMEOUT="$(read_env_file_var "$LITELLM_PRISMA_ENV_FILE" LITELLM_PRISMA_BOOTSTRAP_TIMEOUT)"
+        PRISMA_STEP_TIMEOUT="${PRISMA_STEP_TIMEOUT:-600}"   # belt: an unwritable prisma.env must not yield `timeout ""`
+        run_prisma() {
+            (
+                # shellcheck source=/dev/null
+                set -a; . "$LITELLM_PRISMA_ENV_FILE"; set +a
+                cd "$LITELLM_CONFIG_DIR" \
+                && PATH="${UV_LITELLM_VENV}/bin:$PATH" \
+                    timeout -k 15 "$PRISMA_STEP_TIMEOUT" "${UV_LITELLM_VENV}/bin/prisma" "$@" </dev/null
+            )
+        }
+        # Heal 1 — the private Node runtime: prisma-client-py installs it only
+        # when this dir is ABSENT. Do NOT reduce the probe to a `-d` test — the
+        # directory existing without bin/node is the broken state it would then
+        # skip forever.
+        if [ -d "$PRISMA_NODEENV_DIR" ] && [ ! -x "${PRISMA_NODEENV_DIR}/bin/node" ]; then
+            warn "Prisma Node toolchain at ${PRISMA_NODEENV_DIR} has no bin/node (interrupted install) — removing so it reinstalls"
+            rm -rf "$PRISMA_NODEENV_DIR"
+        fi
+        # Heal 2 — the npm-installed Prisma CLI. The wrapper does reinstall on
+        # a missing entrypoint, but npm no-ops against a surviving
+        # node_modules/prisma/package.json (it never verifies file
+        # completeness), so a half-extracted tree is never repaired in-place —
+        # rm the npm entries so the install runs clean.
+        if [ -d "${PRISMA_BINARY_CACHE_DIR}/node_modules" ] \
+            && [ ! -f "${PRISMA_BINARY_CACHE_DIR}/node_modules/prisma/build/index.js" ]; then
+            warn "Prisma CLI cache at ${PRISMA_BINARY_CACHE_DIR} has node_modules but no CLI entrypoint (interrupted npm install) — removing the npm entries so they reinstall"
+            rm -rf "${PRISMA_NPM_ENTRIES[@]}"
+        fi
+        # Warm-up: one bounded `prisma --version` (upstream 0.4.84's own
+        # ensure_prisma_toolchain shape) so the nodeenv + CLI installs happen
+        # HERE, supervised and time-boxed, never inside the service. ~1s on a
+        # warm box. Non-fatal on failure, but DO drop both caches first —
+        # unlike generate (which also fails on schema/generator/venv problems),
+        # a warm-box --version exercises only node + the CLI entrypoint, so its
+        # failure IS evidence the caches are bad, including the one shape the
+        # heals can't see: files present and executable but broken. The next
+        # run (or the generate below, on fresh installs) retries from clean.
+        prisma_warmup_started=$SECONDS
+        if run_prisma --version >/dev/null; then
+            log "Prisma toolchain ready ($((SECONDS - prisma_warmup_started))s)"
+        else
+            rm -rf "$PRISMA_NODEENV_DIR" "${PRISMA_NPM_ENTRIES[@]}"
+            warn "Prisma toolchain warm-up failed or timed out (${PRISMA_STEP_TIMEOUT}s) — removed the caches; the next run retries from clean"
+        fi
+
         # Force regeneration after an upgrade (the new LiteLLM may ship a changed
         # schema.prisma); otherwise skip when a client is already present.
-        if [ "${LITELLM_UPGRADED:-0}" != "1" ] && compgen -G "${UV_LITELLM_VENV}/lib/python*/site-packages/prisma/client.py" >/dev/null; then
+        # "Present" is an IMPORT probe, not a file-existence glob: a generate
+        # interrupted mid-write (the service racing this script over the venv —
+        # the pre-mask wedge) leaves a client.py that exists but cannot import,
+        # and an existence check then skips regeneration on every future
+        # no-version-change run, i.e. forever. `from prisma import Prisma` is
+        # the exact import the proxy performs at startup, so the probe passes
+        # iff the proxy would; pre-generation it raises RuntimeError("The
+        # Client hasn't been generated yet"), so a fresh venv fails it too.
+        if [ "${LITELLM_UPGRADED:-0}" != "1" ] \
+            && "${UV_LITELLM_VENV}/bin/python" -c 'from prisma import Prisma' &>/dev/null; then
             log "Prisma client already generated — skipping"
         else
-            # `|| true`: a bare assignment inherits the substitution's exit
-            # status, so a broken venv / import error would abort the whole
-            # script here under `set -e` — silently, since stderr is dropped —
-            # making the diagnostic below dead code for exactly that case.
-            LITELLM_SCHEMA="$("${UV_LITELLM_VENV}/bin/python" -c 'import os, litellm.proxy as p; print(os.path.join(os.path.dirname(p.__file__), "schema.prisma"))' 2>/dev/null || true)"
+            # A glob, not `import litellm.proxy`: importing litellm to build a
+            # path pays the full proxy import (~10-17s cold on one core) plus
+            # its module-level cost-map fetch. `|| true`: a miss must fall
+            # through to the diagnostic below, not abort under `set -e`.
+            LITELLM_SCHEMA="$(compgen -G "${UV_LITELLM_VENV}/lib/python*/site-packages/litellm/proxy/schema.prisma" | head -1 || true)"
             if [ -z "$LITELLM_SCHEMA" ] || [ ! -f "$LITELLM_SCHEMA" ]; then
-                error "Could not locate litellm's schema.prisma; proxy will crash on first DB connect."
-                exit 1
+                error "Could not locate litellm's schema.prisma — Prisma client not generated; LiteLLM is left stopped (see the banner at the end)."
+                LITELLM_CLIENT_BROKEN=1
+            else
+                # On a cold box this downloads query engines for ALL FIVE
+                # binaryTargets litellm's schema lists for its Docker images
+                # (~75MB compressed → ~138MB on disk, single-core gunzip+sha256)
+                # even though this box can only execute the computed one. Verified
+                # unavoidable at prisma 5.17 — PRISMA_CLI_BINARY_TARGETS looks
+                # like the lever but is read only by @prisma/engines' npm
+                # postinstall (ensureBinariesExist), never by generate's
+                # per-schema downloads (tested cold, 2026-08-20: the env var
+                # delivered, 138MB still fetched) — do not re-try it. One-time per
+                # engine hash: ~/.cache/prisma + the node_modules copies persist
+                # across litellm upgrades, and the heals above never remove them.
+                log "Generating Prisma client (a cold box downloads ~75MB of engine binaries here)..."
+                # Toolchain already healed + warmed above. No cache cleanup on
+                # failure — generate also fails on schema/generator/venv problems
+                # that are no evidence of a bad cache, and rm-ing would throw away
+                # a complete multi-minute Node install (the warm-up's failure
+                # branch owns the bad-cache case). Non-fatal: LITELLM_CLIENT_BROKEN
+                # keeps the unit stopped and the rest of the run proceeds.
+                prisma_generate_started=$SECONDS
+                if run_prisma generate --schema="$LITELLM_SCHEMA"; then
+                    log "Prisma client generated ($((SECONDS - prisma_generate_started))s)"
+                else
+                    error "prisma generate failed or timed out (${PRISMA_STEP_TIMEOUT}s) — Prisma client not generated; LiteLLM is left stopped (see the banner at the end). The next run re-heals an incomplete toolchain and regenerates."
+                    LITELLM_CLIENT_BROKEN=1
+                fi
             fi
-            log "Generating Prisma client (downloads ~50MB of engine binaries on first run)..."
-            # Two non-obvious env tweaks for the nested generate process:
-            #  - npm_config_min_release_age=7: prisma generate spawns
-            #    `npm install prisma@<pinned>` via nodeenv. npm's
-            #    `min-release-age` cooldown (npm 11.10.0+) is counted in DAYS,
-            #    unlike pnpm/yarn (minutes) or bun (seconds). A user's ~/.npmrc
-            #    may set it: the supply-chain hardening repo ships
-            #    `min-release-age=7` (7 days), but an older revision shipped a
-            #    stale `10080` (intended as pnpm-style minutes) which npm reads
-            #    as ~27 years and which blocks the pinned 2024 prisma CLI.
-            #    Pin 7 days here so the install is deterministic regardless of
-            #    the user's config (env overrides ~/.npmrc, incl. the stale
-            #    10080) while keeping the hardening repo's intended cooldown:
-            #    the pinned 2024 prisma CLI clears 7 days trivially.
-            #  - PATH prepend: prisma's Node CLI shells out to `prisma-client-py`
-            #    (the Python generator binary), which lives in the uv tool
-            #    venv. Without the prepend, the nested /bin/sh can't find it.
-            PATH="${UV_LITELLM_VENV}/bin:$PATH" \
-            PRISMA_BINARY_CACHE_DIR="$PRISMA_BINARY_CACHE_DIR" \
-            npm_config_min_release_age=7 \
-                "${UV_LITELLM_VENV}/bin/prisma" generate --schema="$LITELLM_SCHEMA"
         fi
     fi
+
+    # Close the window opened at the top of 4a: unmask only. The start is ALWAYS
+    # deferred to Phase 7 — the run's single litellm start, sequenced after
+    # Phase 6's pg_isready gate (a restored VM snapshot's cluster is down until
+    # Phase 6 starts it) and against the freshly deployed unit/env/config. A
+    # start here cost the arc twice whenever Phase 7 then restarted (upgrade,
+    # env/config/unit change — e.g. every box's first run after a template
+    # edit): Phase 7 cgroup-killed the still-converging 4a start and re-ran
+    # bare `prisma` + `db push` + the cold proxy import, minutes on a
+    # CPU-starved VM (observed 2026-08-20). Accepted cost: the proxy is down
+    # across phases 4b-6 (nobody is using it — Phase 0 exits while `claude`
+    # runs) and a no-op run no longer overlaps the arc with 4b-6. The EXIT trap
+    # stays armed as the abort belt for 4b-6; Phase 7 disarms it after its
+    # start.
+    systemctl --user unmask litellm &>/dev/null || true
+    log "LiteLLM start deferred to Phase 7 (single start per run, after the Postgres gate)"
 fi
 
 # 4b. Claude Code (official installer; upgrade in place when present; all modes)
@@ -933,6 +1121,7 @@ fi
 # model-map refetch) and drop in-flight gateway connections for nothing.
 # Seeded from Phase 4a's upgrade signal (a new binary needs a restart too).
 LITELLM_CHANGED="${LITELLM_UPGRADED:-0}"
+[ "$LITELLM_PRISMA_ENV_CHANGED" = "1" ] && LITELLM_CHANGED=1
 if [ "$WITH_LOCAL_LITELLM" = "true" ]; then
     log "=== Phase 6: Postgres ==="
 
@@ -943,9 +1132,18 @@ if [ "$WITH_LOCAL_LITELLM" = "true" ]; then
     # rather than `source $LITELLM_ENV_FILE` because the latter would let stale
     # provider secrets in the env file shadow fresh values from .env.
     PERSISTED_DB_PASSWORD=""
+    PERSISTED_SALT_KEY=""
+    PERSISTED_MASTER_KEY=""
     PERSISTED_UI_LINES=""
     if [ -f "$LITELLM_ENV_FILE" ]; then
-        PERSISTED_DB_PASSWORD="$(grep '^LITELLM_DB_PASSWORD=' "$LITELLM_ENV_FILE" 2>/dev/null | cut -d= -f2-)"
+        PERSISTED_DB_PASSWORD="$(read_env_file_var "$LITELLM_ENV_FILE" LITELLM_DB_PASSWORD)"
+        PERSISTED_SALT_KEY="$(read_env_file_var "$LITELLM_ENV_FILE" LITELLM_SALT_KEY)"
+        # The master key the DEPLOYED service last ran with — the key that
+        # actually encrypted any /ui-stored credentials under litellm's
+        # salt-key fallback. Seeds the first LITELLM_SALT_KEY write below, so
+        # a run that ALSO rotates the master key (new sk- value in .env) can't
+        # pin the salt to a key those rows were never encrypted with.
+        PERSISTED_MASTER_KEY="$(read_env_file_var "$LITELLM_ENV_FILE" LITELLM_MASTER_KEY)"
         PERSISTED_UI_LINES="$(grep -E '^UI_(USERNAME|PASSWORD)=' "$LITELLM_ENV_FILE" 2>/dev/null || true)"
     fi
 
@@ -1102,6 +1300,22 @@ if [ "$WITH_LOCAL_LITELLM" = "true" ]; then
     LITELLM_ENV_CONTENT+="DATABASE_URL=${LITELLM_DB_URL}"$'\n'
     LITELLM_ENV_CONTENT+="STORE_MODEL_IN_DB=True"$'\n'
     [ -n "${LITELLM_DB_PASSWORD:-}" ] && LITELLM_ENV_CONTENT+="LITELLM_DB_PASSWORD=${LITELLM_DB_PASSWORD}"$'\n'
+    # LITELLM_SALT_KEY encrypts DB-stored model credentials at rest ("set once,
+    # never change" — litellm production docs; rotating it makes them
+    # unreadable, so it is persisted like the DB password and NEVER
+    # regenerated). Without it litellm falls back to signing with the MASTER
+    # key, which welds credential encryption to the admin credential — a later
+    # master-key rotation would brick every /ui-added model. First write uses
+    # the master key the deployed service last ran with, deliberately: that is the
+    # docs-sanctioned safe migration for boxes whose stored models are already
+    # encrypted under the fallback (same signing key, cryptographic no-op), and
+    # from then on the master key is free to rotate. Read from the env file,
+    # NOT from $ANTHROPIC_AUTH_TOKEN — on a run that also rotates the master
+    # key the two differ, and seeding from the new value would pin the salt to
+    # a key those rows were never encrypted with (unrecoverable). Falls back to
+    # the current key only on a fresh box, where no encrypted rows exist.
+    LITELLM_SALT_KEY="${PERSISTED_SALT_KEY:-${PERSISTED_MASTER_KEY:-${ANTHROPIC_AUTH_TOKEN}}}"
+    LITELLM_ENV_CONTENT+="LITELLM_SALT_KEY=${LITELLM_SALT_KEY}"$'\n'
     # Manual UI_USERNAME / UI_PASSWORD overrides survive the wholesale rewrite
     # (grepped from the previous env file at the top of this phase).
     [ -n "$PERSISTED_UI_LINES" ] && LITELLM_ENV_CONTENT+="${PERSISTED_UI_LINES}"$'\n'
@@ -1152,7 +1366,6 @@ if [ "$WITH_LOCAL_LITELLM" = "true" ]; then
     # leave the litellm container running under the rootless daemon, holding
     # 127.0.0.1:4000 and blocking the native proxy from binding. Only acts on an
     # actual variant change — a same-mode re-run is untouched here.
-    INSTALLED_LITELLM_UNIT="${HOME}/.config/systemd/user/litellm.service"
     if [ -f "$INSTALLED_LITELLM_UNIT" ]; then
         installed_litellm_variant="native"
         # Anchor on the ExecStart line, not the whole file: a comment mentioning
@@ -1163,7 +1376,7 @@ if [ "$WITH_LOCAL_LITELLM" = "true" ]; then
         if [ "$installed_litellm_variant" != "$desired_litellm_variant" ]; then
             log "Switching LiteLLM runtime ${installed_litellm_variant} -> ${desired_litellm_variant}; stopping current unit first"
             LITELLM_CHANGED=1
-            stop_user_service_if_active litellm
+            stop_user_service litellm
             # systemd may read the unit inactive while the rootless daemon still
             # runs the container (restart: unless-stopped), so the ExecStop above
             # never fired and an orphan still holds 127.0.0.1:4000 — fatal for a
@@ -1174,6 +1387,18 @@ if [ "$WITH_LOCAL_LITELLM" = "true" ]; then
                 litellm_compose down --remove-orphans 2>/dev/null || true
             fi
         fi
+    fi
+
+    # Postgres-gate rendering for BOTH unit variants: with a local cluster
+    # (pg_port set by Phase 6) substitute its port into the units' bounded
+    # pg_isready ExecStartPre; with an external DATABASE_URL delete the line —
+    # a remote DB is not probeable by local pg_isready, and the deploy helper
+    # refuses renders that still carry a __TOKEN__, so deletion is the only
+    # correct external-DB shape. Port value is digits-only (pg_setting), safe
+    # inside the sed replacement.
+    pg_wait_sed=(-e '/__PGPORT__/d')
+    if [ -n "${pg_port:-}" ]; then
+        pg_wait_sed=(-e "s|__PGPORT__|${pg_port}|g")
     fi
 
     if [ "$DOCKER_MODE" = "true" ]; then
@@ -1191,12 +1416,13 @@ if [ "$WITH_LOCAL_LITELLM" = "true" ]; then
 
         if deploy_user_systemd_service litellm "$SCRIPT_DIR/systemd/litellm-docker.service" \
             -e "s|__APP_DIR__|${LITELLM_CONFIG_DIR}|g" \
-            -e "s|__PATH__|${USER_TOOL_PATH}|g"; then
+            -e "s|__PATH__|${USER_TOOL_PATH}|g" \
+            "${pg_wait_sed[@]}"; then
             LITELLM_CHANGED=1
         fi
 
         # Pre-pull the image in the foreground (visible progress) so the unit
-        # start below is fast and wait_for_litellm's 90s window isn't eaten by a
+        # start below is fast and wait_for_litellm's budget isn't eaten by a
         # ~367MB first-run download — the unit's ExecStartPre would otherwise pull
         # silently while we poll. The image tag is pinned, so once cached there is
         # nothing to fetch — skip the registry round-trip entirely (a tag bump
@@ -1217,7 +1443,8 @@ if [ "$WITH_LOCAL_LITELLM" = "true" ]; then
             -e "s|__APP_DIR__|${LITELLM_CONFIG_DIR}|g" \
             -e "s|__PORT__|${LITELLM_PORT}|g" \
             -e "s|__ENV_FILE__|${LITELLM_ENV_FILE}|g" \
-            -e "s|__PATH__|${LITELLM_PATH}|g"; then
+            -e "s|__PATH__|${LITELLM_PATH}|g" \
+            "${pg_wait_sed[@]}"; then
             LITELLM_CHANGED=1
         fi
     fi
@@ -1228,9 +1455,36 @@ if [ "$WITH_LOCAL_LITELLM" = "true" ]; then
     # LiteLLM (Prisma reconnect + boot-time model-map fetch, 5-25s) and drop
     # in-flight gateway connections. Called bare: a failed restart aborts
     # under `set -e`.
-    restart_user_service_if_stale litellm "$LITELLM_CHANGED"
+    if [ "$LITELLM_CLIENT_BROKEN" = "1" ]; then
+        # Phase 4a could not generate the Prisma client: config/env/unit are
+        # deployed (the next run only needs the regen), but a start would
+        # crash on import and churn through the start limit. Keep it down —
+        # stop is a free no-op on an inactive unit and cancels any queued
+        # restart; `enable` is left alone so a later `systemctl --user start`
+        # or reboot behaves as before.
+        stop_user_service litellm
+        warn "LiteLLM left stopped — Prisma client missing (Phase 4a); see the banner at the end"
+    else
+        # In native mode this is the run's ONLY litellm start (Phase 4a stops
+        # the unit for the venv/toolchain work and defers the start here); an
+        # inactive unit is started even when nothing changed.
+        restart_user_service_if_stale litellm "$LITELLM_CHANGED"
 
-    wait_for_litellm "$LITELLM_PORT" || warn "LiteLLM may not be ready — Claude Code calls could fail until it starts"
+        # Liveliness budget: long only when the unit was started this run
+        # (read the action taken, not the staleness rule) — such a start may
+        # spend minutes in the bounded startup schema sync on a CPU-starved VM
+        # (wait_for_litellm's docstring; safe because it bails early on a
+        # failed or crash-looping unit). An untouched running service (docker
+        # no-op runs) keeps the short budget.
+        litellm_wait_budget="$LITELLM_WAIT_SHORT"
+        if [ "${USER_SERVICE_RESTARTED:-0}" = "1" ]; then
+            litellm_wait_budget="$LITELLM_WAIT_LONG"
+        fi
+        wait_for_litellm "$LITELLM_PORT" "$litellm_wait_budget" || warn "LiteLLM may not be ready — Claude Code calls could fail until it starts"
+    fi
+    # The Phase 4a abort belt is obsolete past the authoritative start above
+    # (a no-op under --docker, where 4a never armed it).
+    trap - EXIT
 fi
 
 #############################################################################
@@ -1708,6 +1962,22 @@ if [ "$WITH_LOCAL_LITELLM" = "true" ] && [ -t 1 ]; then
     echo ""
     echo -e "${YELLOW}  To retrieve later: ${NC}grep '^LITELLM_MASTER_KEY=' ~/.config/litellm/env"
     echo -e "${YELLOW}${rule}${NC}"
+    echo ""
+fi
+
+if [ "$LITELLM_CLIENT_BROKEN" = "1" ] && [ -t 1 ]; then
+    echo -e "${RED}${rule}${NC}"
+    echo -e "${RED}  LiteLLM is NOT running: Phase 4a could not generate the Prisma client"
+    echo -e "  (see the [ERROR] lines above). The unit was left stopped on purpose —"
+    echo -e "  starting it would only crash-loop on \"The Client hasn't been generated\".${NC}"
+    echo ""
+    echo -e "${YELLOW}  Next steps:${NC}"
+    echo -e "    1. Fix the cause reported above (network to binaries.prisma.sh /"
+    echo -e "       registry.npmjs.org / nodejs.org, disk, or a stalled child — during"
+    echo -e "       a stall run: ${GREEN}ps -eo pid,ppid,stat,etimes,args --forest | grep -E 'prisma|node|npm'${NC})."
+    echo -e "    2. Re-run ${GREEN}${SCRIPT_DIR}/setup.sh${NC} — it re-heals the toolchain, regenerates the"
+    echo -e "       client (import probe) and starts LiteLLM."
+    echo -e "${RED}${rule}${NC}"
     echo ""
 fi
 

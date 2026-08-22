@@ -230,6 +230,23 @@ update_profile_export() {
 # Read a previously written value from PROFILE_FILE. Prints nothing if not
 # present.
 # Usage: read_profile_export VAR_NAME
+# Read NAME's value from a KEY=value env file (systemd EnvironmentFile /
+# docker env_file shape — no `export`, no quoting). Prints the value of the
+# first match, empty when the file or key is absent. Never fails.
+# Usage: read_env_file_var <file> <NAME>
+read_env_file_var() {
+    local file="$1" name="$2"
+    [ -f "$file" ] || return 0
+    grep "^${name}=" "$file" 2>/dev/null | head -1 | cut -d= -f2-
+}
+
+# The path deploy_user_systemd_service writes <name>.service to — one spelling
+# for the writer and for callers that test/mask/restore the deployed unit.
+# Usage: user_unit_path <name>
+user_unit_path() {
+    echo "${HOME}/.config/systemd/user/$1.service"
+}
+
 read_profile_export() {
     local var_name="$1"
     local line
@@ -757,25 +774,82 @@ pg_url_works() {
 # LiteLLM service readiness
 #############################################################################
 
-# Poll LiteLLM liveliness endpoint until it responds (max ~90s).
-# First boot runs Prisma migrations + may fetch Prisma engine binaries, which
-# can take 15–25s on a fresh DB and occasionally longer under load; the prior
-# 30s window produced false warnings while LiteLLM was still mid-startup.
-# Usage: wait_for_litellm [port]
+# Poll LiteLLM liveliness endpoint until it responds.
+# Typical starts answer in 15–25s (uvicorn + a warm-cache `prisma db push`
+# no-op sync); LITELLM_WAIT_SHORT covers those. The caller passes
+# LITELLM_WAIT_LONG ONLY for a start that actually happened this run (Phase 7
+# — in native mode that is every run, since Phase 4a stops the unit for the
+# venv/toolchain work and never restarts it itself) because such a start can
+# legitimately run long: the schema sync is bounded at ≤4 attempts × 60s
+# hard-killed + 5–15s sleeps (prisma_client.py::PrismaManager.setup_database,
+# see CLAUDE.md > Troubleshooting, "db push in the process list") ≈ 300s,
+# after which the proxy continues startup and binds even on failure — and on
+# a CPU-starved VM every arc step (bare `prisma` spawn, db push, the proxy
+# import) stretches further (observed 2026-08-20: a converging start ran past
+# the old 360s budget while sharing ~1 core with the rest of the run, and the
+# resulting "not responding" warning invited an overlay recovery restart that
+# killed it mid-arc and paid the arc again). 900s is safe to grant because
+# the wait no longer sits out the whole budget blind: it bails as soon as the
+# unit parks `failed` (start-limit) or is demonstrably crash-looping
+# (NRestarts grew ≥3 while waiting — reset-failed zeroes the counter before
+# the initial restart, so growth during the wait is all crash-loop). Where
+# `systemctl --user` itself is unavailable, both probes degrade to no-ops and
+# only the wall-clock bound applies. An unchanged already-running service
+# keeps the short budget so a genuinely broken box doesn't stall a no-op
+# re-run. The budget is wall-clock (SECONDS deadline), not an iteration count
+# — curl's --max-time 3 would otherwise stretch each iteration to 4s on a
+# hung connect and quietly quadruple it. Cadence: 1s while a fast start is
+# still plausible, 5s once the wait is clearly in the bounded-sync regime
+# (the fast path is unchanged — returns the second the probe passes); a
+# progress note at 60s on the long budget tells the operator the
+# long-but-bounded case is expected.
+# Usage: wait_for_litellm [port] [max_wait_seconds]
+LITELLM_WAIT_SHORT=90
+LITELLM_WAIT_LONG=900
 wait_for_litellm() {
     local port="${1:-4000}"
+    local budget="${2:-$LITELLM_WAIT_SHORT}"
     local url="http://127.0.0.1:${port}/health/liveliness"
-    local max_attempts=90
-    local i
+    local hint="check: journalctl --user -u litellm -n 100"
+    local start="$SECONDS" elapsed=0 interval=1 noted=0
+    local probe unit_state restarts_now restarts_start=""
 
-    for ((i=1; i<=max_attempts; i++)); do
+    while :; do
         if curl -sf --max-time 3 "$url" &>/dev/null; then
             log "LiteLLM is responding on port ${port}"
             return 0
         fi
-        sleep 1
+        elapsed=$((SECONDS - start))
+        [ "$elapsed" -ge "$budget" ] && break
+        # Early bail-outs — the big budget may only be spent on a start that
+        # is still progressing, never sat out against a dead or looping unit.
+        # One `systemctl show` answers both probes (ActiveState carries what
+        # is-active would say); the NRestarts baseline is taken on the first
+        # failed liveliness probe, so a box that answers immediately never
+        # spawns systemctl at all. An empty/garbled read (no user bus) makes
+        # both probes no-ops and leaves only the wall-clock bound.
+        probe="$(systemctl --user show -p ActiveState -p NRestarts --value litellm 2>/dev/null || true)"
+        unit_state="${probe%%$'\n'*}"
+        restarts_now="${probe##*$'\n'}"
+        if [ "$unit_state" = "failed" ]; then
+            warn "litellm parked failed (start-limit) after ${elapsed}s — not waiting out the ${budget}s budget; ${hint}"
+            return 1
+        fi
+        if [[ "$restarts_now" =~ ^[0-9]+$ ]]; then
+            [ -n "$restarts_start" ] || restarts_start="$restarts_now"
+            if [ $((restarts_now - restarts_start)) -ge 3 ]; then
+                warn "litellm crash-looping ($((restarts_now - restarts_start)) restarts while waiting, ${elapsed}s in) — not waiting out the ${budget}s budget; ${hint}"
+                return 1
+            fi
+        fi
+        if [ "$noted" = 0 ] && [ "$budget" -gt "$LITELLM_WAIT_SHORT" ] && [ "$elapsed" -ge 60 ]; then
+            log "LiteLLM still starting — the startup schema sync (prisma db push) is bounded at ~5 min worst case, longer on a CPU-starved box; waiting up to ${budget}s total"
+            noted=1
+        fi
+        [ "$elapsed" -ge 30 ] && interval=5
+        sleep "$interval"
     done
-    warn "LiteLLM not responding on port ${port} after 90s"
+    warn "LiteLLM not responding on port ${port} after ${budget}s; ${hint}"
     return 1
 }
 
@@ -833,9 +907,9 @@ deploy_user_systemd_service() {
     local template="$2"
     shift 2
 
-    local service_dir="${HOME}/.config/systemd/user"
-    local dest="${service_dir}/${name}.service"
-    mkdir -p "$service_dir"
+    local dest
+    dest="$(user_unit_path "$name")"
+    mkdir -p "$(dirname "$dest")"
 
     # Render first, then write — piping sed straight into write_if_changed
     # would mask a sed failure (no `set -o pipefail` here): the pipeline's
@@ -870,13 +944,21 @@ deploy_user_systemd_service() {
     return $((1 - changed))
 }
 
-# Stop a systemd --user service if it's active. No-op otherwise.
-stop_user_service_if_active() {
+# Stop a systemd --user service, unconditionally. NEVER gate a stop on
+# `is-active`: that probe is non-zero for `activating (auto-restart)`
+# — where a crash-looping unit spends ~10s of every ~11s cycle — and for
+# `failed` (start-limit parked), so an activity gate skips the stop on exactly
+# the units that most need stopping, leaving their queued auto-restart live
+# (observed 2026-08-19: a wedged unit restarting into Phase 4a's venv rebuild
+# straight through the gated stop). `systemctl stop` on an inactive or unknown
+# unit is a free no-op that also cancels any queued restart. Always returns 0:
+# setup.sh calls this bare under `set -e` on paths where the unit is routinely
+# already inactive.
+stop_user_service() {
     local name="$1"
-    if systemctl --user is-active "$name" &>/dev/null; then
-        systemctl --user stop "$name"
-        log "${name} service stopped"
-    fi
+    systemctl --user stop "$name" &>/dev/null || true
+    log "${name} stop issued (no-op if it wasn't running)"
+    return 0
 }
 
 # Enable a systemd --user service and restart it only when STALE: when
@@ -886,10 +968,15 @@ stop_user_service_if_active() {
 # re-run must not bounce it and drop live connections/sessions. Returns 1 on
 # restart failure (explicit `|| return 1`, so the outcome is the same whether
 # the caller runs it bare — fatal under `set -e` — or in an `if` condition);
-# 0 when restarted or left running.
+# 0 when restarted or left running. Reports which of those it did in
+# USER_SERVICE_RESTARTED (1 = (re)started, 0 = left running) so callers that
+# need the fact — e.g. Phase 7 sizing wait_for_litellm's budget — read the
+# action taken instead of re-deriving this function's staleness predicate at
+# the call site (two spellings of one policy silently desync).
 # Usage: restart_user_service_if_stale <name> <changed 0|1>
 restart_user_service_if_stale() {
     local name="$1" changed="$2"
+    USER_SERVICE_RESTARTED=0
     systemctl --user enable "$name" &>/dev/null || true
     if [ "$changed" = "1" ] || ! systemctl --user is-active "$name" &>/dev/null; then
         # A crash-looped unit latches failed/start-limit-hit; clear it so the
@@ -900,6 +987,7 @@ restart_user_service_if_stale() {
         # needs a probe, e.g. wait_for_litellm after the litellm call site.
         systemctl --user reset-failed "$name" &>/dev/null || true
         systemctl --user restart "$name" || return 1
+        USER_SERVICE_RESTARTED=1
         log "${name} service (re)started"
     else
         log "${name} unchanged — service left running"

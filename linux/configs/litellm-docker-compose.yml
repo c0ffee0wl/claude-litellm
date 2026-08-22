@@ -19,24 +19,28 @@ services:
     # Pinned image — a deliberate pin like the claude-devtools release-tag pin
     # (CLAUDE.md > "install-if-missing"). This uses LiteLLM's plain per-release
     # tag (vX.Y.Z), NOT the `-stable` channel: `-stable` tags are promoted later
-    # and LAG (newest is v1.83.14-stable), so they can't match the native uv
-    # `>=1.84.0` floor. v1.93.0 satisfies that floor, clears the compromised
-    # 1.82.7/1.82.8, and carries the Responses-adapter support this setup relies
-    # on for GPT-5.6 (the Anthropic /v1/messages -> Responses adapter honours
-    # output_config.effort; the `openai/` route in litellm-config.yaml takes that
-    # adapter). It is also what the native uv install resolves to under a 1-week
-    # dependency cooldown, so both runtimes track the same version.
+    # and LAG, so they can't match the native uv `>=1.84.0` floor. v1.96.2
+    # matches what the native uv install runs (same version both runtimes),
+    # clears the compromised 1.82.7/1.82.8, and carries the Responses-adapter
+    # support this setup relies on for GPT-5.6 (the `openai/` route in
+    # litellm-config.yaml takes that adapter).
     #
-    # Bump intentionally, and prefer a tag that is (a) aged in past the cooldown,
-    # (b) git-tagged upstream, and (c) present on ghcr.io — the three can diverge.
-    # Counter-example seen at the v1.93.0 bump: 1.93.1 was on PyPI and ghcr.io but
-    # had NO upstream git tag (unauditable source) and shipped same-day, and it
-    # post-dates 1.94.0 (a backport lane, not mainline). Verify with:
+    # Bump verification for v1.96.2 (2026-08-20), the four CLAUDE.md criteria:
+    #   (1) aged: image built 2026-08-11 (ghcr config blob .created), past the
+    #       7-day cooldown; (2) git-tagged upstream: v1.96.2 = 83d6d84;
+    #   (3) fastapi guard: the image installs with `uv sync --frozen` from the
+    #       tag's committed uv.lock, which pins fastapi 0.136.3 (<0.140.7), so
+    #       the BerriAI/litellm#35763 import crash cannot reach it — this is
+    #       the check the native Phase 4a guard can't do inside an image;
+    #   (4) ghcr manifest exists (HTTP 200).
+    # Re-verify all four on the next bump — they can diverge (the v1.93.0-era
+    # counter-example: 1.93.1 was on PyPI and ghcr.io with NO upstream git tag,
+    # a same-day backport lane). Manifest check:
     #   T=$(curl -s "https://ghcr.io/token?scope=repository:berriai/litellm:pull" | jq -r .token)
     #   curl -sI -H "Authorization: Bearer $T" \
     #     https://ghcr.io/v2/berriai/litellm/manifests/vX.Y.Z
     # (a given version's `-stable` may not exist). ExecStartPre re-pulls on start.
-    image: ghcr.io/berriai/litellm:v1.93.0
+    image: ghcr.io/berriai/litellm:v1.96.2
     restart: unless-stopped
     # Publish to loopback only — same localhost-only exposure as the native unit
     # (which binds --host 127.0.0.1). The container itself listens on 0.0.0.0
@@ -63,6 +67,17 @@ services:
       SSL_ECDH_CURVE: "prime256v1"
       DISABLE_AIOHTTP_TRUST_ENV: "True"
       AIOHTTP_TTL_DNS_CACHE: "10"
+      # Prisma startup-migration budgets — these are upstream's own defaults,
+      # pinned so a future retune can't move us; see systemd/litellm.service.
+      LITELLM_PRISMA_BOOTSTRAP_TIMEOUT: "600"
+      LITELLM_PRISMA_COMMAND_TIMEOUT: "60"
+      # Prisma CLI phone-home (checkpoint.prisma.io) off — same as the native
+      # unit. PRISMA_USE_GLOBAL_NODE is deliberately NOT set here: the image
+      # bakes its CLI under /opt/prisma and relies on the image's /usr/bin/node
+      # ("node (without npm) is required by the prisma CLI at runtime",
+      # upstream Dockerfile); the native unit's opt-out guards against the
+      # host's ~/.bun/bin/node -> bun symlink, which the container never sees.
+      CHECKPOINT_DISABLE: "1"
     command:
       - "--config"
       - "/app/config.yaml"
@@ -74,8 +89,11 @@ services:
       - "1"
       - "--telemetry"
       - "False"
-    # The image runs Prisma migrations on startup (against the host DB), so the
-    # first boot can take a while — generous start_period before unhealthy.
+      # db push posture, in sync with litellm.service's ExecStart — see
+      # CLAUDE.md > Key Conventions, "DB schema posture".
+      - "--use_prisma_db_push"
+    # Startup syncs the DB schema via `prisma db push` (against the host DB), so
+    # the first boot can take a while — generous start_period before unhealthy.
     healthcheck:
       test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:__PORT__/health/liveliness')\""]
       interval: 30s

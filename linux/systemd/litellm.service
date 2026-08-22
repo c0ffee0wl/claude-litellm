@@ -2,7 +2,7 @@
 Description=LiteLLM — Anthropic-compatible gateway to Azure OpenAI / Vertex Gemini / etc.
 After=network-online.target
 Wants=network-online.target
-# Headroom for slow first boots (Prisma migrations + engine fetch, 15–25s) and
+# Headroom for slow first boots (Prisma schema push + engine fetch, 15–25s) and
 # for the boot race against Postgres. Raise BOTH numbers together: the limiter
 # gives up at a cycle time below IntervalSec/Burst, so widening Burst alone
 # would narrow that. See CLAUDE.md, "StartLimitBurst=20 on the litellm units".
@@ -39,10 +39,30 @@ Environment=DISABLE_AIOHTTP_TRUST_ENV=True
 # provider endpoints behind Traffic Manager publish ~10s A records, and aiohttp
 # never invalidates a cached address on connect failure.
 Environment=AIOHTTP_TTL_DNS_CACHE=10
-Environment=PRISMA_BINARY_CACHE_DIR=%h/.cache/prisma-python/binaries
-Environment=PRISMA_HIDE_UPDATE_MESSAGE=1
-Environment=PRISMA_SKIP_POSTINSTALL_GENERATE=1
-ExecStart=__LITELLM_BIN__ --config __APP_DIR__/config.yaml --port __PORT__ --host 127.0.0.1 --num_workers 1 --telemetry False
+# Prisma toolchain switches (cache dir, global-node opt-out, npm cooldown,
+# checkpoint opt-out, startup-migration budgets) come from ONE file shared
+# with setup.sh's run_prisma wrapper, so what Phase 4a warms is what this
+# service reads — see linux/configs/litellm-prisma.env for each switch's
+# rationale. `-`: tolerate its absence (a --docker box never renders it; that
+# unit variant doesn't reference it). WorkingDirectory above also makes
+# prisma-client-py read ./pyproject.toml (Node LTS pin for the nodeenv).
+EnvironmentFile=-__APP_DIR__/prisma.env
+# Wait (bounded) for the host Postgres socket before paying the start arc — a
+# --user unit cannot After= the system postgresql@ instance, so litellm races
+# it at boot, and without this gate every retry cycle costs a full proxy
+# import + two Node spawns against a dead socket. `$$` is systemd's literal-$
+# escape (renders to `$(seq 60)` in the spawned shell). ~120s ceiling, then
+# falls through with exit 0 so an absent DB degrades to the old behavior and
+# can never fail the unit. setup.sh Phase 7 substitutes __PGPORT__ on
+# local-DB runs and DELETES this line for an external DATABASE_URL (a remote
+# DB is not probeable by local pg_isready). TimeoutStartSec bounds
+# ExecStartPre and must stay above the loop's ceiling.
+TimeoutStartSec=180
+ExecStartPre=/bin/sh -c 'for _ in $$(seq 60); do pg_isready -q -h /run/postgresql -p __PGPORT__ && exit 0; sleep 2; done; exit 0'
+# --use_prisma_db_push: DB schema posture is `db push`, not the migrate-deploy
+# default — see CLAUDE.md > Key Conventions, "DB schema posture". Keep this arg
+# in sync with litellm-docker-compose.yml's command: list.
+ExecStart=__LITELLM_BIN__ --config __APP_DIR__/config.yaml --port __PORT__ --host 127.0.0.1 --num_workers 1 --telemetry False --use_prisma_db_push
 # `always`, not `on-failure` — see CLAUDE.md, "Restart policy for long-lived
 # user services". A commanded stop is still never restarted.
 Restart=always
