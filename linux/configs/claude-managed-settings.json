@@ -10,9 +10,18 @@
   "disableDeepLinkRegistration": "disable",
   "disableRemoteControl": true,
   "skipWebFetchPreflight": true,
+
+  "autoUploadSessions": false,
+  "disableClaudeAiConnectors": true,
+  "syncClaudeAiSkills": false,
+  "syncClaudeAiPlugins": false,
+  "enableArtifact": false,
+  "feedbackDrafts": "off",
+
   "attribution": {
     "commit": "",
-    "pr": ""
+    "pr": "",
+    "sessionUrl": false
   },
 
   "env": {
@@ -22,6 +31,8 @@
     "DISABLE_GROWTHBOOK": "1",
 
     "DISABLE_FEEDBACK_COMMAND": "1",
+    "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "1",
+    "DISABLE_BUG_COMMAND": "1",
     "DISABLE_INSTALL_GITHUB_APP_COMMAND": "1",
 
     "ENABLE_CLAUDEAI_MCP_SERVERS": "false",
@@ -30,6 +41,7 @@
   },
 
   "permissions": {
+    "disableAutoMode": "disable",
     "deny": [
       "Bash(rm -rf *)",
       "Bash(rm -fr *)",
@@ -76,6 +88,16 @@
       "Read(~/.netrc)",
       "Read(~/.config/litellm/config.yaml)",
       "Read(~/.config/litellm/env)",
+
+      "Read(~/.openai/**)",
+      "Read(~/.anthropic/**)",
+      "Read(~/.config/codex/**)",
+      "Read(~/.config/gcloud/**)",
+      "Read(~/.config/google/**)",
+      "Read(~/.config/op/**)",
+      "Read(~/.terraform.d/**)",
+
+      "Read(__REPO_DIR__/.env)",
       "Read(**/.env)",
       "Read(**/.env.*)",
       "Read(**/*.pem)",
@@ -92,6 +114,7 @@
       "Read(~/.bashrc)",
       "Read(~/.zshrc)",
       "Read(~/.zprofile)",
+      "Read(~/.bash_profile)",
 
       "Edit(~/.bashrc)",
       "Edit(~/.zshrc)",
@@ -132,11 +155,7 @@
 
       "NotebookEdit"
     ],
-    "allow": [
-      "mcp__microsoft-learn__microsoft_docs_search",
-      "mcp__microsoft-learn__microsoft_docs_fetch",
-      "mcp__microsoft-learn__microsoft_code_sample_search"
-    ]
+    "allow": []
   },
 
   "hooks": {

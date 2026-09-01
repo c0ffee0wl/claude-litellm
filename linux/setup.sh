@@ -1298,11 +1298,19 @@ if [ "$WITH_GATEWAY" = "true" ]; then
     # Effort for custom model ids — the documented gateway lever; models that
     # reject effort are still excluded by CC, so safe for /ui-added entries.
     update_profile_export "CLAUDE_CODE_ALWAYS_ENABLE_EFFORT" "1"
+    # Cost warnings are computed from Anthropic list prices, which don't apply
+    # to traffic LiteLLM bills through Azure — so they're wrong here, and the
+    # deployed statusline already shows the real spend ($/sess · $/day · $/30d).
+    # Gated rather than a managed env: entry — CLAUDE.md > "What a managed
+    # `env:` key actually reaches, and the all-modes test it must pass".
+    update_profile_export "DISABLE_COST_WARNINGS" "1"
 else
     # Box flipped from a gateway mode → clean the gateway-only levers
     # (the SUBPROCESS_ENV_SCRUB pattern above).
     remove_profile_export "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"
     remove_profile_export "CLAUDE_CODE_ALWAYS_ENABLE_EFFORT"
+    # Restore cost warnings: without a gateway they're accurate again.
+    remove_profile_export "DISABLE_COST_WARNINGS"
     # A stale forced 1M belief is dangerous against the real Anthropic API
     # (Claude windows are known natively; a 200K-plan session would overrun).
     remove_profile_export "CLAUDE_CODE_MAX_CONTEXT_TOKENS"
@@ -1905,16 +1913,37 @@ if [ ! -f "${HOME}/.claude/settings.json" ]; then
     else
         deploy_config "$SCRIPT_DIR/configs/claude-settings.json" "${HOME}/.claude/settings.json"
     fi
-elif ! jq -e 'has("sandbox")' "${HOME}/.claude/settings.json" >/dev/null 2>&1; then
-    # Existing CC-owned file with NO sandbox block: never auto-modify it, but without a
-    # persisted block the statusline can't detect the sandbox (a /sandbox-picker toggle
-    # is runtime-only — anthropics/claude-code#47624 — and undetectable). The fix-it
-    # command (scripts/add-sandbox-block.sh — idempotent `//=` add-if-missing merge,
-    # run by the user, keeps every other key) is surfaced in the end-of-script banner
-    # via the NEEDS_MODEL_CONFIG pattern — printed inline here it would scroll off
-    # behind Phases 9–11. The warn keeps non-tty runs (no banner) actionable.
-    NEEDS_SANDBOX_BLOCK=1
-    warn "~/.claude/settings.json has no sandbox block — run linux/scripts/add-sandbox-block.sh (details in the end-of-setup banner)."
+else
+    # Existing CC-owned file. Two different situations, deliberately handled
+    # differently — the split is "does adding this key change security posture?".
+
+    # statusLine: it doesn't. Add it if absent so a box whose settings.json predates
+    # this setup still gets a wired statusline — it points at the script 8d deploys
+    # immediately below, so restoring it can only restore intended behavior. Why this
+    # isn't pinned at managed scope instead: CLAUDE.md > the 8c–8d row.
+    # Gated on has() like add-sandbox-block.sh, for its reason: jq re-formats the whole
+    # document, so an unconditional merge would rewrite a CC-owned file (and log that it
+    # "added" something) on every run of any box whose file isn't already jq-formatted.
+    # Value comes from the template, never a literal — a second copy would silently heal
+    # existing boxes onto a stale path after the template changes. `VAR=$(jq …)` first:
+    # no pipefail here, so a piped jq failure would write an empty settings.json.
+    if ! jq -e 'has("statusLine")' "${HOME}/.claude/settings.json" >/dev/null 2>&1; then
+        HEALED_SETTINGS=$(jq --slurpfile tpl "$SCRIPT_DIR/configs/claude-settings.json" \
+            '.statusLine //= $tpl[0].statusLine' "${HOME}/.claude/settings.json")
+        printf '%s\n' "$HEALED_SETTINGS" | write_if_changed "${HOME}/.claude/settings.json" 644 \
+            && log "~/.claude/settings.json: added missing statusLine"
+    fi
+
+    # sandbox: it does. Never auto-modify — but without a persisted block the
+    # statusline can't detect the sandbox (a /sandbox-picker toggle is runtime-only —
+    # anthropics/claude-code#47624 — and undetectable). The fix-it command
+    # (scripts/add-sandbox-block.sh, same `//=` merge, run by the user) is surfaced in
+    # the end-of-script banner via the NEEDS_MODEL_CONFIG pattern — printed inline here
+    # it would scroll off behind Phases 9–11. The warn keeps non-tty runs actionable.
+    if ! jq -e 'has("sandbox")' "${HOME}/.claude/settings.json" >/dev/null 2>&1; then
+        NEEDS_SANDBOX_BLOCK=1
+        warn "~/.claude/settings.json has no sandbox block — run linux/scripts/add-sandbox-block.sh (details in the end-of-setup banner)."
+    fi
 fi
 
 # 8d. Statusline script (content-aware copy — no rewrite on no-op re-runs)
