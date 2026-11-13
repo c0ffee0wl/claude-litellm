@@ -27,20 +27,9 @@ services:
     # `-stable` tags are promoted later and LAG, so no `-stable` image exists for
     # the versions this repo pins.
     #
-    # Four criteria to verify on every bump — they diverge, so check all four
-    # (the v1.93.0-era counter-example: 1.93.1 was on PyPI and ghcr.io with NO
-    # upstream git tag, a same-day backport lane):
-    #   (1) aged past the ~7-day cooldown (ghcr config blob .created);
-    #   (2) git-tagged upstream (auditable source);
-    #   (3) the tag's committed uv.lock pins fastapi <0.140.7 — the image builds
-    #       with `uv sync --frozen`, so this is the BerriAI/litellm#35763 check
-    #       the native LITELLM_FASTAPI_GUARD cannot perform inside an image;
-    #   (4) the ghcr manifest exists:
-    #         T=$(curl -s "https://ghcr.io/token?scope=repository:berriai/litellm:pull" | jq -r .token)
-    #         curl -sI -H "Authorization: Bearer $T" \
-    #           https://ghcr.io/v2/berriai/litellm/manifests/vX.Y.Z
-    # For the current pin all four are recorded next to LITELLM_VERSION in
-    # setup.sh. The unit pulls only a missing image (`up --pull missing`).
+    # The four bump criteria (and the ghcr manifest check) live next to
+    # LITELLM_VERSION in setup.sh, with the current pin's verified answers.
+    # The unit pulls only a missing image (`up --pull missing`).
     image: ghcr.io/berriai/litellm:v__LITELLM_IMAGE_TAG__
     # `no`, not `unless-stopped`: the systemd unit wrapping `docker compose up`
     # already declares Restart=always, and two supervisors on one process means
@@ -91,6 +80,14 @@ services:
       # which is where the native side reads them from.
       LITELLM_PRISMA_BOOTSTRAP_TIMEOUT: "600"
       LITELLM_PRISMA_COMMAND_TIMEOUT: "60"
+      LITELLM_PRISMA_MIGRATE_DEPLOY_TIMEOUT: "600"
+      # Schema posture, in sync with litellm.service — see CLAUDE.md > Key
+      # Conventions, "DB schema posture". The v2 resolver is litellm's default
+      # (the --use_v2_migration_resolver flag is deprecated); pinned so a
+      # default flip cannot silently bring back the migrate storm. The image
+      # builds with the extra_proxy extra, so psycopg — and with it the
+      # resolver's ahead-of-head warning — is present in the container too.
+      USE_V2_MIGRATION_RESOLVER: "true"
       # Prisma CLI phone-home (checkpoint.prisma.io) off — same as the native
       # unit. PRISMA_USE_GLOBAL_NODE is deliberately NOT set here: the image
       # bakes its CLI under /opt/prisma and relies on the image's /usr/bin/node
@@ -109,12 +106,6 @@ services:
       - "1"
       - "--telemetry"
       - "False"
-      # Schema posture, in sync with litellm.service's ExecStart — see
-      # CLAUDE.md > Key Conventions, "DB schema posture" — including why the
-      # resolver's ahead-of-head warning is likely inert inside this image
-      # (psycopg is dev-only upstream), leaving the LITELLM_VERSION pin that
-      # renders the tag above as what actually prevents a schema downgrade.
-      - "--use_v2_migration_resolver"
     # Startup syncs the DB schema via `prisma migrate deploy` (against the host
     # DB), so the first boot can take a while — generous start_period.
     # /health/readiness, not liveliness: liveliness answers 200 with the DB

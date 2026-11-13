@@ -1,9 +1,11 @@
 [Unit]
 Description=LiteLLM (Docker) — Anthropic-compatible gateway via rootless Docker Compose
 # docker.service here is the *rootless* per-user daemon (systemd --user), set up
-# by install_docker_rootless. network-online ordering matters for the image pull.
-After=docker.service network-online.target
-Wants=docker.service network-online.target
+# by install_docker_rootless. No network-online.target: that target does not
+# exist in the user manager, so ordering on it does nothing (CLAUDE.md,
+# "StartLimitBurst=20").
+After=docker.service
+Wants=docker.service
 # First boot runs Prisma migrations against the host DB. Must stay identical to
 # litellm.service — Phase 7 deploys either template under the same `litellm`
 # unit name.

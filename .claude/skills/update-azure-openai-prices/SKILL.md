@@ -47,7 +47,7 @@ Standard, `--region <name>` for another region.
 |---|---|---|
 | `0` | in sync | Stop and report prices unchanged. A no-op diff wastes the user's review attention. |
 | `1` | drift | Go to Step 2. |
-| `2` | a meter was missing | Azure may not sell that model, or the id may not follow `gpt-<family>-<tier>`. Report which model and stop — never guess a rate. |
+| `2` | a meter was missing | Azure may not sell that model in this region/scope, the id may not follow `gpt-<family>-<tier>`, or Azure invented yet another meter spelling (GPT-6 already mixes `6-astra`, `6.1-sol` and `61 terra` — extend `meter_prefixes()`). Report which model and stop — never guess a rate. |
 
 ## Step 2 — apply the new rates
 
@@ -55,20 +55,22 @@ Only when Step 1 reported drift. Everything lives in
 `linux/configs/litellm-config.yaml`; `CLAUDE.md` deliberately holds no figures,
 so leave it alone unless the *mechanism* changed.
 
-**1. The rate blocks.** Each deployment's `model_info` holds the six keys, which
-the script prints per model in the exact order and float format the file uses —
-paste them as printed rather than retyping, since a transposed exponent here is
-invisible until someone reads a bill.
+**1. The rate blocks.** Each deployment's `model_info` holds the eight rate keys
+(input, output, cache read, cache write — each also `_above_272k_tokens`),
+which the script prints per model in the exact order and float format the file
+uses — paste them as printed rather than retyping, since a transposed exponent
+here is invisible until someone reads a bill. Leave the GPT-6 entries'
+capability keys (`max_input_tokens`, `supports_*`) alone; they are not prices.
 
 **2. The `$/1M` table** in the comment block above `model_list`
 (`grep -n 'Verified' linux/configs/litellm-config.yaml` lands in it). The
 script's `$/1M` line per model is already in that table's column order
-(in / cached-in / out), which is *not* the order of the YAML keys. Also update
-the `Verified …` date to today and, in the reprice-watch note lower in the
-block, the meter date that counts as "unchanged".
+(in / cached-in / cache-wr / out), which is *not* the order of the YAML keys.
+Also update the `Verified …` date to today and the meter date after which
+"Azure repriced" (the newest `meters effective` date the script printed).
 
-If Azure has finally matched an OpenAI price cut, delete the notes saying it had
-*not*. A stale explanation is worse than none, because the next reader trusts it.
+A stale explanation is worse than none, because the next reader trusts it: if
+a note in that comment block no longer matches the feed, fix or delete it.
 
 ## Step 3 — verify
 

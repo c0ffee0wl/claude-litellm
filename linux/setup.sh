@@ -212,13 +212,18 @@ fi
 #############################################################################
 
 LITELLM_PORT=4000
+# Input window Claude Code is told to believe for the gateway's model ids
+# (CLAUDE_CODE_MAX_CONTEXT_TOKENS, Phase 5a): the smallest any served tier
+# takes. Every tier served here, GPT-6 and the GPT-5.6 fallback targets alike,
+# takes 922K input + 128K output (the 1.05M often quoted is the total window).
+GPT_CONTEXT_TOKENS=922000
 # Unified Anthropic /v1/messages endpoint — translates to any provider in
 # model_list. NOT the /anthropic pass-through (that one only proxies to api.anthropic.com).
 ANTHROPIC_GATEWAY_URL="http://127.0.0.1:${LITELLM_PORT}"
 USER_TOOL_PATH="${HOME}/.local/bin:${HOME}/.bun/bin:/usr/local/bin:/usr/bin:/bin"
 # uv tool venv bin first: `prisma` CLI lives there (we install via --with prisma),
 # and LiteLLM shells out to `prisma migrate deploy` on startup
-# (--use_v2_migration_resolver in the unit). Without this, the schema sync
+# (USE_V2_MIGRATION_RESOLVER in the unit). Without this, the schema sync
 # silently fails and UI-required tables like LiteLLM_UserTable never get created.
 # Kept separate from USER_TOOL_PATH: the venv exposes generic names (httpx,
 # openai, fastapi, nodeenv, mcp, …) that would shadow system tools for unrelated
@@ -232,47 +237,53 @@ LITELLM_PATH="${HOME}/.local/share/uv/tools/litellm/bin:${USER_TOOL_PATH}"
 # schema DOWNGRADE, the one direction that destroys data (CLAUDE.md > "DB schema
 # posture"). Pinning both to the same value makes that unreachable.
 #
-# BUMP DELIBERATELY (same discipline as the claude-devtools release tag). Verify
-# all four criteria before moving it — they diverge; recipe in CLAUDE.md:
-#   1.97.0 (verified 2026-08-23): ghcr manifest 200; upstream git tag
-#   ef84494d52c6708e4e9f4a54ce551a265995ad8f; the tag's committed uv.lock pins
-#   fastapi 0.136.3 (so #35763 cannot reach inside the image — the check the
-#   native LITELLM_FASTAPI_GUARD can't perform); image .created 2026-08-16, past
-#   the uv cooldown. 1.97.1 does not exist; the 1.97 line has one release.
-# Above the compromised 1.82.7/1.82.8, and 1.97.0 pins litellm-proxy-extras
-# ==0.4.84 — the release whose heal_incomplete_nodeenv_cache and separate
-# bootstrap budget make configs/litellm-prisma.env's LITELLM_PRISMA_* values
-# live (they are inert against the 0.4.81 that litellm <=1.96.2 pins).
-LITELLM_VERSION='1.97.0'
+# BUMP DELIBERATELY (same discipline as the claude-devtools release tag). This
+# is the ONE place the bump criteria live — verify all four, they diverge (the
+# v1.93.0-era counter-example: 1.93.1 was on PyPI and ghcr.io with NO upstream
+# git tag, a same-day backport lane):
+#   (1) aged past the ~7-day uv cooldown (ghcr config blob .created);
+#   (2) git-tagged upstream (auditable source);
+#   (3) the tag's committed uv.lock is sane — the image builds with
+#       `uv sync --frozen`, so a dependency regression (e.g. a fastapi like
+#       BerriAI/litellm#35763) can only be checked there for --docker;
+#   (4) the ghcr manifest exists:
+#         T=$(curl -s "https://ghcr.io/token?scope=repository:berriai/litellm:pull" | jq -r .token)
+#         curl -sI -H "Authorization: Bearer $T" https://ghcr.io/v2/berriai/litellm/manifests/vX.Y.Z
+#   1.108.0 (verified 2026-11-13): ghcr manifest 200; upstream git tag
+#   b48077ff9ef6b14dd3f188d020ee7f40e2c5ebca; the tag's committed uv.lock pins
+#   fastapi 0.136.3; image .created 2026-11-04, past the uv cooldown. A
+#   mainline release (1.108.1+ are same-week patch releases; re-check them
+#   once aged in).
+# Beyond the four, re-verify on every bump what this repo leans on (CLAUDE.md
+# > "Model naming" / "DB schema posture"), all checked for 1.108.0 against the
+# wheel AND a live proxy driven by a fake Responses upstream:
+#   * /v1/messages still takes the Responses adapter for custom_llm_provider
+#     "openai" (_RESPONSES_API_PROVIDERS, now under llms/anthropic/pass_through/
+#     — moved from experimental_pass_through/); the new Rust bridge serves
+#     /v1/messages only for anthropic/deepseek/vertex_ai, so ours stays Python;
+#   * router fallbacks fire on a 404 and a 500 (streaming and not);
+#   * model_info capability pins steer effort normalization;
+#   * every litellm-config.yaml key and every LITELLM_PRISMA_* knob is read.
+# Above the compromised 1.82.7/1.82.8. 1.108.0 pins litellm-proxy-extras
+# ==0.4.110: 75 migrations past 1.97.0's 0.4.84, all additive (no DROP or
+# TRUNCATE; the two SpendLogs index migrations are `SELECT 1` — the serving
+# proxy builds those indexes in the background via psycopg). A bump that ships
+# migrations is ONE-WAY, so Phase 6 dumps the DB before the first start of a
+# new version (backup_litellm_db, common.sh) — the only rollback path.
+# 1.108.0 also contains the fastapi fix for BerriAI/litellm#35763
+# (get_flat_params, now in proxy/list_api/common.py), so the former
+# LITELLM_FASTAPI_GUARD ceiling is gone. Verify such fixes by grepping the
+# wheel, never by comparing SHAs (recipe in CLAUDE.md > Setup Phases > 4a).
+LITELLM_VERSION='1.108.0'
 # The uv requirement string for LiteLLM — one definition for the fresh-install
 # and upgrade paths in Phase 4a, so a version bump can't skew the two. An exact
 # `==` pin, not a floor: see LITELLM_VERSION. `uv tool install --upgrade` is
 # therefore a no-op on an already-pinned box; the Prisma regenerate gate keys
 # on a provenance stamp rather than on any "did it upgrade" flag.
 LITELLM_SPEC="litellm[proxy,proxy-runtime]==${LITELLM_VERSION}"
-# fastapi ceiling for the LiteLLM venv: litellm >=1.95.0 crash-loops on
-# fastapi >=0.140.7 (issue BerriAI/litellm#35763; full story in CLAUDE.md >
-# Setup Phases > 4a). DROP once a litellm release containing upstream merge
-# ecba48d has aged past the uv cooldown.
-# Verify by grepping the wheel, NOT by comparing SHAs (recipe + why in CLAUDE.md).
-# Checked 2026-08-23 — 1.96.2 and 1.97.0 both still import `get_flat_dependant`;
-# v1.98.0 is the FIRST release importing `get_flat_params`, i.e. the release to
-# move LITELLM_VERSION to in order to drop this guard.
-#
-# READ THE NAG'S REACH HONESTLY: LITELLM_FASTAPI_GUARD_STALE_ABOVE names the
-# newest release verified broken, and Phase 4a compares it against the INSTALLED
-# litellm. Since LITELLM_SPEC is an exact `==` pin, the installed version can
-# only exceed the marker after a human edits LITELLM_VERSION — so the nag is a
-# reminder attached to a deliberate bump, NOT an aging-in detector. Nothing
-# fires on its own when a fixed litellm or a fastapi security release ships;
-# re-check this pin whenever you touch LITELLM_VERSION. (Same for
-# LITELLM_PYTHON_PIN_STALE_ABOVE below: prisma-client-py's version is pinned
-# transitively by the litellm pin, so it too only moves on a deliberate bump.)
-LITELLM_FASTAPI_GUARD='fastapi<0.140.7'
-LITELLM_FASTAPI_GUARD_STALE_ABOVE='1.97.0'
 # Interpreter for the LiteLLM venv. Neither package's requires-python excludes
 # 3.14 (litellm >=3.10,<3.15; prisma >=3.8.0), so this cannot be derived — it is
-# an explicit pin with a staleness nag, like LITELLM_FASTAPI_GUARD above.
+# an explicit pin with a staleness nag.
 # Why: Kali moved to Python 3.14, `uv tool install` rebuilt the venv onto it, and
 # prisma-client-py 0.15.0 predates 3.14 and does not test against it. The
 # `'Prisma' object has no attribute '_Prisma__engine' and no __dict__ for
@@ -283,18 +294,21 @@ LITELLM_FASTAPI_GUARD_STALE_ABOVE='1.97.0'
 # (Phase 4a) regenerates the client automatically. Where the pinned interpreter
 # is absent, uv fetches a managed CPython. Override by editing this line.
 LITELLM_PYTHON_PIN='3.13'
+# The nag only fires after a deliberate LITELLM_VERSION bump moves
+# prisma-client-py (pinned transitively by the litellm pin) — a reminder
+# attached to a bump, not an aging-in detector.
 LITELLM_PYTHON_PIN_STALE_ABOVE='0.15.0'   # newest prisma-client-py verified against the pin
 # The uv --with set shared by both Phase 4a install paths — one definition so
-# the guard drop (or a future addition) can't skew fresh-install vs upgrade,
-# same rule as LITELLM_SPEC above.
-# psycopg is why this list has a third entry: it is a DEV-only dependency of
-# litellm, and without it litellm-proxy-extras' _warn_if_db_ahead_of_head()
-# returns silently on ImportError — the only thing that reports a DB newer than
-# this build's schema. Deliberately unpinned (unlike LITELLM_SPEC): diagnostic
-# only, nothing imports it at request time. It is necessary but NOT sufficient
-# on this repo's socket-first Postgres — CLAUDE.md > "DB schema posture" has the
-# caveat and what actually guards against a downgrade.
-LITELLM_UV_WITH=(--with prisma --with 'psycopg[binary]' --with "$LITELLM_FASTAPI_GUARD")
+# an addition can't skew fresh-install vs upgrade, same rule as LITELLM_SPEC.
+# psycopg sits in litellm's `extra-proxy` extra, which LITELLM_SPEC does not
+# request, so it is added here. Two consumers: litellm-proxy-extras'
+# _warn_if_db_ahead_of_head() returns silently on ImportError (the only thing
+# that reports a DB newer than this build's schema), and since 0.4.110 the
+# background request-log index build after `migrate deploy` connects through
+# it. Unpinned (unlike LITELLM_SPEC) — litellm bounds it itself (>=3.2,<4).
+# Necessary but NOT sufficient against a downgrade on this repo's socket-first
+# Postgres — CLAUDE.md > "DB schema posture" has the caveat.
+LITELLM_UV_WITH=(--with prisma --with 'psycopg[binary]')
 # LiteLLM runtime state directory. config.yaml, the env file, and (under
 # --docker) docker-compose.yml MUST stay siblings here: the docker unit's
 # WorkingDirectory points at this dir and the compose file mounts ./config.yaml
@@ -327,23 +341,18 @@ ENDPOINT_DNS_DEAD=()
 # Rootless Docker daemon socket (used by the --docker paths in Phase 7).
 DOCKER_SOCK="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/docker.sock"
 
-# docker against the rootless daemon — keeps the DOCKER_HOST pinning (rootless
-# socket, not the default CLI context) in one place. Used by the --docker paths
-# in Phase 7.
-rootless_docker() {
-    DOCKER_HOST="unix://${DOCKER_SOCK}" docker "$@"
-}
-# docker compose against the deployed compose file — as an argv array too, so
-# `timeout` (which cannot exec a shell function) can wrap the same command.
-LITELLM_COMPOSE=(env "DOCKER_HOST=unix://${DOCKER_SOCK}" docker compose -f "${LITELLM_CONFIG_DIR}/docker-compose.yml")
-litellm_compose() {
-    "${LITELLM_COMPOSE[@]}" "$@"
-}
+# docker against the rootless daemon (its socket, not the default CLI context)
+# and compose against the deployed file — the DOCKER_HOST pinning lives only
+# here. argv arrays, not functions, so `timeout` can wrap them. Used by the
+# --docker paths in Phase 7.
+ROOTLESS_DOCKER=(env "DOCKER_HOST=unix://${DOCKER_SOCK}" docker)
+LITELLM_COMPOSE=("${ROOTLESS_DOCKER[@]}" compose -f "${LITELLM_CONFIG_DIR}/docker-compose.yml")
 
 # Claude Code presence — the installer usually puts `claude` on PATH, but a
-# fresh install in this same run may only exist at ~/.local/bin yet.
+# fresh install in this same run may only exist at ~/.local/bin yet
+# (claude_launcher, common.sh, owns that resolution).
 have_claude() {
-    command -v claude &>/dev/null || [ -x "${HOME}/.local/bin/claude" ]
+    [ -x "$(claude_launcher)" ]
 }
 
 #############################################################################
@@ -556,8 +565,8 @@ prisma_stamp_for() {
     printf '%s|%s|%s|%s\n' "$litellm_ver" "$sha" "$generator_ver" "$pyver"
 }
 
-# The venv the litellm tool lives in — needed by the toolchain work below and by
-# the staleness nags above it, so it is resolved once here.
+# The venv the litellm tool lives in — needed by the toolchain work and the
+# staleness nag below, so it is resolved once here.
 UV_LITELLM_VENV="${HOME}/.local/share/uv/tools/litellm"
 
 # Skipped under --docker: the ghcr.io/berriai/litellm image already bundles
@@ -590,7 +599,7 @@ if [ "$WITH_LOCAL_LITELLM" = "true" ] && [ "$DOCKER_MODE" != "true" ]; then
     # ABORT BELT ONLY — the normal path never starts litellm before Phase 7
     # (see the end of 4a). An unexpected `set -e` abort anywhere between here
     # and Phase 7's own start would otherwise leave the proxy down (and
-    # masked) with nothing to bring it back (no timer, updates are manual).
+    # start-held) with nothing to bring it back (no timer, updates are manual).
     # Release the hold unconditionally (also clears a stale one a killed
     # earlier run left), then start an inactive unit — unless there is no unit
     # yet (fresh install: deployed in Phase 7) or no Prisma client to import
@@ -624,8 +633,6 @@ if [ "$WITH_LOCAL_LITELLM" = "true" ] && [ "$DOCKER_MODE" != "true" ]; then
         litellm_ver_before="$(litellm_tool_version)"
         log "LiteLLM present at $LITELLM_BIN (${litellm_ver_before:-unknown}) — converging to pinned ${LITELLM_VERSION} (python ${LITELLM_PYTHON_PIN})..."
         if uv tool install --upgrade --python "$LITELLM_PYTHON_PIN" "${LITELLM_UV_WITH[@]}" "$LITELLM_SPEC"; then
-            # 19: assign litellm_ver_now directly — no second variable read
-            # back through a `:-` fallback below.
             litellm_ver_now="$(litellm_tool_version)"
             if [ "$litellm_ver_before" != "$litellm_ver_now" ]; then
                 log "LiteLLM ${litellm_ver_before:-?} -> ${litellm_ver_now:-?}"
@@ -651,18 +658,11 @@ if [ "$WITH_LOCAL_LITELLM" = "true" ] && [ "$DOCKER_MODE" != "true" ]; then
             || error "LiteLLM ${LITELLM_VERSION} install failed — if this box has a uv cooldown (~/.config/uv/uv.toml exclude-newer), the pin may not have aged in yet. LiteLLM is left stopped; the rest of the run continues."
         # To enable optional LiteLLM features, add `extra_proxy` to the extras in
         # LITELLM_SPEC: RedisVL semantic caching, Google Cloud KMS + Azure Key
-        # Vault as secret backends, and Resend for email — plus prisma, which
-        # makes LITELLM_UV_WITH's --with prisma redundant.
+        # Vault as secret backends, and Resend for email — plus prisma and
+        # psycopg, which make LITELLM_UV_WITH redundant.
     fi
 
     litellm_ver_now="${litellm_ver_now:-$(litellm_tool_version)}"
-    # Both pins below are live constraints that would otherwise rot silently —
-    # nag the moment the thing they were verified against is no longer newest.
-    # The fastapi ceiling sits on a network-facing framework, so a stale one
-    # also holds back its security releases.
-    if version_newer_than "$litellm_ver_now" "$LITELLM_FASTAPI_GUARD_STALE_ABOVE"; then
-        warn "litellm ${litellm_ver_now} > ${LITELLM_FASTAPI_GUARD_STALE_ABOVE}: check whether it contains upstream merge ecba48d (PR BerriAI/litellm#35773, issue #35763) — grep the wheel for get_flat_params, do NOT compare SHAs (see LITELLM_FASTAPI_GUARD). If present drop LITELLM_FASTAPI_GUARD, else bump LITELLM_FASTAPI_GUARD_STALE_ABOVE"
-    fi
     # The Python pin exists because prisma-client-py 0.15.0 predates 3.14; a
     # newer release may well support it, at which point the pin can be dropped.
     prisma_py_ver="$(litellm_venv_pkg_version prisma)"
@@ -893,7 +893,7 @@ if [ "$WITH_LOCAL_LITELLM" = "true" ] && [ "$DOCKER_MODE" != "true" ]; then
                 # prevent. It sits at the venv root, which uv may keep across an
                 # in-place rebuild; the interpreter and generator fields in
                 # prisma_stamp_for are what cover that case.
-                printf '%s\n' "$prisma_stamp_want" > "$prisma_stamp_file"
+                write_state_file "$prisma_stamp_file" "$prisma_stamp_want"
                 log "Prisma client generated ($((SECONDS - prisma_generate_started))s)"
             else
                 rm -f "$prisma_stamp_file"
@@ -1112,10 +1112,10 @@ fi
 # Third fallback, local-LiteLLM modes only: the deployed EnvironmentFile. Phase
 # 5b already treats that file as a persistent home for provider secrets — it
 # carries forward any the collector didn't find — so a box whose .env was
-# deleted after a successful install KEEPS serving azure/gpt-5.6-* while Phase
+# deleted after a successful install KEEPS serving the azure/gpt-* tiers while Phase
 # 5a used to see no Azure credentials at all. The visible symptom of that
 # asymmetry was the CLAUDE_CODE_MAX_CONTEXT_TOKENS scrub below firing on a box
-# whose models still take 1.05M input: Claude Code silently dropped back to
+# whose models still take ~1M input: Claude Code silently dropped back to
 # believing 200K and auto-compacted five times too early. Scoped to
 # WITH_LOCAL_LITELLM because only there is this file the credentials the
 # gateway will actually run with — under --harden-only it may be a leftover
@@ -1123,35 +1123,31 @@ fi
 # serve.
 _azure_env_file=""
 [ "$WITH_LOCAL_LITELLM" = "true" ] && _azure_env_file="$LITELLM_ENV_FILE"
-_azure_endpoint_raw="${AZURE_RESOURCE_ENDPOINT:-$(read_profile_export "AZURE_RESOURCE_ENDPOINT")}"
-if [ -z "$_azure_endpoint_raw" ] && [ -n "$_azure_env_file" ]; then
-    _azure_endpoint_raw="$(read_env_file_var "$_azure_env_file" AZURE_RESOURCE_ENDPOINT)"
-fi
+# Both halves of the pair resolve through the SAME chain — environment, then
+# ~/.profile, then the deployed env file. When they didn't (the key lacked the
+# ~/.profile fallback), Azure creds exported only in ~/.profile and setup run
+# from a shell that never sourced it left the gateway with working credentials
+# while the Phase 5a gate below wrote all four model selectors EMPTY and fired
+# the misleading "no Azure credentials" banner.
+# Usage: resolve_azure_var NAME   (prints the value, or nothing)
+resolve_azure_var() {
+    local v="${!1:-}"
+    [ -n "$v" ] || v="$(read_profile_export "$1")"
+    [ -n "$v" ] || [ -z "$_azure_env_file" ] || v="$(read_env_file_var "$_azure_env_file" "$1")"
+    printf '%s' "$v"
+}
+_azure_endpoint_raw="$(resolve_azure_var AZURE_RESOURCE_ENDPOINT)"
 if [ -n "$_azure_endpoint_raw" ]; then
     AZURE_RESOURCE_ENDPOINT="$(normalize_azure_v1_endpoint "$_azure_endpoint_raw")"
     export AZURE_RESOURCE_ENDPOINT
 fi
-unset _azure_endpoint_raw
-
-# Same ~/.profile fallback for the key half of the pair. Without it the two
-# halves resolve from different sources: with Azure creds exported only in
-# ~/.profile (a supported discovery location — Phase 5b's collector reads it)
-# and setup run from a shell that never sourced it, the endpoint resolves and
-# the key doesn't, so the gateway gets working credentials while the Phase 5a
-# gate below writes all four model selectors EMPTY and fires the misleading
-# "no Azure credentials" banner.
-if [ -z "${AZURE_OPENAI_API_KEY:-}" ]; then
-    _azure_key_raw="$(read_profile_export "AZURE_OPENAI_API_KEY")"
-    if [ -z "$_azure_key_raw" ] && [ -n "$_azure_env_file" ]; then
-        _azure_key_raw="$(read_env_file_var "$_azure_env_file" AZURE_OPENAI_API_KEY)"
-    fi
-    if [ -n "$_azure_key_raw" ]; then
-        AZURE_OPENAI_API_KEY="$_azure_key_raw"
-        export AZURE_OPENAI_API_KEY
-    fi
-    unset _azure_key_raw
+_azure_key_raw="$(resolve_azure_var AZURE_OPENAI_API_KEY)"
+if [ -n "$_azure_key_raw" ]; then
+    AZURE_OPENAI_API_KEY="$_azure_key_raw"
+    export AZURE_OPENAI_API_KEY
 fi
-unset _azure_env_file
+unset -f resolve_azure_var
+unset _azure_endpoint_raw _azure_key_raw _azure_env_file
 
 # 5a. Gateway URL + telemetry → ~/.profile (client-side; runs in every mode).
 # These are the single source of truth for Claude Code's connection to LiteLLM —
@@ -1261,7 +1257,7 @@ done <<< "$managed_env_toggles"
 #     `/fork` works without it (default v2.1.161+); the var additionally lets Claude
 #     auto-spawn forks and routes all subagent spawns to background (already the
 #     v2.1.198 default). Model-agnostic: the fork inherits the session's gateway id
-#     (azure/gpt-5.6-terra) — no hardcoded claude-* id, no 404. Its advertised cost win
+#     (azure/gpt-6.1-terra) — no hardcoded claude-* id, no 404. Its advertised cost win
 #     (parent prompt-cache reuse) is Anthropic-cache-specific; over LiteLLM→Azure it
 #     degrades to a normal full-context request.
 profile_toggle "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"          "75"
@@ -1309,20 +1305,24 @@ NEEDS_MODEL_CONFIG=0
 # end-of-script banner never fires in that mode.
 if [ "$WITH_GATEWAY" = "true" ]; then
     if [ -n "${AZURE_OPENAI_API_KEY:-}" ] && [ -n "${AZURE_RESOURCE_ENDPOINT:-}" ]; then
-        update_profile_export "ANTHROPIC_DEFAULT_HAIKU_MODEL"  "azure/gpt-5.6-luna"
-        update_profile_export "ANTHROPIC_DEFAULT_SONNET_MODEL" "azure/gpt-5.6-terra"
-        update_profile_export "ANTHROPIC_DEFAULT_OPUS_MODEL"   "azure/gpt-5.6-terra"
-        # fable -> sol; 404s without a gpt-5.6-sol deployment (CLAUDE.md > "Model naming")
-        update_profile_export "ANTHROPIC_DEFAULT_FABLE_MODEL"  "azure/gpt-5.6-sol"
+        # The GPT-6 generation. Each id must exist as a model_name in
+        # litellm-config.yaml, whose router fallbacks degrade a missing or
+        # failing GPT-6 deployment onto GPT-5.6 — so a box whose Azure resource
+        # lacks one of these still works (CLAUDE.md > "Model naming").
+        update_profile_export "ANTHROPIC_DEFAULT_HAIKU_MODEL"  "azure/gpt-6-luna"
+        update_profile_export "ANTHROPIC_DEFAULT_SONNET_MODEL" "azure/gpt-6.1-terra"
+        update_profile_export "ANTHROPIC_DEFAULT_OPUS_MODEL"   "azure/gpt-6.1-sol"
+        # fable = the premium tier, never auto-selected (by far the costliest)
+        update_profile_export "ANTHROPIC_DEFAULT_FABLE_MODEL"  "azure/gpt-6-astra"
         # Believed context window: CC assumes 200K for unrecognized gateway
         # ids and no documented knob raises it (anthropics/claude-code#68522).
         # This undocumented pair does (issue-thread workaround, deploy-verified
         # 2026-07-30; third-party gateway docs use the same mechanism).
-        # Session-global, so written only on this Azure path where every
-        # served tier takes 1.05M input; a /ui-added smaller-window model
+        # Session-global, so it must be the SMALLEST input window any served
+        # tier has: GPT_CONTEXT_TOKENS (922K, see its definition). A /ui-added smaller-window model
         # would be over-believed -> API 400s before compaction fires. See
         # CLAUDE.md > "Model naming".
-        update_profile_export "CLAUDE_CODE_MAX_CONTEXT_TOKENS" "1000000"
+        update_profile_export "CLAUDE_CODE_MAX_CONTEXT_TOKENS" "$GPT_CONTEXT_TOKENS"
         update_profile_export "CLAUDE_CODE_DISABLE_1M_CONTEXT" "0"
     else
         for var in ANTHROPIC_DEFAULT_HAIKU_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_DEFAULT_FABLE_MODEL; do
@@ -1333,14 +1333,17 @@ if [ "$WITH_GATEWAY" = "true" ]; then
             fi
         done
         # Box flipped Azure -> no-Azure (creds removed, /ui model instead):
-        # drop the 1M belief written by the branch above, or CC keeps assuming
-        # a 1.05M window for a possibly-200K /ui model -> API 400s before
+        # drop the belief written by the branch above, or CC keeps assuming
+        # a ~1M window for a possibly-200K /ui model -> API 400s before
         # auto-compact fires. Value-scoped so a manual window (CLAUDE.md tells
-        # no-Azure users to set their model's real limit) is preserved.
-        if [ "$(read_profile_export "CLAUDE_CODE_MAX_CONTEXT_TOKENS")" = "1000000" ]; then
+        # no-Azure users to set their model's real limit) is preserved;
+        # 1000000 is the value the GPT-5.6-era setup.sh wrote.
+        _ctx="$(read_profile_export "CLAUDE_CODE_MAX_CONTEXT_TOKENS")"
+        if [ "$_ctx" = "$GPT_CONTEXT_TOKENS" ] || [ "$_ctx" = "1000000" ]; then
             remove_profile_export "CLAUDE_CODE_MAX_CONTEXT_TOKENS"
             remove_profile_export "CLAUDE_CODE_DISABLE_1M_CONTEXT"
         fi
+        unset _ctx
     fi
     # Discovery: populate /model from the gateway's /v1/models (CC >=2.1.129;
     # claude-*/anthropic-* ids only; also needs LiteLLM >=1.95.0 — the
@@ -1496,10 +1499,12 @@ if [ "$WITH_LOCAL_LITELLM" = "true" ]; then
     # (`:${pg_port}` on a drifted cluster) — the dbname pin keeps tunnel URLs
     # to other databases external. The socket globs require `:` or `/`
     # immediately after `localhost` (hosts merely prefixed with "localhost"
-    # stay external) and the exact query tail; the portless form is the URL
-    # shape older installs wrote.
+    # stay external) and the exact query tail; the `%2Frun%2Fpostgresql`
+    # authority is the current shape (see socket_tail below), the `localhost`
+    # forms are what older installs wrote.
     if [ -n "${DATABASE_URL:-}" ] \
        && [[ "${DATABASE_URL}" != postgresql://litellm:*@127.0.0.1:*/litellm ]] \
+       && [[ "${DATABASE_URL}" != postgresql://litellm:*@%2Frun%2Fpostgresql:*/litellm\?host=/run/postgresql ]] \
        && [[ "${DATABASE_URL}" != postgresql://litellm:*@localhost:*/litellm\?host=/run/postgresql ]] \
        && [[ "${DATABASE_URL}" != postgresql://litellm:*@localhost/litellm\?host=/run/postgresql ]]; then
         log "DATABASE_URL set externally — skipping local Postgres install"
@@ -1616,7 +1621,7 @@ if [ "$WITH_LOCAL_LITELLM" = "true" ]; then
         # Preflight the socket URL and only then commit it, falling back so no
         # existing install can be broken by the switch — a hand-edited pg_hba
         # or otherwise failed socket auth costs a warning, not the proxy. The
-        # port rides the URL *authority* (@localhost:PORT/), which libpq and
+        # port rides the URL *authority* (@%2Frun%2Fpostgresql:PORT/), which libpq and
         # Prisma both parse; a &port= query param is only libpq-verified. The
         # probe URL carries no password (see pg_url_works). On a first-probe
         # failure, force the postmaster to re-read pg_hba (pg_reload_conf —
@@ -1626,10 +1631,27 @@ if [ "$WITH_LOCAL_LITELLM" = "true" ]; then
         # reload never landed — the shape ensure_pg_socket_scram_rule's
         # file-presence idempotence check cannot see.
         ensure_pg_socket_scram_rule
-        socket_tail="localhost:${pg_port}/litellm?host=/run/postgresql"
+        # The socket rides the URL TWICE, once per client library, because the
+        # two read different parts of it:
+        #   * Prisma (schema + query engine) only takes a socket from the
+        #     `?host=` query param — a percent-encoded authority alone fails
+        #     P1001 ("Can't reach database server at `%2Frun%2Fpostgresql`").
+        #   * litellm-proxy-extras >=0.4.110 also opens psycopg connections
+        #     (the migration lock every start takes, the ledger reads, the
+        #     request-log index build) through _strip_prisma_query_params,
+        #     which keeps only a libpq allow-list that lacks `host` — so with
+        #     a `localhost` authority they silently go to TCP localhost: on a
+        #     box without a TCP listener (and ALWAYS under --docker, where
+        #     localhost is the container) the lock fails and the proxy exits 2
+        #     on every start. libpq reads a percent-encoded socket directory
+        #     in the authority, which the stripping preserves.
+        # Verified on litellm 1.108.0 against a socket-only cluster: the
+        # `localhost` form exits 2, the authority-only form fails in Prisma,
+        # this form migrates and serves.
+        socket_tail="%2Frun%2Fpostgresql:${pg_port}/litellm?host=/run/postgresql"
         probe_url="postgresql://litellm@${socket_tail}"
         if pg_url_works "$probe_url" "$LITELLM_DB_PASSWORD" \
-           || { sudo -u postgres psql -qAtc 'SELECT pg_reload_conf()' >/dev/null 2>&1
+           || { pg_reload
                 sleep 1
                 pg_url_works "$probe_url" "$LITELLM_DB_PASSWORD"; }; then
             LITELLM_DB_URL="postgresql://litellm:${LITELLM_DB_PASSWORD}@${socket_tail}"
@@ -1645,6 +1667,20 @@ if [ "$WITH_LOCAL_LITELLM" = "true" ]; then
         else
             LITELLM_DB_URL="postgresql://litellm:${LITELLM_DB_PASSWORD}@127.0.0.1:${pg_port}/litellm"
             warn "Postgres socket auth failed — keeping the TCP URL. Check the 'local litellm litellm scram-sha-256' line in pg_hba.conf and that the role password matches LITELLM_DB_PASSWORD in ~/.config/litellm/env, then re-run setup.sh"
+        fi
+
+        # Rollback copy before a LiteLLM version that has never run against
+        # this DB migrates it, one-way (backup_litellm_db, common.sh). HERE, not
+        # at Phase 7's start: the sudo calls just above guarantee a live sudo
+        # timestamp (Phase 7's --docker image pre-pull can outlast it, and the
+        # dump runs `sudo -n`), and nothing has started the new version yet.
+        # The version is what Phase 7 will start: native = what uv actually
+        # installed (a failed converge keeps the old one), docker = the image
+        # tag. Residual: a run that aborts between Phase 4a and here has its
+        # EXIT trap start a new native version undumped.
+        litellm_run_version="${litellm_ver_now:-$LITELLM_VERSION}"
+        if ! backup_litellm_db "$litellm_run_version"; then
+            warn "Could not dump the litellm DB before LiteLLM ${litellm_run_version} migrates it — starting anyway (the migrations are additive), but there is no rollback copy. Manual: sudo -u postgres pg_dump -Fc -d litellm > ~/litellm.dump"
         fi
     fi
 
@@ -1756,7 +1792,7 @@ if [ "$WITH_LOCAL_LITELLM" = "true" ]; then
             # project down directly, independent of the unit state. Idempotent; if
             # the daemon/socket is down there's no running container to orphan.
             if [ "$installed_litellm_variant" = "docker" ] && [ -f "${LITELLM_CONFIG_DIR}/docker-compose.yml" ]; then
-                litellm_compose down --remove-orphans 2>/dev/null || true
+                "${LITELLM_COMPOSE[@]}" down --remove-orphans 2>/dev/null || true
             fi
         fi
     fi
@@ -1804,7 +1840,7 @@ if [ "$WITH_LOCAL_LITELLM" = "true" ]; then
         # Talks to the rootless daemon started in Phase 2b.
         compose_image=$(awk '/^[[:space:]]*image:/{print $2; exit}' "${LITELLM_CONFIG_DIR}/docker-compose.yml")
         if [ -n "$compose_image" ] \
-            && rootless_docker image inspect "$compose_image" &>/dev/null; then
+            && "${ROOTLESS_DOCKER[@]}" image inspect "$compose_image" &>/dev/null; then
             log "LiteLLM image ${compose_image} already cached — skipping pull"
         else
             log "Pulling LiteLLM image (first run downloads ~367MB; cached afterwards; bounded at 15 min)..."
@@ -1893,6 +1929,9 @@ if [ "$WITH_LOCAL_LITELLM" = "true" ]; then
         # transient failure must not fail an otherwise complete deployment.
         if wait_for_litellm "$LITELLM_PORT" "$litellm_wait_budget"; then
             LITELLM_RUN_STATE=ready
+            # Readiness implies the startup schema sync finished: the DB is
+            # now at this version's schema.
+            [ -n "${pg_port:-}" ] && record_litellm_db_version "$litellm_run_version"
             for _dns_host in $(litellm_endpoint_hosts "$LITELLM_ENV_FILE"); do
                 case "$(endpoint_dns_state "$_dns_host")" in
                     ok) ;;
@@ -1921,7 +1960,7 @@ if [ "$WITH_LOCAL_LITELLM" = "true" ]; then
 fi
 
 #############################################################################
-# PHASE 8: Claude Code Managed Settings (only in full mode)
+# PHASE 8: Claude Code settings (8a/8e policy: full + --harden-only; 8b-8d: all modes)
 #############################################################################
 
 log "=== Phase 8: Claude Code Settings ==="
@@ -1957,7 +1996,7 @@ if [ "$WITH_POLICY" = "true" ]; then
     rm -f "$MANAGED_TMP"
 fi
 
-# 8b. /tmp/claude (sandbox prerequisite; bashrc-ct.sh is gone, do it here). Runs in
+# 8b. /tmp/claude (sandbox prerequisite). Runs in
 # every mode — no sudo needed, and the sandbox runtime now ships in all modes (incl.
 # --router-only, which can /sandbox on), so the prereq dir must exist everywhere.
 mkdir -p /tmp/claude
@@ -2230,10 +2269,12 @@ if [ "$CLAUDE_DEVTOOLS_RAM_OK" = "1" ]; then
         # versionsort.suffix is configured, and even with it a newer version's
         # rc with no final yet still sorts first — so an upstream rc/beta push
         # would otherwise silently become the pinned "latest release tag".
-        CLAUDE_DEVTOOLS_LATEST_TAG=$(cd "$CLAUDE_DEVTOOLS_DIR" && git ls-remote --refs --tags --sort=-v:refname origin 'v*' 2>/dev/null | grep -vE 'refs/tags/v?[0-9][^/]*-' | head -1 | awk -F'refs/tags/' '{print $2}' || true)
-        if [ -z "$CLAUDE_DEVTOOLS_LATEST_TAG" ]; then
-            CLAUDE_DEVTOOLS_LATEST_TAG=$(cd "$CLAUDE_DEVTOOLS_DIR" && git ls-remote --refs --tags --sort=-v:refname origin 2>/dev/null | grep -vE 'refs/tags/v?[0-9][^/]*-' | head -1 | awk -F'refs/tags/' '{print $2}' || true)
-        fi
+        # `v*` tags first; an upstream without the prefix falls back to all tags.
+        for tag_pattern in 'v*' ''; do
+            CLAUDE_DEVTOOLS_LATEST_TAG=$(cd "$CLAUDE_DEVTOOLS_DIR" && git ls-remote --refs --tags --sort=-v:refname origin ${tag_pattern:+"$tag_pattern"} 2>/dev/null | grep -vE 'refs/tags/v?[0-9][^/]*-' | head -1 | awk -F'refs/tags/' '{print $2}' || true)
+            [ -n "$CLAUDE_DEVTOOLS_LATEST_TAG" ] && break
+        done
+        unset tag_pattern
 
         # Defense in depth: a hostile upstream could push a tag with shell
         # metacharacters. Restrict to characters git allows in tag names that
@@ -2326,7 +2367,7 @@ fi
 # to live on port 12001. They were removed; this phase scrubs both from any
 # machine that ran an older setup. Runs in all modes (a previous --router-only
 # / full install on this host may have deployed them).
-LEGACY_HISTORY_SERVICE="${HOME}/.config/systemd/user/claude-history.service"
+LEGACY_HISTORY_SERVICE="$(user_unit_path claude-history)"
 LEGACY_CLAUDE_RUN_BIN="${HOME}/.bun/bin/claude-run"
 # -L, not bun_global_present: a DANGLING claude-run symlink still needs the
 # `bun remove -g` + link cleanup below (the helper deliberately reports a

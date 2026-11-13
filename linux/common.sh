@@ -209,14 +209,6 @@ update_profile_export() {
     escaped_value="${escaped_value//\$/\\\$}"    # $ -> \$
     escaped_value="${escaped_value//\`/\\\`}"    # ` -> \`
 
-    # For the sed replacement: double every backslash FIRST (sed consumes one
-    # level — without this `\"` lands as a bare `"` and a changed value with a
-    # quote, $ or backtick writes a broken/expanding line), then escape &
-    # (special in the replacement) and | (the s||| delimiter).
-    local sed_value="${escaped_value//\\/\\\\}"
-    sed_value="${sed_value//&/\\&}"              # & -> \&
-    sed_value="${sed_value//|/\\|}"              # | -> \|
-
     [ ! -f "$PROFILE_FILE" ] && touch "$PROFILE_FILE"
     # Already exactly this line? Skip the sed -i full-file rewrite — with
     # ~36 calls per setup run this keeps a no-op re-run from rewriting
@@ -232,10 +224,34 @@ update_profile_export() {
     if [ "$existing" = "export ${var_name}=\"${escaped_value}\"" ]; then
         return 0
     fi
+    local mode=""
     if [ -n "$existing" ]; then
-        sed -i "/^export ${var_name}=/{x;/^seen\$/{x;d};s/.*/seen/;x;s|^export ${var_name}=.*|export ${var_name}=\"${sed_value}\"|}" "$PROFILE_FILE"
+        mode=active
     elif grep -q "^#[[:space:]]*export ${var_name}=" "$PROFILE_FILE" 2>/dev/null; then
-        sed -i "s|^#[[:space:]]*export ${var_name}=.*|export ${var_name}=\"${sed_value}\"|" "$PROFILE_FILE"
+        mode=commented
+    fi
+    if [ -n "$mode" ]; then
+        # Rewrite in awk with the new line passed through the ENVIRONMENT, not
+        # argv: a `sed -i "s|…|<value>|"` put the value (the master key, on a
+        # rotation) in /proc/<pid>/cmdline, readable by every local user.
+        # active: rewrite the first export line, DELETE later duplicates (what
+        # login shells actually use is the last one, so collapsing them makes
+        # the next run a no-op); commented: un-comment every commented export.
+        # Written back through `cat >` so the file keeps its inode and mode.
+        local tmp
+        tmp=$(mktemp "${PROFILE_FILE}.XXXXXX")
+        UPE_NAME="$var_name" UPE_MODE="$mode" \
+        UPE_LINE="export ${var_name}=\"${escaped_value}\"" \
+            awk 'BEGIN { a = "^export " ENVIRON["UPE_NAME"] "="
+                         c = "^#[[:space:]]*export " ENVIRON["UPE_NAME"] "=" }
+                 ENVIRON["UPE_MODE"] == "active" && $0 ~ a {
+                     if (!seen) { print ENVIRON["UPE_LINE"]; seen = 1 }
+                     next }
+                 ENVIRON["UPE_MODE"] == "commented" && $0 ~ c {
+                     print ENVIRON["UPE_LINE"]; next }
+                 { print }' "$PROFILE_FILE" > "$tmp" \
+            && cat "$tmp" > "$PROFILE_FILE"
+        rm -f "$tmp"
     else
         echo "export ${var_name}=\"${escaped_value}\"" >> "$PROFILE_FILE"
     fi
@@ -485,14 +501,105 @@ unexport_secrets() {
 #             run aborted part-way)
 #   litellm = none | ready | not-ready | client-broken   (Phase 7's verdict;
 #             client-broken = deliberately left stopped, never restart it)
-# Written via a temp file in the SAME directory, so the mv is a real rename and
-# a reader never sees a partial file. Never fatal.
+# Written atomically (write_state_file). Never fatal.
 # Usage: write_run_status <outcome> [litellm-state]
 RUN_STATUS_FILE="${HOME}/.local/state/claude-litellm/run-status"
 write_run_status() {
-    mkdir -p "${RUN_STATUS_FILE%/*}" 2>/dev/null \
-        && printf 'outcome=%s\nlitellm=%s\n' "$1" "${2:-none}" > "${RUN_STATUS_FILE}.tmp" \
-        && mv -f "${RUN_STATUS_FILE}.tmp" "$RUN_STATUS_FILE" || true
+    write_state_file "$RUN_STATUS_FILE" "$(printf 'outcome=%s\nlitellm=%s' "$1" "${2:-none}")"
+}
+
+# Replace a small state file atomically: temp file in the SAME directory, so
+# the mv is a real rename and a reader never sees a partial file. Never fatal.
+# Usage: write_state_file <path> <content>   (a trailing newline is added)
+write_state_file() {
+    mkdir -p "${1%/*}" 2>/dev/null \
+        && printf '%s\n' "$2" > "${1}.tmp" \
+        && mv -f "${1}.tmp" "$1" || true
+}
+
+# Rollback insurance for LiteLLM version changes. LiteLLM migrates the schema
+# of the LOCAL `litellm` database at startup (`prisma migrate deploy`), and that
+# is one-way: an older LiteLLM against a newer schema is the downgrade
+# CLAUDE.md > "DB schema posture" warns about, and nothing in Prisma can undo
+# it. So before a version that has never come up against this database starts,
+# dump it; once that version answers readiness, record it as the DB's version.
+#   * LITELLM_DB_VERSION_FILE holds the last version that came up healthy. A
+#     box without it (first run of this code) is treated as changed, so it gets
+#     one dump — cheap, and the safe reading of "unknown".
+#   * A database with no `_prisma_migrations` table has nothing to lose (fresh
+#     install), so no dump.
+#   * pg_dump runs as the postgres superuser over the same pg_wrapper routing
+#     as Phase 6's psql calls (peer auth: no password in argv or env). Custom
+#     format (-Fc) is compressed by pg_dump itself, so the output goes through
+#     a plain redirect to a file — no pipe whose reader could outlive a hung
+#     writer (the run_bounded lesson) — and restores with pg_restore.
+#   * Bounded (600s) and never fatal: a failed dump costs a warning, not the
+#     gateway. The verified-additive migrations of a LITELLM_VERSION bump make
+#     starting without it the lesser risk.
+# Restore recipe: CLAUDE.md > Troubleshooting, "Rolling back a LiteLLM bump".
+# Dumps hold hashed keys and salt-encrypted provider credentials: mode 600 in
+# a 700 dir, newest LITELLM_DB_BACKUP_KEEP kept.
+LITELLM_DB_VERSION_FILE="${HOME}/.local/state/claude-litellm/litellm-db-version"
+LITELLM_DB_BACKUP_DIR="${HOME}/.local/state/claude-litellm/db-backups"
+LITELLM_DB_BACKUP_KEEP=3
+
+# Usage: backup_litellm_db <version-about-to-start>
+# Returns 1 only when a needed dump failed (the caller warns).
+backup_litellm_db() {
+    local want="$1" have="" ledger out
+    [ -f "$LITELLM_DB_VERSION_FILE" ] && have="$(head -n1 "$LITELLM_DB_VERSION_FILE" 2>/dev/null)"
+    [ "$have" = "$want" ] && return 0
+    # A recorded version NEWER than the one about to start is a schema
+    # downgrade — the case CLAUDE.md > "Rolling back a LiteLLM bump" says to
+    # do by RESTORING a dump, never by just lowering the pin. Still dump (a
+    # copy of the newer state is the only way back to it), but say so.
+    if [ -n "$have" ] && version_newer_than "$have" "$want"; then
+        warn "LiteLLM ${have} last ran against this DB and ${want} is about to start — that is a schema DOWNGRADE (columns/tables the older build doesn't know stay behind). To roll back, restore the pre-${have} dump instead (CLAUDE.md > Troubleshooting, 'Rolling back a LiteLLM bump')."
+    fi
+    # sudo -n: fail fast instead of sitting on a password prompt — the ct-*
+    # overlays run this as a deploy user whose sudoers allow-list must grant
+    # postgres-side psql AND pg_dump (their LITELLM_PG_CMDS). Tri-state, so a
+    # failed probe (sudo refused, psql error) is reported, never mistaken for
+    # the fresh-install "no ledger" answer.
+    ledger="$(sudo -n -u postgres psql -d litellm -tAc \
+        "SELECT to_regclass('public._prisma_migrations') IS NOT NULL" 2>/dev/null || true)"
+    case "$ledger" in
+        t) ;;
+        f) return 0 ;;   # no migrations ledger yet: fresh DB, nothing to lose
+        *) return 1 ;;
+    esac
+    # The stamp is user-writable: keep its value out of the path's structure.
+    have="${have//[^A-Za-z0-9._-]/_}"
+    # One dump per transition. The stamp is only written once the new version
+    # answers readiness, so a migrated-but-not-ready start leaves `have`
+    # unchanged; dumping again would capture the ALREADY-MIGRATED schema under
+    # the same "before" label, and enough such runs would prune the genuine
+    # pre-migration copy away.
+    if compgen -G "${LITELLM_DB_BACKUP_DIR}/litellm-${have:-unknown}-before-${want}-*.dump" >/dev/null; then
+        log "DB backup for LiteLLM ${have:-<unrecorded>} -> ${want} already taken — keeping it"
+        return 0
+    fi
+    out="${LITELLM_DB_BACKUP_DIR}/litellm-${have:-unknown}-before-${want}-$(date +%Y%m%dT%H%M%S).dump"
+    (umask 077 && mkdir -p "$LITELLM_DB_BACKUP_DIR" && chmod 700 "$LITELLM_DB_BACKUP_DIR") || return 1
+    log "LiteLLM ${have:-<unrecorded>} -> ${want} against the local DB — dumping it first (its startup migration is one-way)..."
+    if (umask 077 && timeout -k 10 600 sudo -n -u postgres pg_dump -Fc -d litellm </dev/null >"${out}.tmp") \
+        && [ -s "${out}.tmp" ] && mv -f "${out}.tmp" "$out"; then
+        log "DB backup: $out"
+        # Prune by name: the timestamp suffix sorts chronologically within the
+        # fixed prefix, and ls -t would trust mtimes a restore could reset.
+        find "$LITELLM_DB_BACKUP_DIR" -maxdepth 1 -name 'litellm-*.dump' -printf '%f\n' 2>/dev/null \
+            | sed 's/.*-\([0-9]\{8\}T[0-9]\{6\}\)\.dump$/\1 &/' | sort -r | awk '{print $2}' \
+            | tail -n +$((LITELLM_DB_BACKUP_KEEP + 1)) \
+            | while IFS= read -r f; do rm -f -- "${LITELLM_DB_BACKUP_DIR}/${f}"; done
+        return 0
+    fi
+    rm -f -- "${out}.tmp"
+    return 1
+}
+
+# Usage: record_litellm_db_version <version-that-answered-readiness>
+record_litellm_db_version() {
+    write_state_file "$LITELLM_DB_VERSION_FILE" "$1"
 }
 
 # Emit `KEY=VALUE` lines for every LiteLLM-relevant provider env var found in
@@ -935,11 +1042,10 @@ install_docker_rootless() {
         echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/${docker_distro} ${docker_codename} stable" \
             | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
 
-        # Explicit update (not apt_update_once): the Docker repo was just added,
-        # so the index must be refreshed even if another phase already did.
-        # Re-mark it fresh so a later apt_install this run can skip its update.
-        sudo apt-get update
-        APT_INDEX_FRESH=1
+        # The Docker repo was just added, so the index must be refreshed even
+        # if another phase already did: invalidate, then refresh once.
+        APT_INDEX_FRESH=0
+        apt_update_once
         if [ "$need_engine" = true ]; then
             apt_install \
                 docker-ce docker-ce-cli containerd.io \
@@ -978,7 +1084,7 @@ install_docker_rootless() {
     # Set up rootless dockerd as a `systemd --user` service. The setuptool writes
     # ~/.config/systemd/user/docker.service and enables it; guard on that file so
     # re-runs are no-ops.
-    if [ -f "${HOME}/.config/systemd/user/docker.service" ]; then
+    if [ -f "$(user_unit_path docker)" ]; then
         log "Rootless Docker user service already set up — skipping setuptool"
     else
         log "Setting up rootless Docker (dockerd as systemd --user)..."
@@ -1023,6 +1129,13 @@ pg_setting() {
     sudo -u postgres psql -tAc "SHOW $1;" 2>/dev/null | tr -d '[:space:]'
 }
 
+# Make the postmaster re-read pg_hba/postgresql.conf. Through the server
+# (pg_reload_conf = SIGHUP), NOT `systemctl reload`: it works whatever state
+# Debian's /bin/true umbrella unit is in. Quiet; callers own the failure.
+pg_reload() {
+    sudo -u postgres psql -qAtc 'SELECT pg_reload_conf()' >/dev/null 2>&1
+}
+
 # Ensure the host Postgres accepts password (scram) auth for the `litellm` role
 # over its Unix socket. Used by every local-Postgres install: Phase 6 connects
 # LiteLLM over the socket in both runtimes (native since the socket switch;
@@ -1059,7 +1172,7 @@ ensure_pg_socket_scram_rule() {
     # systemctl form fails with "not active, cannot reload" on every native
     # install. The server is definitionally up here (it just answered SHOW
     # hba_file), so a failure is anomalous; warn with a command that works.
-    sudo -u postgres psql -qAtc 'SELECT pg_reload_conf()' >/dev/null 2>&1 \
+    pg_reload \
         || warn "Could not reload Postgres — apply with: sudo -u postgres psql -c 'SELECT pg_reload_conf()'"
 }
 
@@ -1159,9 +1272,13 @@ pg_url_works() {
 # LITELLM_WAIT_LONG ONLY for a start that actually happened this run (Phase 7
 # — in native mode that is every run, since Phase 4a stops the unit for the
 # venv/toolchain work and never restarts it itself) because such a start can
-# legitimately run long: the schema sync is bounded at ≤4 attempts × 60s
-# hard-killed + 5–15s sleeps (litellm_proxy_extras/utils.py::_setup_database_v2,
-# see CLAUDE.md > Troubleshooting, "prisma in the process list") ≈ 300s. Under
+# legitimately run long: since litellm-proxy-extras 0.4.110 one whole
+# `prisma migrate deploy` may run LITELLM_PRISMA_MIGRATE_DEPLOY_TIMEOUT (600s)
+# however many migrations are pending, so a version bump's slow-but-healthy
+# first sync fits this budget; a sync that keeps timing out (≤4 attempts × 600s
+# + 5–15s sleeps, litellm_proxy_extras/utils.py::_setup_database_v2, see
+# CLAUDE.md > Troubleshooting, "prisma in the process list") does not, and is
+# reported not-ready while the unit carries on. Under
 # the v2 resolver an UNRECOVERABLE sync does NOT fall through to a bind — it
 # raises and proxy_cli.py exits 2 — so a genuinely broken sync ends this wait
 # via the crash-loop bail-out below, not by timing out. On
@@ -1180,7 +1297,7 @@ pg_url_works() {
 # re-run. The budget is wall-clock (SECONDS deadline), not an iteration count
 # — curl's --max-time 3 would otherwise stretch each iteration to 4s on a
 # hung connect and quietly quadruple it. Cadence: 1s while a fast start is
-# still plausible, 5s once the wait is clearly in the bounded-sync regime
+# still plausible, 2s once the wait is clearly in the bounded-sync regime
 # (the fast path is unchanged — returns the second the probe passes); a
 # progress note at 60s on the long budget tells the operator the
 # long-but-bounded case is expected.
@@ -1237,34 +1354,24 @@ wait_for_litellm() {
         if [[ "$restarts_now" =~ ^[0-9]+$ ]]; then
             [ -n "$restarts_start" ] || restarts_start="$restarts_now"
             if [ $((restarts_now - restarts_start)) -ge 3 ]; then
-                # Restart growth has two shapes under the v2 migration resolver
-                # and the journal tells them apart: a DRIFTED LEDGER (a box
-                # provisioned in the brief --use_prisma_db_push era) heals ≤3
-                # migrations per start, exits 2 and comes back — dozens of
-                # cycles, far past any budget, but converging, and an overlay
-                # recovery restart would only reset it (see CLAUDE.md,
-                # "A `prisma migrate deploy` process"). Its fingerprint is
-                # "marking applied"/"creating baseline" lines — note each such
-                # cycle ALSO ends in "Database migration cannot proceed" (the
-                # 4-attempt budget raising), so that line alone does not mean
-                # fatal; fatal is "cannot proceed" WITHOUT the healing lines
-                # (or an import traceback). One journalctl spawn, at bail-out
-                # time only.
-                local jtail
-                jtail="$(journalctl --user -u litellm -n 400 --no-pager -o cat 2>/dev/null || true)"
-                if [[ $jtail == *"failed idempotently"* || $jtail == *"marking applied"* || $jtail == *"creating baseline"* ]]; then
-                    warn "litellm restarted $((restarts_now - restarts_start))x while waiting (${elapsed}s in) but the journal shows the startup schema sync CONVERGING (migrations being marked applied, ~3 per start; each cycle's trailing 'Database migration cannot proceed' is the 4-attempt budget, not a fatal error) — expected on a box with a drifted migrations ledger, not a crash loop. Leave the unit alone; it comes up by itself once the ledger is caught up. Not waiting out the ${budget}s budget; ${hint}"
-                else
-                    warn "litellm crash-looping ($((restarts_now - restarts_start)) restarts while waiting, ${elapsed}s in) — not waiting out the ${budget}s budget; ${hint} (look for 'Database migration cannot proceed' = fatal, needs a human)"
-                fi
+                # Under litellm-proxy-extras >=0.4.110 a drifted migrations
+                # ledger converges within ONE start (the older resolver healed
+                # ~3 migrations per start and looked like this), so restart
+                # growth during the wait is a crash loop. The journal line
+                # that names the cause is "Database migration cannot proceed".
+                warn "litellm crash-looping ($((restarts_now - restarts_start)) restarts while waiting, ${elapsed}s in) — not waiting out the ${budget}s budget; ${hint} (look for 'Database migration cannot proceed' = needs a human)"
                 return 1
             fi
         fi
         if [ "$noted" = 0 ] && [ "$budget" -gt "$LITELLM_WAIT_SHORT" ] && [ "$elapsed" -ge 60 ]; then
-            log "LiteLLM still starting — the startup schema sync (prisma migrate deploy) is bounded at ~5 min worst case, longer on a CPU-starved box; waiting up to ${budget}s total"
+            log "LiteLLM still starting — the startup schema sync (prisma migrate deploy) can take minutes after a LiteLLM version bump (one deploy is bounded at 600s); waiting up to ${budget}s total"
             noted=1
         fi
-        [ "$elapsed" -ge 10 ] && interval=5
+        # 2s once a fast start is clearly over: native litellm is restarted
+        # every run and answers at ~20-30s, so a 5s step cost ~2.5s per run on
+        # average, while a 2s cadence is still far from the "tight" polling
+        # the readiness note above warns about.
+        [ "$elapsed" -ge 10 ] && interval=2
         sleep "$interval"
     done
     warn "LiteLLM not responding on port ${port} after ${budget}s; ${hint}"
@@ -1343,7 +1450,6 @@ write_if_changed() {
 # Phase 8a sudo-install path, which restates the guard in grep form.
 TEMPLATE_TOKEN_RE='(^|[^A-Za-z0-9])__[A-Z][A-Z0-9_]*__([^A-Za-z0-9]|$)'
 
-# Usage: render_template_if_changed <template> <dest> <label> [sed_args...]
 # The validated render on its own, for callers that cannot use write_if_changed
 # to place the result (the managed-settings deploy needs `sudo install`). Prints
 # the rendered template on success; errors and returns 1 on any of the three
@@ -1371,6 +1477,7 @@ render_template_or_fail() {
     printf '%s\n' "$rendered"
 }
 
+# Usage: render_template_if_changed <template> <dest> <label> [sed_args...]
 render_template_if_changed() {
     local template="$1" dest="$2" label="$3"
     shift 3

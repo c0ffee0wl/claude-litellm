@@ -15,8 +15,7 @@ RestartSec=5
 Environment=PATH=__PATH__
 Environment=PORT=__CLAUDE_DEVTOOLS_PORT__
 Environment=HOST=127.0.0.1
-# %h = the user's home dir, expanded by systemd itself (same idiom as
-# litellm.service's PRISMA_BINARY_CACHE_DIR) — no sed token needed.
+# %h = the user's home dir, expanded by systemd itself — no sed token needed.
 Environment=CLAUDE_ROOT=%h/.claude
 
 [Install]

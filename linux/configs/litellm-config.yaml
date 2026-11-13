@@ -18,11 +18,11 @@ model_list:
   #
   # model_info carries EXPLICIT per-token rates ONLY to fix cost tracking. The
   # `openai/` route above also drives the price lookup, so without them every
-  # request bills the OPENAI map key `gpt-5.6-<tier>` — i.e. OpenAI list prices
-  # for traffic Azure invoices. Understated terra 1.38x, luna 5.50x, sol 1.10x.
+  # request bills the OPENAI map key `gpt-<family>-<tier>` — i.e. OpenAI list
+  # prices for traffic Azure invoices (Azure's DZ meters run ~1.2x OpenAI list).
   #
-  # `model_info.base_model: azure/eu/gpt-5.6-<tier>` is the obvious fix and does
-  # NOT work here — verified against litellm 1.93.0, do not re-try it.
+  # `model_info.base_model: azure/eu/gpt-<family>-<tier>` is the obvious fix and
+  # does NOT work here — verified against litellm 1.93.0, do not re-try it.
   # _select_model_name_for_cost_calc does return the azure/eu key, but the
   # downstream lookup passes the route's provider alongside it, and
   #     get_model_info("azure/eu/gpt-5.6-luna", custom_llm_provider="openai")
@@ -32,48 +32,152 @@ model_list:
   # route's, so it is unusable on the deliberate `openai/` route. Explicit rates
   # are provider-agnostic — they bypass the map lookup entirely.
   #
-  # cache_creation_input_token_cost is set equal to input_cost_per_token, and is
-  # absent from the table below because Azure has no such meter — cached-write
-  # tokens bill as ordinary input. It is stated rather than omitted because
-  # Router._inherit_builtin_cache_pricing copies the key from the OpenAI map
-  # entry when a deployment omits it. Today that inherited rate is inert: the
-  # Responses API reports no cache-creation tokens, so it multiplies zero (which
-  # is why the update-azure-openai-prices skill maps no `Cd Wr` meter). Stating
-  # it makes the deployment correct if that ever changes, instead of silently
-  # billing OpenAI's cache-write rate against Azure traffic. Keep it equal to
-  # input_cost_per_token whenever the rates below are refreshed — the skill does
-  # not manage this key.
+  # The cache-write pair (cache_creation_input_token_cost[_above_272k_tokens])
+  # comes from Azure's `Cd Wr` meters — 1.25x input on both GPT-5.6 and GPT-6.
+  # The Responses API rarely reports cache-creation tokens, but the keys are
+  # stated anyway: when a deployment omits them,
+  # Router._inherit_builtin_cache_pricing copies OPENAI's cache-write rate onto
+  # Azure traffic. The skill below manages all eight keys.
   #
   # Rates are Azure Data Zone Standard, EU zone: Sweden Central sits inside the
   # Azure EU Data Boundary, so a DataZoneStandard deployment there bills the `DZ`
-  # meters. Verified 2026-08-04 against the Azure retail feed — $/1M tokens,
-  # short context (in / cached-in / out), long context (>272k) on the second row:
-  #     terra  2.75 / 0.275 / 16.50   |  5.50 / 0.55 / 24.75
-  #     luna   1.10 / 0.11  /  6.60   |  2.20 / 0.22 /  9.90
-  #     sol    5.50 / 0.55  / 33.00   |  11.0 / 1.10 / 49.50
+  # meters. Verified 2026-11-13 against the Azure retail feed — $/1M tokens,
+  # short context (in / cached-in / cache-wr / out), long context (>272k) second:
+  #     gpt-6.1-terra  1.20 / 0.06  / 1.50  /  6.00  |  2.40 / 0.12  / 3.00 /  9.00
+  #     gpt-6-luna     0.12 / 0.012 / 0.15  /  0.60  |  0.24 / 0.024 / 0.30 /  0.90
+  #     gpt-6.1-sol    2.40 / 0.12  / 3.00  / 12.00  |  4.80 / 0.24  / 6.00 / 18.00
+  #     gpt-6-astra    12.0 / 1.20  / 15.0  / 60.00  |  24.0 / 2.40  / 30.0 / 90.00
+  #     gpt-5.6-terra  2.20 / 0.22  / 2.75  / 13.20  |  4.40 / 0.44  / 5.50 / 19.80
+  #     gpt-5.6-luna   0.22 / 0.022 / 0.275 /  1.32  |  0.44 / 0.044 / 0.55 /  1.98
+  #     gpt-5.6-sol    4.40 / 0.44  / 5.50  / 22.00  |  8.80 / 0.88  / 11.0 / 33.00
   # Refresh these with the `update-azure-openai-prices` skill
-  # (.claude/skills/), which reads the live feed and rewrites both the rate
-  # blocks and the table above. Do not hand-query the feed — the skill's script
-  # owns the meter-name grammar, and a second recipe here would drift from it.
+  # (.claude/skills/), which reads the live feed and prints the rate blocks and
+  # this table's rows. Do not hand-query the feed — the skill's script owns the
+  # meter-name grammar (which differs between GPT-5.6 and GPT-6), and a second
+  # recipe here would drift from it. Re-run it when the deployment type or zone
+  # changes (the script takes --scope Gl / --region), and after any model_list
+  # change. Meter dates newer than 2026-10-01 mean Azure repriced.
   #
-  # Worth re-running when the deployment type or zone changes (the script takes
-  # --scope Gl / --region), or when Azure follows OpenAI's 2026-07-30 cut
-  # (terra -20%, luna -80%, sol flat) — which it had NOT as of this writing,
-  # hence luna costing 5.5x its OpenAI list price. Meters dated later than
-  # 2026-07-01 mean Azure repriced.
+  # TIERS AND FALLBACKS. setup.sh Phase 5a points Claude Code's four aliases at
+  # the GPT-6 generation: haiku -> gpt-6-luna (also every background call:
+  # titles, compaction summaries, the Explore subagent), sonnet -> gpt-6.1-terra,
+  # opus -> gpt-6.1-sol, fable -> gpt-6-astra (premium, never auto-selected).
+  # The GPT-5.6 entries stay as FALLBACK TARGETS only (router_settings.fallbacks
+  # below): an Azure deployment that is missing, renamed, retired or failing
+  # degrades a request onto the previous generation instead of failing it — the
+  # haiku slot most of all, since a dead background model breaks compaction.
+  # A fallback only helps while its target deployment exists in Azure; when the
+  # 5.6 deployments are deleted, its entries can go too (drop the fallbacks
+  # first). Every Public Model Name here is ALSO the Azure deployment name the
+  # `openai/` route sends as `model` — keep the two identical.
+  #
+  # Per-deployment capability fields (max_input_tokens, supports_*_reasoning_
+  # effort) pin what LiteLLM would otherwise only learn from the model map it
+  # fetches at startup — the wheel's bundled fallback map may predate a model
+  # (1.108.0's lacks gpt-6.1-terra), and a failed fetch would then silently
+  # downgrade effort: max to `high`. gpt-6-astra pins
+  # supports_max_reasoning_effort: false because Azure's map entry says so while
+  # the OPENAI entry (which the `openai/` route reads) says true — sending
+  # `max` would 400.
+  - model_name: azure/gpt-6.1-terra
+    litellm_params:
+      model: openai/gpt-6.1-terra
+      api_base: os.environ/AZURE_RESOURCE_ENDPOINT
+      api_key: os.environ/AZURE_OPENAI_API_KEY
+    model_info:
+      max_input_tokens: 922000
+      max_output_tokens: 128000
+      supports_reasoning: true
+      supports_xhigh_reasoning_effort: true
+      supports_max_reasoning_effort: true
+      input_cost_per_token: 1.2e-06
+      output_cost_per_token: 6e-06
+      cache_read_input_token_cost: 6e-08
+      cache_creation_input_token_cost: 1.5e-06
+      input_cost_per_token_above_272k_tokens: 2.4e-06
+      output_cost_per_token_above_272k_tokens: 9e-06
+      cache_read_input_token_cost_above_272k_tokens: 1.2e-07
+      cache_creation_input_token_cost_above_272k_tokens: 3e-06
+
+  - model_name: azure/gpt-6-luna
+    litellm_params:
+      model: openai/gpt-6-luna
+      api_base: os.environ/AZURE_RESOURCE_ENDPOINT
+      api_key: os.environ/AZURE_OPENAI_API_KEY
+    model_info:
+      max_input_tokens: 922000
+      max_output_tokens: 128000
+      supports_reasoning: true
+      supports_xhigh_reasoning_effort: true
+      supports_max_reasoning_effort: true
+      input_cost_per_token: 1.2e-07
+      output_cost_per_token: 6e-07
+      cache_read_input_token_cost: 1.2e-08
+      cache_creation_input_token_cost: 1.5e-07
+      input_cost_per_token_above_272k_tokens: 2.4e-07
+      output_cost_per_token_above_272k_tokens: 9e-07
+      cache_read_input_token_cost_above_272k_tokens: 2.4e-08
+      cache_creation_input_token_cost_above_272k_tokens: 3e-07
+
+  - model_name: azure/gpt-6.1-sol
+    litellm_params:
+      model: openai/gpt-6.1-sol
+      api_base: os.environ/AZURE_RESOURCE_ENDPOINT
+      api_key: os.environ/AZURE_OPENAI_API_KEY
+    model_info:
+      max_input_tokens: 922000
+      max_output_tokens: 128000
+      supports_reasoning: true
+      supports_xhigh_reasoning_effort: true
+      supports_max_reasoning_effort: true
+      input_cost_per_token: 2.4e-06
+      output_cost_per_token: 1.2e-05
+      cache_read_input_token_cost: 1.2e-07
+      cache_creation_input_token_cost: 3e-06
+      input_cost_per_token_above_272k_tokens: 4.8e-06
+      output_cost_per_token_above_272k_tokens: 1.8e-05
+      cache_read_input_token_cost_above_272k_tokens: 2.4e-07
+      cache_creation_input_token_cost_above_272k_tokens: 6e-06
+
+  # Premium tier — Claude Code's `fable` alias (ANTHROPIC_DEFAULT_FABLE_MODEL,
+  # setup.sh Phase 5a), so `/model fable` and subagent frontmatter
+  # `model: fable` land here. Never auto-selected: no background path uses the
+  # fable alias, so its 5x price only applies when asked for.
+  - model_name: azure/gpt-6-astra
+    litellm_params:
+      model: openai/gpt-6-astra
+      api_base: os.environ/AZURE_RESOURCE_ENDPOINT
+      api_key: os.environ/AZURE_OPENAI_API_KEY
+    model_info:
+      max_input_tokens: 922000
+      max_output_tokens: 128000
+      supports_reasoning: true
+      supports_xhigh_reasoning_effort: true
+      supports_max_reasoning_effort: false
+      input_cost_per_token: 1.2e-05
+      output_cost_per_token: 6e-05
+      cache_read_input_token_cost: 1.2e-06
+      cache_creation_input_token_cost: 1.5e-05
+      input_cost_per_token_above_272k_tokens: 2.4e-05
+      output_cost_per_token_above_272k_tokens: 9e-05
+      cache_read_input_token_cost_above_272k_tokens: 2.4e-06
+      cache_creation_input_token_cost_above_272k_tokens: 3e-05
+
+  # --- Previous generation: fallback targets (see TIERS AND FALLBACKS) -------
   - model_name: azure/gpt-5.6-terra
     litellm_params:
       model: openai/gpt-5.6-terra
       api_base: os.environ/AZURE_RESOURCE_ENDPOINT
       api_key: os.environ/AZURE_OPENAI_API_KEY
     model_info:
-      input_cost_per_token: 2.75e-06
-      output_cost_per_token: 1.65e-05
-      cache_read_input_token_cost: 2.75e-07
+      input_cost_per_token: 2.2e-06
+      output_cost_per_token: 1.32e-05
+      cache_read_input_token_cost: 2.2e-07
       cache_creation_input_token_cost: 2.75e-06
-      input_cost_per_token_above_272k_tokens: 5.5e-06
-      output_cost_per_token_above_272k_tokens: 2.475e-05
-      cache_read_input_token_cost_above_272k_tokens: 5.5e-07
+      input_cost_per_token_above_272k_tokens: 4.4e-06
+      output_cost_per_token_above_272k_tokens: 1.98e-05
+      cache_read_input_token_cost_above_272k_tokens: 4.4e-07
+      cache_creation_input_token_cost_above_272k_tokens: 5.5e-06
 
   - model_name: azure/gpt-5.6-luna
     litellm_params:
@@ -81,34 +185,29 @@ model_list:
       api_base: os.environ/AZURE_RESOURCE_ENDPOINT
       api_key: os.environ/AZURE_OPENAI_API_KEY
     model_info:
-      input_cost_per_token: 1.1e-06
-      output_cost_per_token: 6.6e-06
-      cache_read_input_token_cost: 1.1e-07
-      cache_creation_input_token_cost: 1.1e-06
-      input_cost_per_token_above_272k_tokens: 2.2e-06
-      output_cost_per_token_above_272k_tokens: 9.9e-06
-      cache_read_input_token_cost_above_272k_tokens: 2.2e-07
+      input_cost_per_token: 2.2e-07
+      output_cost_per_token: 1.32e-06
+      cache_read_input_token_cost: 2.2e-08
+      cache_creation_input_token_cost: 2.75e-07
+      input_cost_per_token_above_272k_tokens: 4.4e-07
+      output_cost_per_token_above_272k_tokens: 1.98e-06
+      cache_read_input_token_cost_above_272k_tokens: 4.4e-08
+      cache_creation_input_token_cost_above_272k_tokens: 5.5e-07
 
-  # Flagship tier — wired to Claude Code's `fable` alias via
-  # ANTHROPIC_DEFAULT_FABLE_MODEL (setup.sh Phase 5a), so `/model fable`,
-  # `/model azure/gpt-5.6-sol` and subagent frontmatter `model: fable` all land
-  # here. Never auto-selected: no background path uses the fable alias, so it
-  # costs nothing unless asked for. Requires a `gpt-5.6-sol` deployment;
-  # without one it 404s at call time (LiteLLM does not validate at boot) and
-  # nothing else is affected.
   - model_name: azure/gpt-5.6-sol
     litellm_params:
       model: openai/gpt-5.6-sol
       api_base: os.environ/AZURE_RESOURCE_ENDPOINT
       api_key: os.environ/AZURE_OPENAI_API_KEY
     model_info:
-      input_cost_per_token: 5.5e-06
-      output_cost_per_token: 3.3e-05
-      cache_read_input_token_cost: 5.5e-07
+      input_cost_per_token: 4.4e-06
+      output_cost_per_token: 2.2e-05
+      cache_read_input_token_cost: 4.4e-07
       cache_creation_input_token_cost: 5.5e-06
-      input_cost_per_token_above_272k_tokens: 1.1e-05
-      output_cost_per_token_above_272k_tokens: 4.95e-05
-      cache_read_input_token_cost_above_272k_tokens: 1.1e-06
+      input_cost_per_token_above_272k_tokens: 8.8e-06
+      output_cost_per_token_above_272k_tokens: 3.3e-05
+      cache_read_input_token_cost_above_272k_tokens: 8.8e-07
+      cache_creation_input_token_cost_above_272k_tokens: 1.1e-05
 
 litellm_settings:
   drop_params: true
@@ -127,20 +226,38 @@ litellm_settings:
   reasoning_auto_summary: true
 
 router_settings:
-  # No `stream_timeout` and no `request_timeout`: on the /v1/messages path
-  # Claude Code uses, neither is read (they sit on the chat-completion branch).
-  # The knob that WOULD bite is `timeout:`, left at the path's 600s default
-  # because an `effort: high/xhigh` turn can legitimately sit silent for
-  # minutes. Full precedence chain + how it reaches aiohttp: CLAUDE.md >
-  # "Retries and fallbacks DO apply on /v1/messages". Per-request override:
-  # the `x-litellm-timeout` header.
+  # No `timeout:` and no `stream_timeout:` here: on the /v1/messages path
+  # Claude Code uses, the upstream timeout resolves (1.108.0,
+  # passthrough/timeout_utils.py) per-request -> deployment -> these router
+  # keys (stream_timeout first, for streaming) -> litellm_settings
+  # .request_timeout above -> 600s. So the one 600 above governs every route,
+  # streaming or not — deliberately long, because an `effort: high/xhigh`
+  # turn can legitimately sit silent for minutes. It reaches aiohttp as an
+  # idle-gap bound. Per-request override: the `x-litellm-timeout` header.
+  # CLAUDE.md > "Retries and fallbacks DO apply on /v1/messages".
   # Every model group here has exactly ONE deployment, so a cooldown has nothing
-  # to fail over to — it just converts a single recoverable error into
-  # "No deployments available for selected model" for the cooldown window. That
-  # fires on any non-retryable status, e.g. the 404 from `azure/gpt-5.6-sol`
-  # when no `sol` deployment exists. Safe to disable precisely BECAUSE there is
-  # no second deployment; revisit if a group ever gains one.
+  # to fail over to WITHIN the group — it just converts a single recoverable
+  # error into "No deployments available for selected model" for the cooldown
+  # window, and that error would also be what the fallback below sees. It fires
+  # on any non-retryable status, e.g. the 404 of a deployment that does not
+  # exist. Safe to disable precisely BECAUSE no group has a second deployment;
+  # revisit if one ever gains one.
   disable_cooldowns: true
+  # Cross-GROUP failover: once a GPT-6 group has exhausted its retries, the
+  # request is replayed on the next group in its list (see the TIERS AND
+  # FALLBACKS note above model_list). Each chain ends on a tier that is billed
+  # at its own rates, so a fallback can never be mis-costed. Only the four
+  # primary groups fall back; the 5.6 targets fail as they are, so no chain
+  # can loop. A degraded request is NOT visible in the statusline (it shows
+  # the configured upstream from /model/info) — look for the
+  # `x-litellm-attempted-fallbacks` response header, the WARNING-level
+  # fallback line in `journalctl --user -u litellm`, or the serving model in
+  # /ui's spend logs.
+  fallbacks:
+    - azure/gpt-6-luna: [azure/gpt-5.6-luna, azure/gpt-6.1-terra]
+    - azure/gpt-6.1-terra: [azure/gpt-5.6-terra]
+    - azure/gpt-6.1-sol: [azure/gpt-5.6-sol, azure/gpt-6.1-terra]
+    - azure/gpt-6-astra: [azure/gpt-6.1-sol]
 
 general_settings:
   master_key: os.environ/LITELLM_MASTER_KEY
@@ -167,6 +284,13 @@ general_settings:
   # default is ~2880 round-trips/day on a single-user box that changes models
   # by hand.
   proxy_config_reload_interval_seconds: 300
+  # Off: litellm 1.108.0 GETs `<api_base>/models` with the deployment's
+  # key every 300s for every openai/-route deployment, to learn token limits.
+  # Here that is 7 authenticated Azure calls per 5 minutes, through the DNS
+  # path CLAUDE.md > Troubleshooting documents as fragile, to learn limits the
+  # GPT-6 entries above already pin. (proxy_server.py `refresh_model_info`,
+  # router.py `arefresh_model_info`.)
+  disable_model_info_refresh: true
 
 # --- Guardrails (deferred — uncomment to enable) ---------------------------
 # All four below are OSS, no enterprise license required.

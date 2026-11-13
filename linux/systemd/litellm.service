@@ -1,7 +1,5 @@
 [Unit]
 Description=LiteLLM — Anthropic-compatible gateway to Azure OpenAI / Vertex Gemini / etc.
-After=network-online.target
-Wants=network-online.target
 # Headroom for slow first boots (Prisma schema sync + engine fetch, 15–25s) and
 # for the boot race against Postgres. Raise BOTH numbers together: the limiter
 # gives up at a cycle time below IntervalSec/Burst, so widening Burst alone
@@ -63,11 +61,20 @@ EnvironmentFile=-__APP_DIR__/prisma.env
 # ExecStartPre and must stay above the loop's ceiling.
 TimeoutStartSec=180
 ExecStartPre=/bin/sh -c 'for _ in $$(seq 60); do pg_isready -q -h /run/postgresql -p __PGPORT__ && exit 0; sleep 2; done; exit 0'
-# --use_v2_migration_resolver: keeps `prisma migrate deploy` but skips the
-# diff-and-force recovery that caused the migrate storm, and warns when the DB
-# is ahead of this build instead of silently dropping columns the way `db push`
-# does — see CLAUDE.md > Key Conventions, "DB schema posture". Keep this arg in
-# sync with litellm-docker-compose.yml's command: list.
+# Schema posture: the v2 migration resolver keeps `prisma migrate deploy` but
+# skips the diff-and-force recovery that caused the migrate storm, and warns
+# when the DB is ahead of this build instead of silently dropping columns the
+# way `db push` does — see CLAUDE.md > Key Conventions, "DB schema posture".
+# Selected TWICE, deliberately. The env var is what 1.108.0+ reads (v2 is its
+# default; pinned so a future default flip cannot silently bring back the
+# storm). The `--use_v2_migration_resolver` flag on ExecStart is what OLDER
+# releases read — 1.97.0 ignores the env var and defaults to v1 — and a box
+# can run an older litellm under this unit: Phase 4a keeps the existing
+# version when its converge fails (uv cooldown, network). 1.108.0 accepts the
+# flag and only prints a one-line deprecation notice. Keep the env var in
+# sync with litellm-docker-compose.yml (whose image tag is always the pin, so
+# it needs no flag).
+Environment=USE_V2_MIGRATION_RESOLVER=true
 # --num_workers 1 is deliberate despite upstream's single-VM advice: each worker
 # runs its own Prisma query engine whose resident memory ratchets to a
 # high-water mark, and this box is CPU- and RAM-constrained.

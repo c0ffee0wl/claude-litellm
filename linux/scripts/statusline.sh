@@ -22,7 +22,7 @@
 #            NB a REMOTE LiteLLM router (the --harden-only setup) also lands
 #            here — line 2 then shows only model + ctx, no upstream/spend info
 #   LITELLM — 127.0.0.1/localhost:4000: show progress bar + model + ctx %, with the
-#            upstream model (e.g. gpt-5.6-terra) appended after an arrow when
+#            upstream model (e.g. gpt-6.1-terra) appended after an arrow when
 #            available via LiteLLM's /model/info endpoint, plus up to three
 #            gateway spend figures — "$X/sess · $Y/day · $Z/30d":
 #              /sess — THIS Claude Code session, summed from
@@ -316,10 +316,12 @@ resolve_token() {
     TOKEN_RESOLVED=1
     TOKEN="${ANTHROPIC_AUTH_TOKEN:-}"
     if [ -z "$TOKEN" ] && [ -r "$HOME/.profile" ]; then
-        TOKEN=$(sed -n 's/^export ANTHROPIC_AUTH_TOKEN="\(.*\)"$/\1/p' "$HOME/.profile" | head -1)
+        # Last match wins, as for the shell that sources the file (and as
+        # common.sh's read_profile_export / read_env_file_var resolve it).
+        TOKEN=$(sed -n 's/^export ANTHROPIC_AUTH_TOKEN="\(.*\)"$/\1/p' "$HOME/.profile" | tail -n 1)
     fi
     if [ -z "$TOKEN" ] && [ -r "$HOME/.config/litellm/env" ]; then
-        TOKEN=$(sed -n 's/^LITELLM_MASTER_KEY=//p' "$HOME/.config/litellm/env" | head -1)
+        TOKEN=$(sed -n 's/^LITELLM_MASTER_KEY=//p' "$HOME/.config/litellm/env" | tail -n 1)
         # EnvironmentFile values may be quoted — strip a matched surrounding pair.
         TOKEN="${TOKEN%\"}"; TOKEN="${TOKEN#\"}"
         TOKEN="${TOKEN%\'}"; TOKEN="${TOKEN#\'}"
@@ -369,7 +371,7 @@ fetch_litellm_cache() {
         resolve_token
         [ -n "$TOKEN" ] || exit 0
         curl -sf --max-time 5 \
-            -H "Authorization: Bearer $TOKEN" \
+            -H @- <<<"Authorization: Bearer $TOKEN" \
             "${ANTHROPIC_BASE_URL%/}/$endpoint" \
             -o "$tmp" \
             && mv "$tmp" "$cache_file" \
@@ -420,7 +422,7 @@ fetch_session_spend() {
             # no `cat` per page. A failed transfer breaks out below and $tmp is
             # discarded unread, so a partial append can never be digested.
             curl -sf --max-time 5 \
-                -H "Authorization: Bearer $TOKEN" \
+                -H @- <<<"Authorization: Bearer $TOKEN" \
                 "${ANTHROPIC_BASE_URL%/}/spend/logs/session/ui?session_id=${sid}&page=${page}&page_size=100" \
                 >> "$tmp" || { dbg "session fetch FAILED rc=$? page=$page"; ok=""; break; }
             if [ "$page" = 1 ]; then
@@ -443,12 +445,7 @@ fetch_session_spend() {
             [ -n "$fresh" ] && find "$CACHE_DIR" -maxdepth 1 -name "${SESSION_CACHE_PREFIX##*/}*" -mtime +7 -delete
         fi
         rm -f "$tmp"
-    # No `2>&1` here, deliberately: stderr is already /dev/null process-wide
-    # (the exec at the top) UNLESS CLAUDE_STATUSLINE_DEBUG is set, and letting
-    # the job inherit it is what puts a failing curl/jq — and resolve_token's
-    # trace — in front of you under debug. Re-adding `2>&1` for symmetry would
-    # silently blind the debug switch inside these jobs. Only the stdout
-    # redirect is load-bearing for Claude Code.
+    # No `2>&1` — same reason as the fetch job above.
     ) </dev/null >/dev/null &
 }
 
@@ -640,12 +637,12 @@ fi
 
 MODEL_LABEL="$MODEL"
 # Skip the arrow when upstream is just the model_id with its provider prefix
-# stripped (e.g. MODEL_ID=azure/gpt-5.6-terra, UPSTREAM_MODEL=gpt-5.6-terra) — that's the
+# stripped (e.g. MODEL_ID=azure/gpt-6.1-terra, UPSTREAM_MODEL=gpt-6.1-terra) — that's the
 # alias-free config where Public Name == LiteLLM model, so the arrow is noise.
 [ -n "$UPSTREAM_MODEL" ] && [ "$UPSTREAM_MODEL" != "$MODEL_ID" ] && [ "$UPSTREAM_MODEL" != "${MODEL_ID#*/}" ] && MODEL_LABEL="${MODEL} → ${UPSTREAM_MODEL}"
 LINE2="${GREEN}[${MODEL_LABEL}] ${BAR_COLOR}${BAR}${GREEN} ${PCT}% (${CTX_LABEL})"
 
-# Mode-specific suffix. LC_ALL=C pins awk/printf to '.' decimals regardless of
+# Mode-specific suffix. LC_ALL=C pins printf to '.' decimals regardless of
 # the inherited locale; the regex requires a well-formed number (no multi-dot).
 SUFFIX=""
 if [ "$MODE" = "DIRECT" ]; then

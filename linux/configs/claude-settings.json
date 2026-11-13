@@ -42,6 +42,7 @@
         "~/.config/litellm",
         "~/.config/litellm/config.yaml",
         "~/.config/litellm/env",
+        "~/.local/state/claude-litellm/db-backups",
         "//root",
         "//etc/shadow",
         "//etc/passwd",
