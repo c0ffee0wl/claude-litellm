@@ -40,7 +40,7 @@ services:
     #         curl -sI -H "Authorization: Bearer $T" \
     #           https://ghcr.io/v2/berriai/litellm/manifests/vX.Y.Z
     # For the current pin all four are recorded next to LITELLM_VERSION in
-    # setup.sh. ExecStartPre re-pulls on start.
+    # setup.sh. The unit pulls only a missing image (`up --pull missing`).
     image: ghcr.io/berriai/litellm:v__LITELLM_IMAGE_TAG__
     # `no`, not `unless-stopped`: the systemd unit wrapping `docker compose up`
     # already declares Restart=always, and two supervisors on one process means

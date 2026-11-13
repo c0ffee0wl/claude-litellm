@@ -4,11 +4,9 @@ Description=LiteLLM (Docker) — Anthropic-compatible gateway via rootless Docke
 # by install_docker_rootless. network-online ordering matters for the image pull.
 After=docker.service network-online.target
 Wants=docker.service network-online.target
-# First boot pulls the image (~367 MB) and runs Prisma migrations against the
-# host DB. Must stay identical to litellm.service — Phase 7 deploys either
-# template under the same `litellm` unit name. Note ExecStartPre re-pulls on
-# every restart, so an unbounded retry loop here also means unbounded registry
-# round-trips; the give-up envelope below is what bounds it.
+# First boot runs Prisma migrations against the host DB. Must stay identical to
+# litellm.service — Phase 7 deploys either template under the same `litellm`
+# unit name.
 StartLimitBurst=20
 StartLimitIntervalSec=600
 
@@ -18,14 +16,12 @@ WorkingDirectory=__APP_DIR__
 Environment=PATH=__PATH__
 # Rootless daemon socket lives in the user runtime dir (%t = /run/user/<uid>).
 Environment=DOCKER_HOST=unix://%t/docker.sock
-# TimeoutStartSec must cover the pull PLUS the pg gate below (first-run pull
-# ~367MB; previously the 90s default bounded the pull alone).
-TimeoutStartSec=300
-# Re-pull on (re)start so a bumped image tag in docker-compose.yml is honoured.
-# Leading "-" makes a failed pull (offline / already cached) non-fatal. Runs
-# BEFORE the Postgres gate: the pull has no DB dependency, so a slow-booting
-# cluster comes up while the registry round-trip is in flight.
-ExecStartPre=-/usr/bin/docker compose pull
+# TimeoutStartSec bounds ExecStartPre — just the pg gate below now — so it
+# matches litellm.service. No ExecStartPre pull: the tag is pinned and setup.sh
+# pre-pulls it on a tag change, so a per-start registry round-trip bought
+# nothing, and on a slow/stalled ghcr.io it ate this whole window, failed the
+# start and aborted setup.sh's Phase 7 restart under `set -e`.
+TimeoutStartSec=180
 # Wait (bounded) for the HOST Postgres socket before `docker compose up` —
 # same gate as litellm.service (the container reaches the DB over the
 # bind-mounted /run/postgresql socket, so probing it host-side is exact).
@@ -33,7 +29,9 @@ ExecStartPre=-/usr/bin/docker compose pull
 # (can only delay the start, never fail it). Phase 7 substitutes __PGPORT__
 # or deletes the line for an external DATABASE_URL.
 ExecStartPre=/bin/sh -c 'for _ in $$(seq 60); do pg_isready -q -h /run/postgresql -p __PGPORT__ && exit 0; sleep 2; done; exit 0'
-ExecStart=/usr/bin/docker compose up
+# --pull missing: only if the pinned image is gone from the cache (pruned) —
+# inside ExecStart, which Type=simple does not time-box.
+ExecStart=/usr/bin/docker compose up --pull missing
 ExecStop=/usr/bin/docker compose down
 # `always`, not `on-failure` — see CLAUDE.md. `docker compose up` exits 0 when
 # the container stops on its own, which on-failure would ignore. ExecStop still

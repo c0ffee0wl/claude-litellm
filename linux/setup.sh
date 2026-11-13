@@ -29,6 +29,12 @@ set -e
 # written to ~/.profile, so the user's interactive locale is untouched.
 # C.UTF-8 is built into glibc on Debian/Kali. Mirrors /opt/linux-setup.
 export LC_ALL=C.UTF-8 LANG=C.UTF-8
+# git over HTTPS must never block an unattended run: no credential prompt on
+# /dev/tty (a renamed/privatized third-party repo answers 401, and git would
+# ask for a username invisibly — stderr is often hidden), and abort a transfer
+# that stays under 1 KB/s for 30s instead of waiting on a stalled socket forever
+# (git's low-speed limit is off by default). Inherited by every git child.
+export GIT_TERMINAL_PROMPT=0 GIT_HTTP_LOW_SPEED_LIMIT=1000 GIT_HTTP_LOW_SPEED_TIME=30
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(dirname "$SCRIPT_DIR")"
@@ -178,15 +184,22 @@ log "Checking for script updates..."
 cd "$REPO_DIR"
 
 if git rev-parse --git-dir > /dev/null 2>&1; then
-    git fetch origin 2>/dev/null || true
+    # Bounded (a blackholed connect otherwise waits out the kernel's TCP
+    # timeout) and non-fatal: a failed fetch just means no self-update this run.
+    timeout -k 10 120 git fetch origin 2>/dev/null || true
 
     BEHIND=$(git rev-list HEAD..@{u} 2>/dev/null | wc -l)
 
     if [ "$BEHIND" -gt 0 ]; then
-        log "Updates found! Pulling latest changes..."
-        git pull --ff-only
-        log "Re-executing updated script..."
-        exec "$SCRIPT_DIR/setup.sh" "${ORIGINAL_ARGS[@]}"
+        log "Updates found! Fast-forwarding to them..."
+        # Merge what the fetch above already downloaded — no second network
+        # round-trip that could fail transiently — and never abort the run over
+        # it: a diverged or dirty checkout keeps running the current version.
+        if git merge --ff-only @{u}; then
+            log "Re-executing updated script..."
+            exec "$SCRIPT_DIR/setup.sh" "${ORIGINAL_ARGS[@]}"
+        fi
+        warn "Self-update could not fast-forward (local changes or diverged history) — continuing with the current version"
     else
         log "Script is up to date"
     fi
@@ -320,9 +333,11 @@ DOCKER_SOCK="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/docker.sock"
 rootless_docker() {
     DOCKER_HOST="unix://${DOCKER_SOCK}" docker "$@"
 }
-# docker compose against the deployed compose file.
+# docker compose against the deployed compose file — as an argv array too, so
+# `timeout` (which cannot exec a shell function) can wrap the same command.
+LITELLM_COMPOSE=(env "DOCKER_HOST=unix://${DOCKER_SOCK}" docker compose -f "${LITELLM_CONFIG_DIR}/docker-compose.yml")
 litellm_compose() {
-    rootless_docker compose -f "${LITELLM_CONFIG_DIR}/docker-compose.yml" "$@"
+    "${LITELLM_COMPOSE[@]}" "$@"
 }
 
 # Claude Code presence — the installer usually puts `claude` on PATH, but a
@@ -736,16 +751,13 @@ if [ "$WITH_LOCAL_LITELLM" = "true" ] && [ "$DOCKER_MODE" != "true" ]; then
             "${PRISMA_BINARY_CACHE_DIR}/package-lock.json"
         )
         # Every prisma call goes through this wrapper so no call site can
-        # silently drop a guard (claude_mutate's rule): the prisma.env switches
-        # (sourced, not restated); the cwd (the pyproject above); the generator
-        # PATH (prisma's Node CLI shells out to `prisma-client-py` in the
-        # venv); stdin from /dev/null (nothing in the toolchain may wait on a
-        # terminal — the bun-REPL stall would have been an instant fall-through
-        # with this alone); and the per-step budget (prisma.env's
-        # LITELLM_PRISMA_BOOTSTRAP_TIMEOUT, upstream 0.4.84's own; `-k` is
-        # required, not decoration — plain `timeout` sends only SIGTERM then
-        # waits, and this child is a Node CLI; timeout signals its whole
-        # process group, so npm/node grandchildren die with it).
+        # silently drop a guard: the prisma.env switches (sourced, not
+        # restated); the cwd (the pyproject above); the generator PATH
+        # (prisma's Node CLI shells out to `prisma-client-py` in the venv); and
+        # run_bounded (stdin /dev/null — the bun-REPL stall would have been an
+        # instant fall-through with this alone — ceiling, I/O-stall watchdog)
+        # with the per-step budget from prisma.env's
+        # LITELLM_PRISMA_BOOTSTRAP_TIMEOUT (upstream 0.4.84's own).
         # Network note: `--version` and `generate` fetch a missing engine from
         # binaries.prisma.sh (the npm postinstall that would otherwise fetch
         # it is disabled on overlays with ignore-scripts=true) into
@@ -776,7 +788,7 @@ if [ "$WITH_LOCAL_LITELLM" = "true" ] && [ "$DOCKER_MODE" != "true" ]; then
                 set +a
                 cd "$LITELLM_CONFIG_DIR" \
                 && PATH="${UV_LITELLM_VENV}/bin:$PATH" \
-                    timeout -k 15 "$PRISMA_STEP_TIMEOUT" "${UV_LITELLM_VENV}/bin/prisma" "$@" </dev/null
+                    run_bounded "$PRISMA_STEP_TIMEOUT" 180 "${UV_LITELLM_VENV}/bin/prisma" "$@"
             )
         }
         # Heal 1 — the private Node runtime: prisma-client-py installs it only
@@ -914,25 +926,19 @@ fi
 if have_claude; then
     # Upgrade-in-place (not skip): `claude update` is a no-op when already latest
     # and still works under DISABLE_AUTOUPDATER=1 (that gates only the background
-    # check, not the explicit command; DISABLE_UPDATES is not set). Resolve the
-    # real binary; claude may live outside ~/.local/bin (e.g. a host-provided symlink).
-    claude_bin="$(command -v claude 2>/dev/null || echo "${HOME}/.local/bin/claude")"
-    log "Claude Code present — running 'claude update'..."
-    # Same two hazards Phase 8e's claude_mutate guards against, and the same
-    # fixes — `claude` is a Node TUI that emits terminal-capability queries
-    # (OSC 11, DA1) AFTER finishing its work and blocks forever waiting for
-    # replies whenever stdout is a tty and stdin cannot answer. An overlay
-    # updater that runs setup.sh with stdin </dev/null but stdout still on the
-    # terminal hits exactly that, and this call had no bound at all.
-    # `| cat` (not a $(...) capture) detaches stdout from the tty — which is
-    # what stops the probe — while still streaming the ~300MB download's
-    # progress, so a slow update doesn't look hung. The pipeline's own status
-    # is cat's, hence PIPESTATUS; read it on the next line, before any other
-    # command clobbers it.
-    timeout -k 15 600 "$claude_bin" update </dev/null 2>&1 | cat
-    claude_update_rc=${PIPESTATUS[0]}
-    [ "$claude_update_rc" -eq 0 ] \
-        || warn "claude update failed or timed out (rc=${claude_update_rc}) — keeping existing version"
+    # check, not the explicit command; DISABLE_UPDATES is not set).
+    cu_budget=900 cu_stall=120
+    log "Claude Code present — running 'claude update' (ceiling $((cu_budget / 60)) min, ended early after $((cu_stall / 60)) min without I/O)..."
+    # run_bounded (common.sh) owns every way this call has hung: the tty probe,
+    # a stray descendant holding a pipe (the old `| cat`, 2026-11-13), a stalled
+    # ~300 MB download, and silence (heartbeat with MB moved).
+    claude_update_rc=0
+    run_bounded "$cu_budget" "$cu_stall" claude update || claude_update_rc=$?
+    case "$claude_update_rc" in
+        0) ;;
+        124|137) warn "claude update exceeded its $((cu_budget / 60)) min ceiling and was ended — keeping existing version; the next run retries" ;;
+        *) warn "claude update failed or stalled (rc=${claude_update_rc}) — keeping existing version; the next run retries" ;;
+    esac
 else
     log "Installing Claude Code..."
     # download_and_run (not `curl | bash`): a piped curl masks HTTP errors, so a
@@ -1751,8 +1757,8 @@ if [ "$WITH_LOCAL_LITELLM" = "true" ]; then
 
         # Pre-pull the image in the foreground (visible progress) so the unit
         # start below is fast and wait_for_litellm's budget isn't eaten by a
-        # ~367MB first-run download — the unit's ExecStartPre would otherwise pull
-        # silently while we poll. The image tag is pinned, so once cached there is
+        # ~367MB first-run download — the unit's `up --pull missing` would
+        # otherwise pull silently while we poll. The image tag is pinned, so once cached there is
         # nothing to fetch — skip the registry round-trip entirely (a tag bump
         # changes the rendered compose, the inspect misses, and the pull fires).
         # Talks to the rootless daemon started in Phase 2b.
@@ -1761,9 +1767,13 @@ if [ "$WITH_LOCAL_LITELLM" = "true" ]; then
             && rootless_docker image inspect "$compose_image" &>/dev/null; then
             log "LiteLLM image ${compose_image} already cached — skipping pull"
         else
-            log "Pulling LiteLLM image (first run downloads ~367MB; cached afterwards)..."
-            litellm_compose pull \
-                || warn "docker compose pull failed — the unit will retry via ExecStartPre on start"
+            log "Pulling LiteLLM image (first run downloads ~367MB; cached afterwards; bounded at 15 min)..."
+            # Plain timeout, not run_bounded: the bytes move in the rootless
+            # dockerd, not in this CLI's process group, so an I/O watchdog would
+            # read a healthy pull as stalled. Output stays on the terminal (no
+            # pipe), so docker's own progress is visible.
+            timeout -k 15 900 "${LITELLM_COMPOSE[@]}" pull </dev/null \
+                || warn "docker compose pull failed or timed out — the unit pulls a missing image itself on start (up --pull missing)"
         fi
     else
         if deploy_user_systemd_service litellm "$SCRIPT_DIR/systemd/litellm.service" \
@@ -2000,29 +2010,14 @@ deploy_config "$SCRIPT_DIR/scripts/statusline.sh" "${HOME}/.claude/statusline.sh
 # then-latest convention as ACP (4c); user runs
 # `claude plugin update nah --scope user` to upgrade.
 if [ "$WITH_POLICY" = "true" ] && have_claude; then
-    # Every claude invocation here needs stdin redirected + a timeout so a
-    # headless/CI run can't wedge the script. Two independent hazards, two guards:
-    #
-    #   1. TTY probing (the real wedger). `claude` is a Node TUI: when its
-    #      stdout is an interactive terminal it emits terminal-capability
-    #      queries (OSC 11 background-colour, DA1 device-attributes) AFTER
-    #      doing its work and blocks waiting for the replies — which arrive on
-    #      stdin, but stdin is </dev/null here, so they never come and it hangs
-    #      forever (it has already printed "Successfully installed", so the
-    #      on-disk action is done). The read-only calls dodge this for free by
-    #      piping stdout into tr|sed|jq — a pipe is not a tty, so isTTY is
-    #      false and claude stays non-interactive. The mutating calls get the
-    #      same via claude_mutate below ($(... 2>&1) capture makes stdout/stderr
-    #      pipes, not the terminal); output is surfaced only on failure.
-    #   2. timeout signal escalation (belt-and-suspenders). Plain `timeout N`
-    #      sends only SIGTERM then waits for the child; a Node process that
-    #      traps it or keeps a handle open is never killed and timeout waits
-    #      forever. `-k <grace>` escalates to uncatchable SIGKILL. The
-    #      add/install calls clone over the network under claude's own 120s
-    #      internal git timeout, so their outer bound is 180s (above 120s) to
-    #      avoid cutting a slow-but-working first clone; -k 15 force-kills 15s
-    #      later. State is committed before any lingering, so a force-kill
-    #      never corrupts it (re-runs find it "already added"/installed).
+    # Every claude invocation here goes through run_bounded (common.sh), which
+    # owns the hang hazards (tty capability probe, pipe-EOF wait on a stray
+    # descendant, no ceiling). Only one local fact remains: the add/install
+    # calls clone over the network under claude's own 120s internal git
+    # timeout, so their outer bound is 180s (above 120s) to avoid cutting a
+    # slow-but-working first clone. State is committed before any lingering,
+    # so a force-kill never corrupts it (re-runs find it "already
+    # added"/installed).
     #
     # Read-only queries share one sanitizer: `claude plugin … --json` (verified
     # empirically) writes JSON with CRLF line endings AND appends a trailing
@@ -2031,22 +2026,9 @@ if [ "$WITH_POLICY" = "true" ] && have_claude; then
     # `sed -n '/^\[/,/^\]/p'` so jq gets clean input. The sed range tolerates a
     # single-line `[]` (both anchors match the same line, printed once).
     claude_plugin_json() {
-        timeout -k 15 60 claude "$@" --json </dev/null 2>/dev/null \
+        run_bounded 60 0 claude "$@" --json \
             | tr -d '\r' \
             | sed -n '/^\[/,/^\]/p'
-    }
-
-    # The mutating plugin calls below share the same hazards; this wrapper bakes
-    # in all three guards (stdin closed, stderr folded into stdout for the
-    # caller's $(...) capture, timeout with SIGKILL escalation) so a call site
-    # can't silently drop one and reintroduce the tty-probe wedge. Scoped to
-    # this WITH_POLICY block like claude_plugin_json — hoist both to the
-    # top-level helper section if another phase ever needs them.
-    # Usage: out=$(claude_mutate <secs> <claude-args…>)
-    claude_mutate() {
-        local secs="$1"
-        shift
-        timeout -k 15 "$secs" claude "$@" </dev/null 2>&1
     }
 
     # Plugin state first — the steady state (installed + enabled) then costs a
@@ -2111,7 +2093,7 @@ if [ "$WITH_POLICY" = "true" ] && have_claude; then
                 # The .repo field in `claude plugin marketplace list --json` drops the
                 # ref suffix, so the idempotency selector above still matches.
                 # if-condition form is set -e-safe (a failure doesn't abort the script).
-                if nah_add_out=$(claude_mutate 180 plugin marketplace add manuelschipper/nah@claude-marketplace); then
+                if nah_add_out=$(run_bounded 180 0 claude plugin marketplace add manuelschipper/nah@claude-marketplace); then
                     nah_marketplace_ok=1
                 else
                     warn "Failed to add nah marketplace — try 'claude update' (the 'plugin' subcommand may be missing in older Claude Code). Output: ${nah_add_out}"
@@ -2122,14 +2104,14 @@ if [ "$WITH_POLICY" = "true" ] && have_claude; then
             # the install call is guaranteed to fail with a less informative error.
             if [ "$nah_marketplace_ok" = "1" ]; then
                 log "Installing nah Claude Code plugin..."
-                if nah_install_out=$(claude_mutate 180 plugin install nah@nah --scope user); then
+                if nah_install_out=$(run_bounded 180 0 claude plugin install nah@nah --scope user); then
                     log "nah plugin installed"
                     # install enables by default; assert it on first install so a
                     # fresh box ends up enabled regardless of build behaviour. A
                     # benign "already enabled" error here is expected and ignored.
                     # We do this ONLY on first install — never in the `false`
                     # branch, where a disabled plugin is the user's choice.
-                    claude_mutate 60 plugin enable nah@nah --scope user >/dev/null || true
+                    run_bounded 60 0 claude plugin enable nah@nah --scope user >/dev/null || true
                 else
                     warn "Failed to install nah plugin — try 'claude plugin marketplace list' to confirm marketplace registration. Output: ${nah_install_out}"
                 fi

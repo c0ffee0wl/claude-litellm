@@ -161,7 +161,10 @@ download_and_run() {
     local tmp
     tmp="$(mktemp)"
     if download_to_file "$url" "$tmp" "$label installer"; then
-        "$interp" "$tmp" </dev/null || warn "$label installer exited non-zero"
+        # run_bounded: these vendor installers download with bare curl (no
+        # timeout) and claude.ai's ends by running `claude install` — the CLI
+        # whose tty probe / stray-descendant hangs run_bounded exists for.
+        run_bounded 1200 180 "$interp" "$tmp" || warn "$label installer exited non-zero, stalled or timed out"
         rm -f "$tmp"
         return 0
     fi
@@ -586,6 +589,79 @@ SHIM
     mv "$tmp" "$shim"
     chmod 644 "$shim"
 }
+
+# Run a command unattended with every way it can hang bounded. Prints the
+# command's combined stdout+stderr AFTER it exits and returns its status
+# (124 = budget exceeded, 125 = stalled, 137 = force-killed). Notices go to
+# stderr, so `out=$(run_bounded …)` captures only the command's output.
+#  - stdin </dev/null and output to a FILE, never a pipe: a `| cat`/`$(…)`
+#    reader waits for EOF until EVERY holder of the write end has exited, so a
+#    descendant the command leaves behind hangs the caller forever, past
+#    `timeout` (it signals only its own process group). This is what hung
+#    `claude update` on 2026-11-13; it also keeps claude's tty capability probe
+#    (OSC 11/DA1 queries answered on stdin) from firing.
+#  - `timeout -k 15 <budget>`: hard ceiling with SIGKILL escalation.
+#  - <stall> > 0 adds a watchdog for long network steps: the process group's
+#    read+write byte counters (/proc/<pid>/io) are sampled every 5s; flat for
+#    <stall> seconds → ended early (125) with the process group printed, and a
+#    heartbeat every 30s reports elapsed time and MB moved (no tty → no
+#    progress bar of their own). Unreadable counters disable only the stall
+#    check. <stall> 0 runs in the foreground with no poll at all — the right
+#    choice for short calls, which then return the moment the command exits.
+# Usage: run_bounded <budget-secs> <stall-secs|0> <command> [args…]
+run_bounded() {
+    local budget="$1" stall="$2"; shift 2
+    local out pid rc=0 start=$SECONDS last_change=$SECONDS beat=$SECONDS
+    local io last=-1 base=-1 p k v tick done_pid
+    out="$(mktemp)"
+    if [ "$stall" -le 0 ]; then
+        timeout -k 15 "$budget" "$@" </dev/null >"$out" 2>&1 || rc=$?
+    else
+        timeout -k 15 "$budget" "$@" </dev/null >"$out" 2>&1 &
+        pid=$!
+        while :; do
+            # Wake on whichever ends first — the command or the 5s sample tick —
+            # so the command's exit is seen at once, not on the next tick.
+            sleep 5 & tick=$!
+            wait -n -p done_pid "$pid" "$tick" 2>/dev/null; rc=$?
+            if [ "${done_pid:-}" = "$pid" ]; then
+                kill "$tick" 2>/dev/null; wait "$tick" 2>/dev/null
+                break
+            fi
+            rc=0 io=0
+            for p in $(pgrep -g "$pid" 2>/dev/null); do
+                while read -r k v; do
+                    case "$k" in rchar:|wchar:) io=$((io + v)) ;; esac
+                done 2>/dev/null < "/proc/$p/io" || true
+            done
+            # Counters unreadable (hardened /proc): no watchdog is possible —
+            # fall back to the plain ceiling instead of polling for nothing.
+            if [ "$io" -eq 0 ] && [ "$base" -lt 0 ]; then
+                wait "$pid" || rc=$?
+                break
+            fi
+            [ "$base" -lt 0 ] && base=$io
+            [ "$io" != "$last" ] && last_change=$SECONDS
+            last=$io
+            if [ $((SECONDS - last_change)) -ge "$stall" ]; then
+                warn "$1 ${2:-}: no I/O for ${stall}s — ending it. Process group at that moment:" >&2
+                ps -o pid,stat,etimes,wchan:24,args -g "$pid" >&2 2>/dev/null || true
+                kill -TERM "$pid" 2>/dev/null || true
+                wait "$pid" 2>/dev/null || true
+                rc=125
+                break
+            fi
+            if [ $((SECONDS - beat)) -ge 30 ]; then
+                beat=$SECONDS
+                log "  $1 ${2:-} still running — $((SECONDS - start))s, $(( (io - base) / 1048576 )) MB moved (ceiling ${budget}s)" >&2
+            fi
+        done
+    fi
+    cat "$out"
+    rm -f "$out"
+    return "$rc"
+}
+
 
 # Prune stale native-installer binaries from ~/.local/share/claude/versions,
 # keeping only the one the launcher points at (~300 MB each).
