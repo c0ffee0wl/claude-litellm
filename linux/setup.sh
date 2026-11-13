@@ -923,7 +923,47 @@ if [ "$WITH_LOCAL_LITELLM" = "true" ] && [ "$DOCKER_MODE" != "true" ]; then
 fi
 
 # 4b. Claude Code (official installer; upgrade in place when present; all modes)
-if have_claude; then
+# Official installer, from the script's real home rather than claude.ai/install.sh:
+# that URL is only a 302 to it, and claude.ai sits behind a Cloudflare WAF that
+# 403s some residential IPs outright (seen 2026-11-13 on a Telekom line) while
+# downloads.claude.ai — the host `claude update` itself uses — answers fine.
+# download_and_run (not `curl | bash`): a piped curl masks HTTP errors, so a
+# transient 403/network blip would silently leave `claude` uninstalled and a
+# downstream step would fail with a confusing "claude: not found".
+# Usage: install_claude_code [stable|latest|VERSION]   (installer default: latest)
+install_claude_code() {
+    download_and_run https://downloads.claude.ai/claude-code-releases/bootstrap.sh "Claude Code" bash "$@"
+    have_claude \
+        || warn "Claude Code is NOT installed — 'claude' unavailable; dependent steps (e.g. MCP registration) will be skipped"
+    # Re-establish bash_profile shim (the installer can drop its own).
+    # `force` bypasses the memo in common.sh — the installer just ran.
+    ensure_managed_bash_profile force
+}
+
+# Health gate first: a binary that cannot print its version cannot update itself
+# either, and every later claude call (8e, the overlays, zap-setup) would sit out
+# its own timeout. The checksum then says whether a reinstall can help.
+claude_update_skip=0
+if have_claude && ! run_bounded 30 0 claude --version >/dev/null; then
+    claude_update_skip=1 claude_verify_rc=0
+    claude_binary_verify || claude_verify_rc=$?
+    case "$claude_verify_rc" in
+        0)  warn "Claude Code does not start ('claude --version' failed or hung) although its binary matches Anthropic's checksum — an environment or ~/.claude state problem, not the install; skipping its update. Diagnose: strace -f claude --version" ;;
+        *)  if [ "$claude_verify_rc" = 1 ]; then
+                warn "Claude Code does not start and its binary fails Anthropic's checksum (corrupt) — reinstalling the stable channel"
+            else
+                warn "Claude Code does not start and its binary could not be verified — reinstalling the stable channel"
+            fi
+            # Remove the bad version file first: the installer copies itself into
+            # versions/<ver> and may keep an existing file of the same version.
+            rm -f "$(readlink -f "$(command -v claude 2>/dev/null || echo "${HOME}/.local/bin/claude")")"
+            install_claude_code stable ;;
+    esac
+fi
+
+if [ "$claude_update_skip" = 1 ]; then
+    :
+elif have_claude; then
     # Upgrade-in-place (not skip): `claude update` is a no-op when already latest
     # and still works under DISABLE_AUTOUPDATER=1 (that gates only the background
     # check, not the explicit command; DISABLE_UPDATES is not set).
@@ -941,15 +981,7 @@ if have_claude; then
     esac
 else
     log "Installing Claude Code..."
-    # download_and_run (not `curl | bash`): a piped curl masks HTTP errors, so a
-    # transient 403/network blip would silently leave `claude` uninstalled and a
-    # downstream step would fail with a confusing "claude: not found". Verify after.
-    download_and_run https://claude.ai/install.sh "Claude Code"
-    have_claude \
-        || warn "Claude Code is NOT installed — 'claude' unavailable; dependent steps (e.g. MCP registration) will be skipped"
-    # Re-establish bash_profile shim (the installer can drop its own).
-    # `force` bypasses the memo in common.sh — the installer just ran.
-    ensure_managed_bash_profile force
+    install_claude_code
 fi
 
 # Keep only the active binary in ~/.local/share/claude/versions. Claude Code's

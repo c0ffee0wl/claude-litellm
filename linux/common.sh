@@ -155,7 +155,8 @@ download_to_file() {
 # non-interactive). Returns 0 if the installer ran (its own non-zero exit is
 # warned, not fatal), 1 if the download failed after all attempts. Callers
 # verify the resulting binary themselves.
-# Usage: download_and_run <url> <label> [interpreter]   (interpreter defaults to bash)
+# Usage: download_and_run <url> <label> [interpreter [installer-args...]]
+#        (interpreter defaults to bash)
 download_and_run() {
     local url="$1" label="$2" interp="${3:-bash}"
     local tmp
@@ -164,7 +165,7 @@ download_and_run() {
         # run_bounded: these vendor installers download with bare curl (no
         # timeout) and claude.ai's ends by running `claude install` — the CLI
         # whose tty probe / stray-descendant hangs run_bounded exists for.
-        run_bounded 1200 180 "$interp" "$tmp" || warn "$label installer exited non-zero, stalled or timed out"
+        run_bounded 1200 180 "$interp" "$tmp" "${@:4}" || warn "$label installer exited non-zero, stalled or timed out"
         rm -f "$tmp"
         return 0
     fi
@@ -718,6 +719,37 @@ prune_claude_versions() {
         log "Pruned ${removed} stale Claude Code version(s) — freed $((freed / 1024 / 1024)) MB"
     fi
     return 0
+}
+
+# Check the active Claude Code binary against Anthropic's release manifest —
+# the one test that tells a corrupt install from an environment problem when the
+# CLI will not start. Observed 2026-11-13 on a ct-dfir-llm VM: versions/2.1.311
+# had the right size but the wrong sha256, and every invocation (--version
+# included) parked forever in a futex right after dynamic linking — so
+# `claude update` could not heal it either; only a reinstall can.
+# Returns 0 = matches, 1 = mismatch, 2 = cannot tell (launcher outside the
+# versions dir, unknown arch, manifest unreachable).
+# Usage: claude_binary_verify
+claude_binary_verify() {
+    local launcher target ver platform want have
+    launcher="$(command -v claude 2>/dev/null || echo "${HOME}/.local/bin/claude")"
+    target="$(readlink -f "$launcher" 2>/dev/null)" || return 2
+    ver="${target##*/}"
+    [[ "$ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 2
+    # Platform key as Anthropic's own bootstrap.sh derives it.
+    case "$(uname -m)" in
+        x86_64|amd64) platform=linux-x64 ;;
+        aarch64|arm64) platform=linux-arm64 ;;
+        *) return 2 ;;
+    esac
+    ldd --version 2>&1 | grep -qi musl && platform+="-musl"
+    want="$(curl_secure -fsS --max-time 30 \
+        "https://downloads.claude.ai/claude-code-releases/${ver}/manifest.json" 2>/dev/null \
+        | jq -r --arg p "$platform" '.platforms[$p].checksum // empty' 2>/dev/null)"
+    [ -n "$want" ] || return 2
+    have="$(sha256sum "$target" 2>/dev/null)"; have="${have%% *}"
+    [ -n "$have" ] || return 2
+    [ "$have" = "$want" ]
 }
 
 #############################################################################
