@@ -57,6 +57,8 @@ check 2 "$F" 'rm --r --f x'                        'rm: minimal abbreviation (BY
 check 2 "$F" 'VAR=1 rm --recu --forc x'            'rm: env prefix + abbreviation (BYPASS)'
 check 2 "$F" $'rm \\\n -rf /tmp/x'                'rm: line continuation before flags (BYPASS)'
 check 2 "$F" $'rm -r \\\n -f /tmp/x'             'rm: line continuation between flags (BYPASS)'
+check 2 "$F" $'rm -r\\\nf /tmp/x'                'rm: line continuation inside a flag word (BYPASS)'
+check 2 "$F" $'r\\\nm -rf /tmp/x'                'rm: line continuation inside the command word (BYPASS)'
 
 ### rm guard — must ALLOW (exit 0)
 check 0 "$F" 'rm file.txt && cp -rf a b'    'rm: -rf belongs to cp (regression)'
@@ -97,6 +99,8 @@ check 2 "$F" 'git push origin heads/master'     'push: heads/ shorthand master (
 check 2 "$F" 'git push origin dev:heads/main'   'push: heads/ refspec dest (BYPASS)'
 check 2 "$F" 'git push -f origin +heads/main'   'push: force heads/ shorthand (BYPASS)'
 check 2 "$F" $'git push origin \\\n main'       'push: line continuation before main (BYPASS)'
+check 2 "$F" $'git push origin ma\\\nin'         'push: line continuation inside the branch name (BYPASS)'
+check 2 "$F" $'git pu\\\nsh origin main'         'push: line continuation inside the subcommand (BYPASS)'
 check 2 "$M" 'git push -o ci.skip origin'       'push: -o value is not a refspec (BYPASS)'
 check 2 "$M" 'git push --push-option x origin'  'push: --push-option value (BYPASS)'
 check 2 "$M" 'git push --repo origin'           'push: --repo value on main (BYPASS)'

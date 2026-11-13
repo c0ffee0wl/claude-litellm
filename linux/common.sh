@@ -224,14 +224,16 @@ update_profile_export() {
     # One read of every existing export of the name. A no-op only when it is
     # the SOLE line and already right — a duplicate further down (a hand-fix
     # appended at the bottom) is what login shells actually use (last wins),
-    # so it must fall through to the sed, which rewrites every matching line.
+    # so it must fall through to the sed, which rewrites the first matching
+    # line and DELETES the rest (hold space marks "first seen") — collapsing
+    # the duplicates, so the next run is a no-op again.
     local existing
     existing=$(grep "^export ${var_name}=" "$PROFILE_FILE" 2>/dev/null || true)
     if [ "$existing" = "export ${var_name}=\"${escaped_value}\"" ]; then
         return 0
     fi
     if [ -n "$existing" ]; then
-        sed -i "s|^export ${var_name}=.*|export ${var_name}=\"${sed_value}\"|" "$PROFILE_FILE"
+        sed -i "/^export ${var_name}=/{x;/^seen\$/{x;d};s/.*/seen/;x;s|^export ${var_name}=.*|export ${var_name}=\"${sed_value}\"|}" "$PROFILE_FILE"
     elif grep -q "^#[[:space:]]*export ${var_name}=" "$PROFILE_FILE" 2>/dev/null; then
         sed -i "s|^#[[:space:]]*export ${var_name}=.*|export ${var_name}=\"${sed_value}\"|" "$PROFILE_FILE"
     else
@@ -450,9 +452,13 @@ is_litellm_provider_var() {
 # whole dependency tree's lifecycle scripts; the `claude plugin` network calls).
 # `export -n`, not `unset`: the shell variables stay readable here (Phase 7 reads
 # DATABASE_URL, the end banner ANTHROPIC_AUTH_TOKEN); only inheritance stops.
-# Covers: every name .env assigned (ENV_FILE_VARS, recorded by Phase 5), every
-# exported provider var by collect_litellm_provider_vars' own test (also catches
-# keys exported by the caller rather than .env), and the gateway key names.
+# Covers: every exported provider var by collect_litellm_provider_vars' own test
+# (also catches keys exported by the caller rather than .env), every secret-NAMED
+# var .env assigned (ENV_FILE_VARS, recorded by Phase 5 — UI_PASSWORD, an external
+# DATABASE_URL, …), and the gateway key names. Only secret-named ones: .env may
+# also carry runtime settings the later phases' children NEED — HTTPS_PROXY,
+# NO_PROXY, NODE_EXTRA_CA_CERTS — and un-exporting those breaks the docker pull,
+# git and pnpm behind a proxy.
 # Call only after Phase 6 — collect_litellm_provider_vars reads `compgen -e`.
 # Usage: unexport_secrets
 unexport_secrets() {
@@ -460,7 +466,12 @@ unexport_secrets() {
     while IFS= read -r v; do
         is_litellm_provider_var "$v" && export -n "$v"
     done < <(compgen -e)
-    export -n "${ENV_FILE_VARS[@]}" ANTHROPIC_AUTH_TOKEN LITELLM_API_KEY LITELLM_MASTER_KEY 2>/dev/null || true
+    for v in "${ENV_FILE_VARS[@]}"; do
+        case "$v" in
+            *KEY*|*TOKEN*|*SECRET*|*PASSWORD*|*PASSWD*|*CREDENTIAL*|*SALT*|DATABASE_URL) export -n "$v" ;;
+        esac
+    done
+    export -n ANTHROPIC_AUTH_TOKEN LITELLM_API_KEY LITELLM_MASTER_KEY 2>/dev/null || true
 }
 
 # Machine-readable outcome of the last setup.sh run, for callers that run it as
@@ -603,8 +614,10 @@ SHIM
 #    (OSC 11/DA1 queries answered on stdin) from firing.
 #  - `timeout -k 15 <budget>`: hard ceiling with SIGKILL escalation.
 #  - <stall> > 0 adds a watchdog for long network steps: the process group's
-#    read+write byte counters (/proc/<pid>/io) are sampled every 5s; flat for
-#    <stall> seconds → ended early (125) with the process group printed, and a
+#    read+write byte counters (/proc/<pid>/io) and CPU time (/proc/<pid>/stat)
+#    are sampled every 5s; both flat for <stall> seconds → ended early (125)
+#    with the process group printed (CPU counts because socket recv() is not in
+#    the byte counters — a download buffered in memory shows only as CPU), and a
 #    heartbeat every 30s reports elapsed time and MB moved (no tty → no
 #    progress bar of their own). Unreadable counters disable only the stall
 #    check. <stall> 0 runs in the foreground with no poll at all — the right
@@ -613,7 +626,7 @@ SHIM
 run_bounded() {
     local budget="$1" stall="$2"; shift 2
     local out pid rc=0 start=$SECONDS last_change=$SECONDS beat=$SECONDS
-    local io last=-1 base=-1 p k v tick done_pid
+    local io cpu act last= base=-1 p k v st f tick done_pid
     out="$(mktemp)"
     if [ "$stall" -le 0 ]; then
         timeout -k 15 "$budget" "$@" </dev/null >"$out" 2>&1 || rc=$?
@@ -623,17 +636,28 @@ run_bounded() {
         while :; do
             # Wake on whichever ends first — the command or the 5s sample tick —
             # so the command's exit is seen at once, not on the next tick.
+            # `|| …` on every wait: errexit-safe for a plain-statement caller.
             sleep 5 & tick=$!
-            wait -n -p done_pid "$pid" "$tick" 2>/dev/null; rc=$?
+            rc=0
+            wait -n -p done_pid "$pid" "$tick" 2>/dev/null || rc=$?
             if [ "${done_pid:-}" = "$pid" ]; then
-                kill "$tick" 2>/dev/null; wait "$tick" 2>/dev/null
+                kill "$tick" 2>/dev/null; wait "$tick" 2>/dev/null || true
                 break
             fi
-            rc=0 io=0
+            rc=0 io=0 cpu=0
+            # Activity = file I/O + CPU time over the process group. I/O alone
+            # misses a download: rchar/wchar count read()/write(), not the
+            # recv() a Bun binary reads its sockets with, so a healthy download
+            # buffered in memory would read as "stalled". A download burns CPU
+            # (TLS); a wedged process (futex, dead socket) burns none.
             for p in $(pgrep -g "$pid" 2>/dev/null); do
                 while read -r k v; do
                     case "$k" in rchar:|wchar:) io=$((io + v)) ;; esac
                 done 2>/dev/null < "/proc/$p/io" || true
+                # utime+stime: fields 14/15, i.e. 11/12 after "pid (comm) ".
+                read -r st 2>/dev/null < "/proc/$p/stat" || continue
+                read -ra f <<<"${st##*) }"
+                cpu=$((cpu + ${f[11]:-0} + ${f[12]:-0}))
             done
             # Counters unreadable (hardened /proc): no watchdog is possible —
             # fall back to the plain ceiling instead of polling for nothing.
@@ -642,10 +666,11 @@ run_bounded() {
                 break
             fi
             [ "$base" -lt 0 ] && base=$io
-            [ "$io" != "$last" ] && last_change=$SECONDS
-            last=$io
+            act="$io:$cpu"
+            [ "$act" != "$last" ] && last_change=$SECONDS
+            last=$act
             if [ $((SECONDS - last_change)) -ge "$stall" ]; then
-                warn "$1 ${2:-}: no I/O for ${stall}s — ending it. Process group at that moment:" >&2
+                warn "$1 ${2:-}: no I/O and no CPU for ${stall}s — ending it. Process group at that moment:" >&2
                 ps -o pid,stat,etimes,wchan:24,args -g "$pid" >&2 2>/dev/null || true
                 kill -TERM "$pid" 2>/dev/null || true
                 wait "$pid" 2>/dev/null || true

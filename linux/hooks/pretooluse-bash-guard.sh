@@ -91,6 +91,10 @@ IFS= read -rd '' input
 # INVARIANT: every check in the segment loop below must have its trigger
 # substring listed here — a check without one silently never fires.
 probe=${input//ermission/}
+# A line continuation arrives as `\\\n` (JSON-escaped backslash + newline) and
+# the shell deletes it outright — `r\<newline>m` runs `rm` — so delete it here
+# too, before the quote/backslash scrub would leave a stray `n` between the halves.
+probe=${probe//'\\\n'/}
 probe=${probe//[\"\'\\]/}
 [[ "$probe" == *rm* || "$probe" == *push* ]] || exit 0
 
@@ -98,10 +102,12 @@ CMD=$(jq -r '.tool_input.command // empty' <<<"$input")
 
 block() { echo "BLOCKED: $1" >&2; exit 2; }
 
-# Join backslash-newline continuations first: the shell deletes them before
-# word splitting, so `rm \<newline> -rf x` runs `rm -rf x` — but the newline split
-# below would otherwise put `rm` and its flags in different segments.
-CMD=${CMD//$'\\\n'/ }
+# Delete backslash-newline continuations first, exactly as the shell does before
+# word splitting — deleted, not replaced by a space: `rm -r\<newline>f x` runs
+# `rm -rf x`, and `r\<newline>m` is `rm`. The newline split below would otherwise
+# also put `rm` and its flags in different segments. (Inside single quotes the
+# shell keeps the pair literally; joining there only over-blocks, as accepted above.)
+CMD=${CMD//$'\\\n'/}
 
 seps=';&|()`'
 # NB when adding a check here: register its trigger substring in the fast-path

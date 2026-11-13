@@ -927,12 +927,16 @@ fi
 # that URL is only a 302 to it, and claude.ai sits behind a Cloudflare WAF that
 # 403s some residential IPs outright (seen 2026-11-13 on a Telekom line) while
 # downloads.claude.ai — the host `claude update` itself uses — answers fine.
+# That path is the redirect's target, not a documented entry point, so the
+# documented claude.ai/install.sh stays as the fallback should it ever move.
 # download_and_run (not `curl | bash`): a piped curl masks HTTP errors, so a
 # transient 403/network blip would silently leave `claude` uninstalled and a
 # downstream step would fail with a confusing "claude: not found".
 # Usage: install_claude_code [stable|latest|VERSION]   (installer default: latest)
 install_claude_code() {
-    download_and_run https://downloads.claude.ai/claude-code-releases/bootstrap.sh "Claude Code" bash "$@"
+    download_and_run https://downloads.claude.ai/claude-code-releases/bootstrap.sh "Claude Code" bash "$@" \
+        || download_and_run https://claude.ai/install.sh "Claude Code (claude.ai fallback)" bash "$@" \
+        || true
     have_claude \
         || warn "Claude Code is NOT installed — 'claude' unavailable; dependent steps (e.g. MCP registration) will be skipped"
     # Re-establish bash_profile shim (the installer can drop its own).
@@ -953,11 +957,22 @@ elif ! run_bounded 30 0 claude --version >/dev/null; then
     else
         [ $? = 1 ] && why="fails Anthropic's checksum (corrupt)" || why="could not be verified"
         warn "Claude Code does not start and its binary ${why} — reinstalling the stable channel"
-        # Remove the bad version file first: the installer copies itself into
-        # versions/<ver> and may keep an existing file of the same version. Only
-        # a managed versions/ file — never an unmanaged launcher.
-        bad="$(claude_active_binary)" && rm -f "$bad"
+        # Move the bad version file aside first: the installer copies itself into
+        # versions/<ver> and may keep an existing file of the same version. Aside,
+        # not deleted — if the reinstall fails too (same bad network that made the
+        # checksum unverifiable), it goes back rather than leaving no claude at
+        # all. Only a managed versions/ file, never an unmanaged launcher.
+        bad="" && bad="$(claude_active_binary)" && mv -f "$bad" "${bad}.bad"
         install_claude_code stable
+        if [ -n "$bad" ] && [ -f "${bad}.bad" ]; then
+            # (a working reinstall may be a NEWER stable, so test the CLI, not the path)
+            if run_bounded 30 0 claude --version >/dev/null; then
+                rm -f "${bad}.bad"
+            elif [ ! -e "$bad" ]; then
+                mv -f "${bad}.bad" "$bad"
+                warn "Reinstall did not produce a working Claude Code — put the previous binary back"
+            fi
+        fi
     fi
 else
     # Upgrade-in-place (not skip): `claude update` is a no-op when already latest
@@ -2050,8 +2065,10 @@ if [ "$WITH_POLICY" = "true" ] && have_claude; then
     # `tr -d '\r'` and extract just the bracketed array with
     # `sed -n '/^\[/,/^\]/p'` so jq gets clean input. The sed range tolerates a
     # single-line `[]` (both anchors match the same line, printed once).
+    # stderr dropped (exec inside the bounded child): run_bounded merges it into
+    # the captured stream, and a warning line there would corrupt the JSON range.
     claude_plugin_json() {
-        run_bounded 60 0 claude "$@" --json \
+        run_bounded 60 0 bash -c 'exec "$@" 2>/dev/null' _ claude "$@" --json \
             | tr -d '\r' \
             | sed -n '/^\[/,/^\]/p'
     }
