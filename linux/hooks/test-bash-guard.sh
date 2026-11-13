@@ -55,6 +55,8 @@ check 2 "$F" 'rm --recu --forc /tmp/x'             'rm: long-option abbreviation
 check 2 "$F" 'rm --forc --recu x'                  'rm: abbreviation flag order (BYPASS)'
 check 2 "$F" 'rm --r --f x'                        'rm: minimal abbreviation (BYPASS)'
 check 2 "$F" 'VAR=1 rm --recu --forc x'            'rm: env prefix + abbreviation (BYPASS)'
+check 2 "$F" $'rm \\\n -rf /tmp/x'                'rm: line continuation before flags (BYPASS)'
+check 2 "$F" $'rm -r \\\n -f /tmp/x'             'rm: line continuation between flags (BYPASS)'
 
 ### rm guard — must ALLOW (exit 0)
 check 0 "$F" 'rm file.txt && cp -rf a b'    'rm: -rf belongs to cp (regression)'
@@ -94,6 +96,10 @@ check 2 "$F" 'git push origin heads/main'       'push: heads/ shorthand (BYPASS)
 check 2 "$F" 'git push origin heads/master'     'push: heads/ shorthand master (BYPASS)'
 check 2 "$F" 'git push origin dev:heads/main'   'push: heads/ refspec dest (BYPASS)'
 check 2 "$F" 'git push -f origin +heads/main'   'push: force heads/ shorthand (BYPASS)'
+check 2 "$F" $'git push origin \\\n main'       'push: line continuation before main (BYPASS)'
+check 2 "$M" 'git push -o ci.skip origin'       'push: -o value is not a refspec (BYPASS)'
+check 2 "$M" 'git push --push-option x origin'  'push: --push-option value (BYPASS)'
+check 2 "$M" 'git push --repo origin'           'push: --repo value on main (BYPASS)'
 
 ### push guard — must ALLOW (exit 0)
 check 0 "$F" 'git push origin domain-fix'       'push: main substring in branch (regression)'
@@ -108,6 +114,7 @@ check 0 "$F" 'git stash push'                   'push: git stash push (regressio
 check 0 "$T" 'git push'                         'push: bare outside a repo (regression)'
 check 0 "$F" 'echo push main'                   'push: no git (regression)'
 check 0 "$F" 'git push origin heads/feature-x'  'push: heads/ feature branch'
+check 0 "$M" 'git push -o ci.skip origin feature' 'push: -o value + feature refspec'
 check 0 "$F" 'git commit -m "push heads/main"'  'push: quoted commit msg heads form'
 
 ### fast path — must ALLOW

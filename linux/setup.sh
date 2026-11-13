@@ -162,9 +162,11 @@ fi
 #   - claude update (replaces binary mid-session)
 #   - bun add -g for ACP (overwrites running binaries)
 #   - litellm service restart (drops in-flight proxy connections)
+write_run_status running
 if pgrep -u "$USER" -x "claude" &>/dev/null || \
    pgrep -u "$USER" -f "claude-agent-acp" &>/dev/null; then
     log "Claude Code or ACP adapter is running — skipping update to avoid session disruption"
+    write_run_status skipped-session
     exit 0
 fi
 
@@ -1036,6 +1038,7 @@ log "Tools phase complete"
 log "=== Phase 5: env vars ==="
 
 ENV_FILE="${REPO_DIR}/.env"
+ENV_FILE_VARS=()
 if [ -f "$ENV_FILE" ]; then
     # Source .env so we can pick out individual values below. Provider secrets
     # (AZURE_*/GEMINI_*/GOOGLE_*) are NOT written into ~/.profile — they live
@@ -1044,6 +1047,8 @@ if [ -f "$ENV_FILE" ]; then
     # shellcheck disable=SC1090
     source "$ENV_FILE"
     set +a
+    # Names it assigned, for unexport_secrets after Phase 6 (`set -a` exported all).
+    mapfile -t ENV_FILE_VARS < <(sed -nE 's/^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)=.*/\2/p' "$ENV_FILE")
 else
     warn ".env not found at ${ENV_FILE}; continuing without it."
     warn "Provider vars from the current shell + ~/.profile will still be picked up."
@@ -1467,7 +1472,12 @@ if [ "$WITH_LOCAL_LITELLM" = "true" ]; then
         # SHOW port follows.) Anchor on the port, not "the first cluster": pg_lsclusters
         # sorts by version, so after a major upgrade NR==1 can be a stale cluster
         # on 5433. The Port column is config-derived, so it's right even while down.
-        pg_target=$(pg_lsclusters -h 2>/dev/null | awk '$3==5432 {print $1"-"$2; exit}' || true)
+        # A SOLE cluster on another port (drifted to 5433, or moved there by the
+        # user as the documented port-capture repair) is the one pg_wrapper
+        # routes to anyway — anchor on it too, or it would never be enabled and
+        # stay down after every reboot on preset-disabled Kali.
+        pg_target=$(pg_lsclusters -h 2>/dev/null \
+            | awk 'NF<3 {next} $3==5432 {hit=$1"-"$2} {n++; only=$1"-"$2} END {print (hit != "" ? hit : (n==1 ? only : ""))}' || true)
 
         # Make autostart survive reboot. Kali ships services preset-disabled, and
         # `postgresql.service` is a /bin/true umbrella whose link to the real
@@ -1484,7 +1494,7 @@ if [ "$WITH_LOCAL_LITELLM" = "true" ]; then
             # enable forever and the cluster stays dead after every reboot.
             sudo systemctl enable --now "postgresql@${pg_target}" || true
         else
-            warn "No local Postgres cluster on port 5432 — falling back to 'systemctl start postgresql'"
+            warn "No local Postgres cluster on port 5432 (and not exactly one cluster) — falling back to 'systemctl start postgresql'"
             sudo systemctl start postgresql || true
         fi
 
@@ -1494,6 +1504,12 @@ if [ "$WITH_LOCAL_LITELLM" = "true" ]; then
         # dead socket (the "No such file or directory" failure on a fresh boot).
         for _ in {1..30}; do pg_isready -q && break; sleep 1; done
         pg_isready -q || { error "Postgres not accepting connections after 30s"; exit 1; }
+
+        # Before the role/db queries: a libc upgrade (Kali's glibc 2.42 → 2.43)
+        # leaves every pre-existing database with a stale recorded collation
+        # version — a WARNING on each connection, and on PG15+ a hard
+        # createdb failure from template1 (see the helper's docstring).
+        pg_refresh_collation_versions
 
         LITELLM_DB_PASSWORD="${PERSISTED_DB_PASSWORD:-$(openssl rand -hex 24)}"
         [ -z "$PERSISTED_DB_PASSWORD" ] && log "Generated new LITELLM_DB_PASSWORD"
@@ -1644,9 +1660,17 @@ if [ "$WITH_LOCAL_LITELLM" = "true" ]; then
     fi
 fi
 
+# Provider secrets have reached their only destination (Phase 6's env file) —
+# stop exporting them (and everything else .env held) before Phases 7-11 spawn
+# third-party code. Runs in every mode: Phase 5 sourced .env even where Phase 6
+# was skipped.
+unexport_secrets
+
 #############################################################################
 # PHASE 7: LiteLLM config + service
 #############################################################################
+
+LITELLM_RUN_STATE=none   # Phase 7's verdict for write_run_status
 
 # (systemd --user lingering is enabled earlier, before Phase 2b.)
 # Skipped in harden-only / install-only (no local LiteLLM service).
@@ -1786,6 +1810,7 @@ if [ "$WITH_LOCAL_LITELLM" = "true" ]; then
         # restart; `enable` is left alone so a later `systemctl --user start`
         # or reboot behaves as before.
         stop_user_service litellm
+        LITELLM_RUN_STATE=client-broken
         warn "LiteLLM left stopped — ${LITELLM_CLIENT_BROKEN_WHY:-Prisma client} failure in Phase 4a; see the banner at the end"
     else
         # In native mode this is the run's ONLY litellm start (Phase 4a stops
@@ -1817,6 +1842,7 @@ if [ "$WITH_LOCAL_LITELLM" = "true" ]; then
         # endpoint may legitimately be unreachable from this box, and a
         # transient failure must not fail an otherwise complete deployment.
         if wait_for_litellm "$LITELLM_PORT" "$litellm_wait_budget"; then
+            LITELLM_RUN_STATE=ready
             for _dns_host in $(litellm_endpoint_hosts "$LITELLM_ENV_FILE"); do
                 case "$(endpoint_dns_state "$_dns_host")" in
                     ok) ;;
@@ -1835,6 +1861,7 @@ if [ "$WITH_LOCAL_LITELLM" = "true" ]; then
             done
             unset _dns_host
         else
+            LITELLM_RUN_STATE=not-ready
             warn "LiteLLM may not be ready — Claude Code calls could fail until it starts"
         fi
     fi
@@ -1927,22 +1954,31 @@ else
     # Value comes from the template, never a literal — a second copy would silently heal
     # existing boxes onto a stale path after the template changes. `VAR=$(jq …)` first:
     # no pipefail here, so a piped jq failure would write an empty settings.json.
-    if ! jq -e 'has("statusLine")' "${HOME}/.claude/settings.json" >/dev/null 2>&1; then
-        HEALED_SETTINGS=$(jq --slurpfile tpl "$SCRIPT_DIR/configs/claude-settings.json" \
-            '.statusLine //= $tpl[0].statusLine' "${HOME}/.claude/settings.json")
-        printf '%s\n' "$HEALED_SETTINGS" | write_if_changed "${HOME}/.claude/settings.json" 644 \
-            && log "~/.claude/settings.json: added missing statusLine"
-    fi
+    # One jq read answers both has() questions below; if it fails the file is
+    # unparseable (a hand edit with a trailing comma, …) — then both probes would
+    # read "key missing" and the heal's jq would abort the rest of the run under
+    # `set -e` (8d, 8e, 9–11, every banner). Leave a CC-owned file we can't parse
+    # untouched and say why.
+    if ! settings_keys=$(jq -r '"\(has("statusLine")) \(has("sandbox"))"' "${HOME}/.claude/settings.json" 2>/dev/null); then
+        warn "~/.claude/settings.json is not valid JSON — skipping the statusLine heal and sandbox check (fix it, e.g. 'jq . ~/.claude/settings.json', then re-run)."
+    else
+        if [ "${settings_keys% *}" != true ]; then
+            HEALED_SETTINGS=$(jq --slurpfile tpl "$SCRIPT_DIR/configs/claude-settings.json" \
+                '.statusLine //= $tpl[0].statusLine' "${HOME}/.claude/settings.json")
+            printf '%s\n' "$HEALED_SETTINGS" | write_if_changed "${HOME}/.claude/settings.json" 644 \
+                && log "~/.claude/settings.json: added missing statusLine"
+        fi
 
-    # sandbox: it does. Never auto-modify — but without a persisted block the
-    # statusline can't detect the sandbox (a /sandbox-picker toggle is runtime-only —
-    # anthropics/claude-code#47624 — and undetectable). The fix-it command
-    # (scripts/add-sandbox-block.sh, same `//=` merge, run by the user) is surfaced in
-    # the end-of-script banner via the NEEDS_MODEL_CONFIG pattern — printed inline here
-    # it would scroll off behind Phases 9–11. The warn keeps non-tty runs actionable.
-    if ! jq -e 'has("sandbox")' "${HOME}/.claude/settings.json" >/dev/null 2>&1; then
-        NEEDS_SANDBOX_BLOCK=1
-        warn "~/.claude/settings.json has no sandbox block — run linux/scripts/add-sandbox-block.sh (details in the end-of-setup banner)."
+        # sandbox: it does. Never auto-modify — but without a persisted block the
+        # statusline can't detect the sandbox (a /sandbox-picker toggle is runtime-only —
+        # anthropics/claude-code#47624 — and undetectable). The fix-it command
+        # (scripts/add-sandbox-block.sh, same `//=` merge, run by the user) is surfaced in
+        # the end-of-script banner via the NEEDS_MODEL_CONFIG pattern — printed inline here
+        # it would scroll off behind Phases 9–11. The warn keeps non-tty runs actionable.
+        if [ "${settings_keys#* }" != true ]; then
+            NEEDS_SANDBOX_BLOCK=1
+            warn "~/.claude/settings.json has no sandbox block — run linux/scripts/add-sandbox-block.sh (details in the end-of-setup banner)."
+        fi
     fi
 fi
 
@@ -2314,6 +2350,7 @@ fi
 ensure_managed_bash_profile force
 
 log "claude-litellm setup complete!"
+write_run_status complete "$LITELLM_RUN_STATE"
 # LiteLLM UI only exists when a local LiteLLM was installed (not harden-only /
 # install-only). DevTools is installed in install-only too, so print it whenever
 # it deployed, regardless of mode.

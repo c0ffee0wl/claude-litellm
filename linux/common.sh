@@ -205,9 +205,11 @@ update_profile_export() {
     escaped_value="${escaped_value//\$/\\\$}"    # $ -> \$
     escaped_value="${escaped_value//\`/\\\`}"    # ` -> \`
 
-    # For sed replacement, also escape & (special in the replacement string)
-    # and | (the s||| delimiter — an unescaped one truncates the expression).
-    local sed_value="$escaped_value"
+    # For the sed replacement: double every backslash FIRST (sed consumes one
+    # level — without this `\"` lands as a bare `"` and a changed value with a
+    # quote, $ or backtick writes a broken/expanding line), then escape &
+    # (special in the replacement) and | (the s||| delimiter).
+    local sed_value="${escaped_value//\\/\\\\}"
     sed_value="${sed_value//&/\\&}"              # & -> \&
     sed_value="${sed_value//|/\\|}"              # | -> \|
 
@@ -215,10 +217,16 @@ update_profile_export() {
     # Already exactly this line? Skip the sed -i full-file rewrite — with
     # ~36 calls per setup run this keeps a no-op re-run from rewriting
     # ~/.profile dozens of times.
-    if grep -qxF "export ${var_name}=\"${escaped_value}\"" "$PROFILE_FILE" 2>/dev/null; then
+    # One read of every existing export of the name. A no-op only when it is
+    # the SOLE line and already right — a duplicate further down (a hand-fix
+    # appended at the bottom) is what login shells actually use (last wins),
+    # so it must fall through to the sed, which rewrites every matching line.
+    local existing
+    existing=$(grep "^export ${var_name}=" "$PROFILE_FILE" 2>/dev/null || true)
+    if [ "$existing" = "export ${var_name}=\"${escaped_value}\"" ]; then
         return 0
     fi
-    if grep -q "^export ${var_name}=" "$PROFILE_FILE" 2>/dev/null; then
+    if [ -n "$existing" ]; then
         sed -i "s|^export ${var_name}=.*|export ${var_name}=\"${sed_value}\"|" "$PROFILE_FILE"
     elif grep -q "^#[[:space:]]*export ${var_name}=" "$PROFILE_FILE" 2>/dev/null; then
         sed -i "s|^#[[:space:]]*export ${var_name}=.*|export ${var_name}=\"${sed_value}\"|" "$PROFILE_FILE"
@@ -257,7 +265,8 @@ read_profile_export() {
     local line
 
     [ -f "$PROFILE_FILE" ] || return 0
-    line=$(grep "^export ${var_name}=" "$PROFILE_FILE" 2>/dev/null | head -1)
+    # Last match, like the shell that sources the file (and read_env_file_var).
+    line=$(grep "^export ${var_name}=" "$PROFILE_FILE" 2>/dev/null | tail -1)
     [ -z "$line" ] && return 0
     local raw="${line#export ${var_name}=}"
     local value
@@ -427,6 +436,48 @@ is_litellm_provider_var() {
     [[ "$name" =~ $LITELLM_PROVIDER_EXCLUDE ]] && return 1
     [[ "$name" =~ $LITELLM_PROVIDER_PATTERN ]] && return 0
     [[ " ${LITELLM_PROVIDER_NAMED[*]} " == *" $name "* ]]
+}
+
+# Stop exporting the secrets this script holds, so no child inherits them.
+# Phase 5 sources .env with `set -a`, which exports EVERY assignment in it —
+# provider keys, the LITELLM_* gateway key an overlay writes there, an external
+# DATABASE_URL — into every child the script spawns from then on, and Phases
+# 7-11 run third-party code (claude-devtools' `pnpm install`/build executes its
+# whole dependency tree's lifecycle scripts; the `claude plugin` network calls).
+# `export -n`, not `unset`: the shell variables stay readable here (Phase 7 reads
+# DATABASE_URL, the end banner ANTHROPIC_AUTH_TOKEN); only inheritance stops.
+# Covers: every name .env assigned (ENV_FILE_VARS, recorded by Phase 5), every
+# exported provider var by collect_litellm_provider_vars' own test (also catches
+# keys exported by the caller rather than .env), and the gateway key names.
+# Call only after Phase 6 — collect_litellm_provider_vars reads `compgen -e`.
+# Usage: unexport_secrets
+unexport_secrets() {
+    local v
+    while IFS= read -r v; do
+        is_litellm_provider_var "$v" && export -n "$v"
+    done < <(compgen -e)
+    export -n "${ENV_FILE_VARS[@]}" ANTHROPIC_AUTH_TOKEN LITELLM_API_KEY LITELLM_MASTER_KEY 2>/dev/null || true
+}
+
+# Machine-readable outcome of the last setup.sh run, for callers that run it as
+# a subprocess (the ct-* overlays). Its exit status alone can't carry this: the
+# claude-is-running skip exits 0 by design, exactly like a full run, so a caller
+# would otherwise have to re-implement the session detection (and race it).
+# Fixed path — a contract, not XDG-relative: callers run us via sudo, where
+# XDG_STATE_HOME is reset. KEY=value lines; callers must PARSE it, never source
+# it — the file is user-writable and an overlay reads it as root. Keys:
+#   outcome = running | skipped-session | complete   (`running` left behind = the
+#             run aborted part-way)
+#   litellm = none | ready | not-ready | client-broken   (Phase 7's verdict;
+#             client-broken = deliberately left stopped, never restart it)
+# Written via a temp file in the SAME directory, so the mv is a real rename and
+# a reader never sees a partial file. Never fatal.
+# Usage: write_run_status <outcome> [litellm-state]
+RUN_STATUS_FILE="${HOME}/.local/state/claude-litellm/run-status"
+write_run_status() {
+    mkdir -p "${RUN_STATUS_FILE%/*}" 2>/dev/null \
+        && printf 'outcome=%s\nlitellm=%s\n' "$1" "${2:-none}" > "${RUN_STATUS_FILE}.tmp" \
+        && mv -f "${RUN_STATUS_FILE}.tmp" "$RUN_STATUS_FILE" || true
 }
 
 # Emit `KEY=VALUE` lines for every LiteLLM-relevant provider env var found in
@@ -860,6 +911,83 @@ ensure_pg_socket_scram_rule() {
     # hba_file), so a failure is anomalous; warn with a command that works.
     sudo -u postgres psql -qAtc 'SELECT pg_reload_conf()' >/dev/null 2>&1 \
         || warn "Could not reload Postgres — apply with: sudo -u postgres psql -c 'SELECT pg_reload_conf()'"
+}
+
+# Heal a C-library collation-version mismatch (PostgreSQL ≥15). Postgres records
+# the libc/ICU collation version each database was created under
+# (pg_database.datcollversion) and, once the OS version moves on, WARNs on every
+# connection — "database "postgres" has a collation version mismatch … created
+# using collation version 2.42, but the operating system provides version 2.43"
+# (observed 2026-11-13 on Kali after glibc 2.42 → 2.43; a rolling distro hits
+# this on every glibc bump, a stable one essentially never). The warning is
+# about correctness, not noise: a btree index over default-collation text may
+# be ordered by the OLD rules, so lookups through it can silently miss rows
+# until it is rebuilt. Upstream's remedy, verbatim from the HINT: rebuild, then
+# `ALTER DATABASE … REFRESH COLLATION VERSION`.
+#
+# Scope is the databases this setup owns or connects to, nothing else:
+#   - litellm   — ours; its text indexes (keys, model names) are the ones at risk
+#   - postgres  — the maintenance DB every bootstrap `sudo -u postgres psql`
+#                 lands on (the source of the two warnings in Phase 6's output)
+#   - template1 — PG15+ CREATE DATABASE *refuses* to copy a template whose
+#                 version mismatches ("template database "template1" has a
+#                 collation version mismatch"), so on a box whose cluster
+#                 predates the libc bump a FRESH litellm install would fail
+#                 at createdb — the hard failure hiding behind the warning
+# Any other mismatched database (e.g. Kali's metasploit `msf`) belongs to
+# another tool and gets a warning with the fix, never a silent REINDEX —
+# rebuilding someone else's indexes is the user's call. template0 is skipped
+# by construction: initdb stores its datcollversion as NULL.
+#
+# REINDEX DATABASE and the refresh run in ONE psql session connected to the
+# target (REINDEX DATABASE can only name the current database), as separate
+# -c statements (each its own transaction; REINDEX DATABASE cannot run inside
+# one), with ON_ERROR_STOP so a failed rebuild never records the new version —
+# a nagging warning beats silencing it over possibly mis-ordered indexes.
+# PG16+ REINDEX DATABASE skips system catalogs, which is correct here: catalog
+# text columns use the "C" collation, which no libc upgrade can change. Phase 6
+# runs this while litellm is stopped (Phase 4a's stop; start deferred to
+# Phase 7), so the rebuild's per-table locks contend with nothing; under
+# --docker the container may be up, and REINDEX simply queues its writes for
+# the seconds a small table takes. Called before any other Phase 6 query so
+# the rest of the phase runs warning-free. Never fatal: always returns 0.
+# Usage: pg_refresh_collation_versions
+pg_refresh_collation_versions() {
+    local rows db err others=()
+    # stderr dropped deliberately: this very connection (to `postgres`) is one
+    # that emits the mismatch WARNING. It doubles as the version gate:
+    # datcollversion / pg_database_collation_actual_version() are PG15+, so on
+    # an older server (no per-database version, never this warning) the query
+    # errors and `|| return 0` reads that as nothing to do. `<>` (not IS
+    # DISTINCT FROM) so a NULL actual version — a provider without versioning —
+    # never counts as drift.
+    rows="$(sudo -u postgres psql -XtAc "SELECT datname FROM pg_database
+        WHERE datallowconn AND datcollversion IS NOT NULL
+          AND datcollversion <> pg_database_collation_actual_version(oid)
+        ORDER BY datname" 2>/dev/null)" || return 0
+    [ -n "$rows" ] || return 0
+    while IFS= read -r db; do
+        case "$db" in
+            litellm|postgres|template1)
+                log "Postgres database '${db}': collation version changed (C library upgrade) — rebuilding indexes + refreshing the recorded version..."
+                # Fixed identifiers only (the case arm above), so the inline
+                # quoting is safe. stderr captured, not shown: a successful run
+                # still prints the connect-time WARNING and the refresh NOTICE.
+                if err="$(sudo -u postgres psql -Xq -v ON_ERROR_STOP=1 -d "$db" \
+                        -c "REINDEX DATABASE \"${db}\"" \
+                        -c "ALTER DATABASE \"${db}\" REFRESH COLLATION VERSION" 2>&1 >/dev/null)"; then
+                    log "Postgres database '${db}': collation version refreshed"
+                else
+                    warn "Postgres database '${db}': collation refresh failed — left as-is (the mismatch warning will continue). Last error: $(printf '%s\n' "$err" | grep -E 'ERROR|FATAL' | tail -n1)"
+                fi
+                ;;
+            *) others+=("$db") ;;
+        esac
+    done <<< "$rows"
+    if [ "${#others[@]}" -gt 0 ]; then
+        warn "Postgres database(s) not managed by this setup report a collation version mismatch (C library upgrade): ${others[*]} — left untouched. Fix each with: sudo -u postgres psql -d <db> -c 'REINDEX DATABASE <db>' -c 'ALTER DATABASE <db> REFRESH COLLATION VERSION'"
+    fi
+    return 0
 }
 
 # Probe a Postgres connection URL (Phase 6's socket preflight). The URL must

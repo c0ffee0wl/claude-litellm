@@ -98,6 +98,11 @@ CMD=$(jq -r '.tool_input.command // empty' <<<"$input")
 
 block() { echo "BLOCKED: $1" >&2; exit 2; }
 
+# Join backslash-newline continuations first: the shell deletes them before
+# word splitting, so `rm \<newline> -rf x` runs `rm -rf x` — but the newline split
+# below would otherwise put `rm` and its flags in different segments.
+CMD=${CMD//$'\\\n'/ }
+
 seps=';&|()`'
 # NB when adding a check here: register its trigger substring in the fast-path
 # probe at the top, or the new check never runs on most commands.
@@ -153,6 +158,13 @@ while IFS= read -r seg; do
             [ "$tok" = "push" ] && seen_push=1
             continue
         fi
+        # Value of a push option given as a separate word (`-o ci.skip`,
+        # `--repo origin`) is not a refspec: counting it as one would lift
+        # nonflag to 2 and skip stage 3's bare-push check.
+        case "$prev" in
+            -o|--push-option|--repo|--receive-pack|--exec) prev=""; continue ;;
+        esac
+        prev="$tok"
         tok="${tok#+}"  # a force refspec (+main) still targets main
         case "$tok" in
             -*|'') ;;
