@@ -1346,8 +1346,8 @@ if [ "$WITH_GATEWAY" = "true" ]; then
         unset _ctx
     fi
     # Discovery: populate /model from the gateway's /v1/models (CC >=2.1.129;
-    # claude-*/anthropic-* ids only; also needs LiteLLM >=1.95.0 — the
-    # two-gate story is in CLAUDE.md > "Model naming").
+    # every id from CC 2.1.323, claude-*/anthropic-* only before; also needs
+    # LiteLLM >=1.95.0 — the gates are in CLAUDE.md > "Model naming").
     update_profile_export "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY" "1"
     # Effort for custom model ids — the documented gateway lever; models that
     # reject effort are still excluded by CC, so safe for /ui-added entries.

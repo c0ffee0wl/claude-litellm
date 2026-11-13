@@ -45,8 +45,6 @@
         "~/.local/state/claude-litellm/db-backups",
         "//root",
         "//etc/shadow",
-        "//etc/passwd",
-        "//etc/group",
         "//etc/claude-code"
       ],
       "denyWrite": [
@@ -73,7 +71,10 @@
       "allowedDomains": [
         "github.com",
         "*.npmjs.org",
-        "pypi.org"
+        "pypi.org",
+        "files.pythonhosted.org",
+        "codeload.github.com",
+        "*.githubusercontent.com"
       ],
       "deniedDomains": ["uploads.github.com"],
       "allowUnixSockets": ["~/.agent-browser/default.sock"]
