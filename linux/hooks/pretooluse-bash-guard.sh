@@ -38,10 +38,13 @@
 # basename, so the shell-equivalent spellings `\rm`, `"rm"`, `r\m`, `/bin/rm`,
 # `./rm` and `rm "-rf"` all count as rm -rf (rm's damage is irreversible, so
 # unlike git below the path form is NOT an accepted residual). Leading shell
-# keywords (`do`/`then`/`{`/`time`/`!`) and env-assignment prefixes are skipped
-# before the command word is read, so the loop/conditional/group/assignment
-# spellings (`for … do rm -rf x; done`, `{ rm -rf x; }`, `VAR=1 rm -rf x`)
-# are command positions too and block.
+# keywords (`do`/`then`/`{`/`time` + its options/`!`), env-assignment prefixes
+# and leading redirections (`2>/dev/null`, `</dev/null`, `> f`, `>&2`) are
+# skipped before the command word is read, so the loop/conditional/group/
+# assignment/redirection spellings (`for … do rm -rf x; done`, `{ rm -rf x; }`,
+# `VAR=1 rm -rf x`, `2>/dev/null rm -rf x`) are command positions too and
+# block; a brace expansion in command position (`{rm,-rf,x}`) is expanded
+# first, as bash will.
 #
 # push check, three stages per push segment:
 #   1. The segment must be a git push invocation. Global options (-C <path>,
@@ -128,21 +131,46 @@ while IFS= read -r seg; do
     # modifiers, and env-assignment prefixes. Without this skip,
     # `for d in a b; do rm -rf "$d"; done`, `if x; then rm -rf y; fi`,
     # `{ rm -rf x; }` and `VAR=1 rm -rf x` all read their command word as the
-    # keyword/assignment and the rm check never fires.
+    # keyword/assignment and the rm check never fires. Also skipped:
+    # redirections, which the shell allows BEFORE the command word
+    # (`2>/dev/null rm -rf x`, `</dev/null rm …`; a bare operator like `>`
+    # takes its target as the next word), a lone fd number (`>&2 rm …` splits
+    # at the `&` separator into `>` and `2 rm …`), and `time`'s own options
+    # (`time -p rm …`). A brace expansion in command position (`{rm,-rf,x}`)
+    # is expanded the way bash will before matching.
     cw=${useg#"${useg%%[![:space:]]*}"}
+    skip_next=0 after_time=0
     while [ -n "$cw" ]; do
         w=${cw%%[[:space:]]*}
-        case "$w" in
-            do|then|else|elif|if|while|until|time|!|'{'|'}'|*=*) ;;
-            *) break ;;
-        esac
+        if [ "$skip_next" = 1 ]; then
+            skip_next=0
+        elif [ "$after_time" = 1 ] && [[ "$w" == -* ]]; then
+            :
+        else
+            after_time=0
+            case "$w" in
+                time) after_time=1 ;;
+                do|then|else|elif|if|while|until|!|'{'|'}'|*=*) ;;
+                [0-9]|[0-9][0-9]) ;;
+                # bare operator: its target is the next word
+                \>|\>\>|\>\||\<|\<\<|\<\<\<|\<\>|[0-9]\>|[0-9]\>\>|[0-9]\<) skip_next=1 ;;
+                # operator with its target attached
+                [\<\>]*|[0-9][\<\>]*|[0-9][0-9][\<\>]*) ;;
+                *) break ;;
+            esac
+        fi
         cw=${cw#"$w"}
         cw=${cw#"${cw%%[![:space:]]*}"}
     done
     w=${cw%%[[:space:]]*}
+    if [[ "$w" == '{'*,*'}'* ]]; then
+        w=${w//,/ }; w=${w//[\{\}]/}
+        cw="$w ${cw#*\}}"
+        w=${cw%%[[:space:]]*}
+    fi
     if [ "${w##*/}" = rm ]; then
-        if [[ "$useg" =~ (^|[[:space:]])(-[a-zA-Z]*[rR]|--r) ]] \
-            && [[ "$useg" =~ (^|[[:space:]])(-[a-zA-Z]*[fF]|--f) ]]; then
+        if [[ "$cw" =~ (^|[[:space:]])(-[a-zA-Z]*[rR]|--r) ]] \
+            && [[ "$cw" =~ (^|[[:space:]])(-[a-zA-Z]*[fF]|--f) ]]; then
             block 'recursive force delete is not allowed'
         fi
         continue
