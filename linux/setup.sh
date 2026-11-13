@@ -940,30 +940,26 @@ install_claude_code() {
     ensure_managed_bash_profile force
 }
 
-# Health gate first: a binary that cannot print its version cannot update itself
-# either, and every later claude call (8e, the overlays, zap-setup) would sit out
-# its own timeout. The checksum then says whether a reinstall can help.
-claude_update_skip=0
-if have_claude && ! run_bounded 30 0 claude --version >/dev/null; then
-    claude_update_skip=1 claude_verify_rc=0
-    claude_binary_verify || claude_verify_rc=$?
-    case "$claude_verify_rc" in
-        0)  warn "Claude Code does not start ('claude --version' failed or hung) although its binary matches Anthropic's checksum — an environment or ~/.claude state problem, not the install; skipping its update. Diagnose: strace -f claude --version" ;;
-        *)  if [ "$claude_verify_rc" = 1 ]; then
-                warn "Claude Code does not start and its binary fails Anthropic's checksum (corrupt) — reinstalling the stable channel"
-            else
-                warn "Claude Code does not start and its binary could not be verified — reinstalling the stable channel"
-            fi
-            # Remove the bad version file first: the installer copies itself into
-            # versions/<ver> and may keep an existing file of the same version.
-            rm -f "$(readlink -f "$(command -v claude 2>/dev/null || echo "${HOME}/.local/bin/claude")")"
-            install_claude_code stable ;;
-    esac
-fi
-
-if [ "$claude_update_skip" = 1 ]; then
-    :
-elif have_claude; then
+# Three states, one chain: missing → install; present but unable to print its
+# version → heal (it cannot update itself either, and every later claude call —
+# 8e, the overlays, zap-setup — would sit out its own timeout); healthy → update.
+if ! have_claude; then
+    log "Installing Claude Code..."
+    install_claude_code
+elif ! run_bounded 30 0 claude --version >/dev/null; then
+    # The checksum says whether a reinstall can help.
+    if claude_binary_verify; then
+        warn "Claude Code does not start ('claude --version' failed or hung) although its binary matches Anthropic's checksum — an environment or ~/.claude state problem, not the install; skipping its update. Diagnose: strace -f claude --version"
+    else
+        [ $? = 1 ] && why="fails Anthropic's checksum (corrupt)" || why="could not be verified"
+        warn "Claude Code does not start and its binary ${why} — reinstalling the stable channel"
+        # Remove the bad version file first: the installer copies itself into
+        # versions/<ver> and may keep an existing file of the same version. Only
+        # a managed versions/ file — never an unmanaged launcher.
+        bad="$(claude_active_binary)" && rm -f "$bad"
+        install_claude_code stable
+    fi
+else
     # Upgrade-in-place (not skip): `claude update` is a no-op when already latest
     # and still works under DISABLE_AUTOUPDATER=1 (that gates only the background
     # check, not the explicit command; DISABLE_UPDATES is not set).
@@ -979,9 +975,6 @@ elif have_claude; then
         124|137) warn "claude update exceeded its $((cu_budget / 60)) min ceiling and was ended — keeping existing version; the next run retries" ;;
         *) warn "claude update failed or stalled (rc=${claude_update_rc}) — keeping existing version; the next run retries" ;;
     esac
-else
-    log "Installing Claude Code..."
-    install_claude_code
 fi
 
 # Keep only the active binary in ~/.local/share/claude/versions. Claude Code's

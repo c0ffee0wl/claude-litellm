@@ -163,7 +163,7 @@ download_and_run() {
     tmp="$(mktemp)"
     if download_to_file "$url" "$tmp" "$label installer"; then
         # run_bounded: these vendor installers download with bare curl (no
-        # timeout) and claude.ai's ends by running `claude install` — the CLI
+        # timeout) and Claude Code's bootstrap.sh ends by running `claude install` — the CLI
         # whose tty probe / stray-descendant hangs run_bounded exists for.
         run_bounded 1200 180 "$interp" "$tmp" "${@:4}" || warn "$label installer exited non-zero, stalled or timed out"
         rm -f "$tmp"
@@ -664,6 +664,26 @@ run_bounded() {
 }
 
 
+# Where the claude launcher is: on PATH, else where the installer puts it (a
+# fresh install in this same run may not be on PATH yet).
+claude_launcher() { command -v claude 2>/dev/null || echo "${HOME}/.local/bin/claude"; }
+# Same resolution the binary uses (env-paths): XDG_DATA_HOME, else ~/.local/share.
+claude_versions_dir() { echo "${XDG_DATA_HOME:-${HOME}/.local/share}/claude/versions"; }
+
+# The live Claude Code binary — the launcher symlink's target inside the versions
+# dir, the only layout Claude Code itself manages (and so the only one in which
+# a version file may be pruned, verified or removed). Prints it; returns 1 when
+# the launcher is not a symlink, 2 when it resolves outside the versions dir.
+# Usage: target=$(claude_active_binary)
+claude_active_binary() {
+    local launcher target
+    launcher="$(claude_launcher)"
+    [ -L "$launcher" ] || return 1
+    target="$(readlink -f "$launcher" 2>/dev/null)" || return 2
+    [[ "$target" == "$(claude_versions_dir)"/* ]] || return 2
+    printf '%s\n' "$target"
+}
+
 # Prune stale native-installer binaries from ~/.local/share/claude/versions,
 # keeping only the one the launcher points at (~300 MB each).
 #
@@ -681,22 +701,20 @@ run_bounded() {
 # own — a silent state worth surfacing. We bail out for the same reason it does:
 # with no symlink there is no way to tell which binary is live.
 prune_claude_versions() {
-    local launcher versions_dir target running f size removed=0 freed=0
+    local versions_dir target running f size removed=0 freed=0
 
-    launcher="$(command -v claude 2>/dev/null || echo "${HOME}/.local/bin/claude")"
-    # Same resolution the binary uses (env-paths): XDG_DATA_HOME, else ~/.local/share.
-    versions_dir="${XDG_DATA_HOME:-${HOME}/.local/share}/claude/versions"
+    versions_dir="$(claude_versions_dir)"
     [ -d "$versions_dir" ] || return 0
 
-    if [ ! -L "$launcher" ]; then
-        warn "Claude Code launcher ${launcher} is not a symlink — its built-in version cleanup is disabled and updates cannot replace it; remove the file and re-run 'claude install stable'"
-        return 0
-    fi
-    target="$(readlink -f "$launcher" 2>/dev/null)" || return 0
-    if [[ "$target" != "$versions_dir"/* ]]; then
-        warn "Claude Code launcher ${launcher} resolves outside ${versions_dir} — skipping version prune"
-        return 0
-    fi
+    local rc=0
+    target="$(claude_active_binary)" || rc=$?
+    case "$rc" in
+        0) ;;
+        1) warn "Claude Code launcher $(claude_launcher) is not a symlink — its built-in version cleanup is disabled and updates cannot replace it; remove the file and re-run 'claude install stable'"
+           return 0 ;;
+        *) warn "Claude Code launcher $(claude_launcher) resolves outside ${versions_dir} — skipping version prune"
+           return 0 ;;
+    esac
 
     # Binaries of live processes, collected once. Deleting a running executable
     # is harmless on Linux (the inode survives), but a session that re-execs
@@ -727,13 +745,12 @@ prune_claude_versions() {
 # had the right size but the wrong sha256, and every invocation (--version
 # included) parked forever in a futex right after dynamic linking — so
 # `claude update` could not heal it either; only a reinstall can.
-# Returns 0 = matches, 1 = mismatch, 2 = cannot tell (launcher outside the
-# versions dir, unknown arch, manifest unreachable).
+# Returns 0 = matches, 1 = mismatch, 2 = cannot tell (no managed launcher —
+# see claude_active_binary —, unknown arch, manifest unreachable).
 # Usage: claude_binary_verify
 claude_binary_verify() {
-    local launcher target ver platform want have
-    launcher="$(command -v claude 2>/dev/null || echo "${HOME}/.local/bin/claude")"
-    target="$(readlink -f "$launcher" 2>/dev/null)" || return 2
+    local target ver platform want have
+    target="$(claude_active_binary)" || return 2
     ver="${target##*/}"
     [[ "$ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 2
     # Platform key as Anthropic's own bootstrap.sh derives it.
