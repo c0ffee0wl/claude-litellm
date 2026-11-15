@@ -1287,6 +1287,11 @@ remove_profile_export "ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES"
 remove_profile_export "VSCODE_TELEMETRY_DISABLE"
 remove_profile_export "VSCODE_CRASH_REPORTER_DISABLE"
 
+# DISABLE_BUG_COMMAND: retired from the env: block 2026-11-14 — since CC 2.1.212
+# /bug reports through /feedback's path, and the binary reads it only beside
+# DISABLE_FEEDBACK_COMMAND in that one gate (a pure alias).
+remove_profile_export "DISABLE_BUG_COMMAND"
+
 # Default model selectors + gateway discovery + effort. In ~/.profile (not
 # managed-settings) so they apply in --router-only too. Four selectors:
 # haiku/sonnet/opus plus fable, the 4th tier (CC >=2.1.170). Values are the
@@ -2080,11 +2085,9 @@ deploy_config "$SCRIPT_DIR/scripts/statusline.sh" "${HOME}/.claude/statusline.sh
 # classifying commands into action types (filesystem_delete, lang_exec,
 # git_history_rewrite, …) and resolving allow/ask/block with sensitive-path
 # + content-scan context. Skipped under --router-only and --install-only (no
-# policy enforcement in those modes). PreToolUse hooks still fire under --dangerously-skip-permissions
-# per Anthropic docs — the flag skips the deny/ask/allow rule chain and the
-# user prompt, but hooks run *before* the prompt and remain active, so nah
-# is the only active policy layer in that mode (and `permissions.deny[]` is
-# idle). Marketplace ref uses @claude-marketplace branch (where upstream's
+# policy enforcement in those modes). Hooks and deny rules both hold under
+# --dangerously-skip-permissions (permission-modes doc); only the prompt goes.
+# Marketplace ref uses @claude-marketplace branch (where upstream's
 # marketplace.json lives) and is otherwise unpinned — same install-if-missing-
 # then-latest convention as ACP (4c); user runs
 # `claude plugin update nah --scope user` to upgrade.

@@ -7,12 +7,12 @@
 # Input (stdin JSON): { "tool_input": { "command": "..." }, "cwd": "...", ... }
 # Exit 2 = block tool invocation, message to stderr shown to user.
 #
-# Retained as a repo-owned, root-enforced, bypass-surviving floor: PreToolUse
-# hooks fire even under --dangerously-skip-permissions (where the
-# permissions.deny[] rules are skipped and nah's filesystem_delete=context
-# likely allows non-sensitive deletes). Scope is deliberately narrow — the
-# action-aware plugin layer (nah) and ultimately the bubblewrap sandbox own
-# the wrapper-evasion cases (`sudo rm -rf`, `sh -c '… rm -rf'`, `xargs rm`,
+# Retained as a repo-owned, root-enforced floor: PreToolUse hooks fire in
+# every mode, --dangerously-skip-permissions included, and this one catches
+# spellings the permissions.deny[] globs miss (`rm -r -f`, `\rm`, `/bin/rm`,
+# …), while nah's filesystem_delete=context likely allows non-sensitive
+# deletes. Scope is deliberately narrow — the action-aware plugin layer (nah)
+# and ultimately the bubblewrap sandbox own the wrapper-evasion cases (`sudo rm -rf`, `sh -c '… rm -rf'`, `xargs rm`,
 # `find -delete`). Complements (does not replace) both. See CLAUDE.md >
 # "Action-aware permission layer".
 #
